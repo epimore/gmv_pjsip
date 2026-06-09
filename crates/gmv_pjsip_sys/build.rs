@@ -158,12 +158,34 @@ fn generate_bindings(root: &Path) {
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
+
+        // PJLIB
         .allowlist_function("pj_.*")
-        .allowlist_function("pjsip_.*")
         .allowlist_type("pj_.*")
-        .allowlist_type("pjsip_.*")
         .allowlist_var("PJ_.*")
+
+        // PJLIB-UTIL
+        // pjlib_util_init() 是 pjlib_ 前缀，不会被 pj_.* 匹配。
+        // 后续 DNS、scanner、XML、hash、err code 等 PJLIB-UTIL 符号也依赖这里。
+        .allowlist_function("pjlib_.*")
+        .allowlist_type("pjlib_.*")
+        .allowlist_var("PJLIB_.*")
+
+        // PJSIP
+        .allowlist_function("pjsip_.*")
+        .allowlist_type("pjsip_.*")
         .allowlist_var("PJSIP_.*")
+
+        // // PJNATH
+        // .allowlist_function("pjnath_.*")
+        // .allowlist_type("pjnath_.*")
+        // .allowlist_var("PJNATH_.*")
+        //
+        // // PJMEDIA
+        // .allowlist_function("pjmedia_.*")
+        // .allowlist_type("pjmedia_.*")
+        // .allowlist_var("PJMEDIA_.*")
+
         .generate()
         .expect("unable to generate PJSIP bindings");
 
