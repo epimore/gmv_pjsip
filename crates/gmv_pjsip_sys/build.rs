@@ -1,66 +1,119 @@
-use std::env;
-use std::ffi::OsStr;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+const DEFAULT_PJSIP_VERSION: &str = "2.17";
 
 fn main() {
-    let root = find_pjsip_root();
-    let include_dir = root.join("include");
-    let lib_dir = root.join("lib");
-
-    assert!(include_dir.join("pjsip.h").exists(), "PJSIP header not found: {}. Set PJSIP_ROOT to pjproject dist prefix.", include_dir.join("pjsip.h").display());
-    assert!(lib_dir.exists(), "PJSIP lib dir not found: {}", lib_dir.display());
-
     println!("cargo:rerun-if-env-changed=PJSIP_ROOT");
-    println!("cargo:rerun-if-env-changed=PJSIP_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=PJSIP_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=GMV_ROOT");
+    println!("cargo:rerun-if-env-changed=PJSIP_VERSION");
     println!("cargo:rerun-if-changed=wrapper.h");
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rerun-if-changed=build.rs");
 
-    link_pjproject_static_libs(&lib_dir);
-    link_system_libs();
+    let version = env::var("PJSIP_VERSION").unwrap_or_else(|_| DEFAULT_PJSIP_VERSION.to_string());
 
-    #[cfg(feature = "bindgen")]
-    generate_bindings(&include_dir);
+    let pjsip_root = find_pjsip_root(&version).unwrap_or_else(|| {
+        panic!(
+            "\nPJSIP not found.\n\
+             Expected one of:\n\
+             1) PJSIP_ROOT=/path/to/pjproject/dist\n\
+             2) GMV_ROOT/third_party/pjproject-{version}/dist\n\n\
+             Current crate is probably a git dependency, so CARGO_MANIFEST_DIR points to \
+             ~/.cargo/git/checkouts/gmv_pjsip-... not your main gmv repository.\n\n\
+             Please run:\n\
+             cd /path/to/gmv\n\
+             PJSIP_VERSION={version} ./scripts/build_pjsip_bootstrap.sh\n\
+             export PJSIP_ROOT=/path/to/gmv/third_party/pjproject-{version}/dist\n"
+        )
+    });
 
-    #[cfg(not(feature = "bindgen"))]
-    {
-        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
-        fs::write(out_path, "/* bindgen feature disabled: no bindings generated */\n").unwrap();
-    }
+    verify_pjsip_root(&pjsip_root);
+    emit_link_flags(&pjsip_root);
+    generate_bindings(&pjsip_root);
 }
 
-fn find_pjsip_root() -> PathBuf {
-    if let Ok(root) = env::var("PJSIP_ROOT") {
-        return PathBuf::from(root);
-    }
-
-    // Workspace layout: <gmv>/crates/gmv_pjsip_sys -> <gmv>/third_party/pjproject-*/dist
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let gmv_root = manifest_dir
-        .ancestors()
-        .nth(2)
-        .expect("failed to locate workspace root")
-        .to_path_buf();
-    let third_party = gmv_root.join("third_party");
-
-    let mut candidates = Vec::new();
-    if let Ok(entries) = fs::read_dir(&third_party) {
-        for entry in entries.flatten() {
-            let p = entry.path().join("dist");
-            if p.join("include/pjsip.h").exists() && p.join("lib").exists() {
-                candidates.push(p);
-            }
+fn find_pjsip_root(version: &str) -> Option<PathBuf> {
+    if let Some(root) = env::var_os("PJSIP_ROOT") {
+        let root = PathBuf::from(root);
+        if is_pjsip_root(&root) {
+            return Some(root);
         }
     }
-    candidates.sort();
-    candidates.pop().unwrap_or_else(|| third_party.join("pjproject-2.17/dist"))
+
+    if let Some(gmv_root) = env::var_os("GMV_ROOT") {
+        let root = PathBuf::from(gmv_root)
+            .join("third_party")
+            .join(format!("pjproject-{version}"))
+            .join("dist");
+
+        if is_pjsip_root(&root) {
+            return Some(root);
+        }
+    }
+
+    None
 }
 
-fn link_pjproject_static_libs(lib_dir: &Path) {
-    // PJSIP installs libraries as lib<name>-<target>.a, e.g.
-    // libpjsip-x86_64-unknown-linux-gnu.a. We discover the actual archive names.
-    let wanted_prefixes = [
+fn is_pjsip_root(root: &Path) -> bool {
+    root.join("include/pjsip.h").exists()
+        && root.join("include/pjlib.h").exists()
+        && has_static_libs(&root.join("lib"))
+}
+
+fn verify_pjsip_root(root: &Path) {
+    assert!(
+        root.join("include/pjsip.h").exists(),
+        "pjsip.h not found under {}",
+        root.join("include").display()
+    );
+
+    assert!(
+        root.join("include/pjlib.h").exists(),
+        "pjlib.h not found under {}",
+        root.join("include").display()
+    );
+
+    assert!(
+        has_static_libs(&root.join("lib")),
+        "PJSIP static libs not found under {}",
+        root.join("lib").display()
+    );
+}
+
+fn has_static_libs(lib_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(lib_dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|e| {
+        let name = e.file_name().to_string_lossy().to_string();
+        name.starts_with("libpjsip") && name.ends_with(".a")
+    })
+}
+
+fn emit_link_flags(root: &Path) {
+    let lib_dir = root.join("lib");
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+
+    let mut libs = Vec::new();
+
+    for entry in fs::read_dir(&lib_dir).expect("read PJSIP lib dir failed").flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        if name.starts_with("lib") && name.ends_with(".a") {
+            libs.push(
+                name.trim_start_matches("lib")
+                    .trim_end_matches(".a")
+                    .to_string(),
+            );
+        }
+    }
+
+    libs.sort();
+
+    let ordered_prefixes = [
         "pjsua2",
         "pjsua",
         "pjsip-ua",
@@ -75,82 +128,47 @@ fn link_pjproject_static_libs(lib_dir: &Path) {
         "pj",
     ];
 
-    let mut archives = Vec::new();
-    for prefix in wanted_prefixes {
-        if let Some(name) = find_archive_link_name(lib_dir, prefix) {
-            archives.push(name);
+    let mut emitted = Vec::new();
+
+    for prefix in ordered_prefixes {
+        for lib in libs.iter().filter(|lib| lib.starts_with(prefix)) {
+            println!("cargo:rustc-link-lib=static={lib}");
+            emitted.push(lib.clone());
         }
     }
 
-    if archives.is_empty() {
-        panic!("no pjproject static archives found in {}", lib_dir.display());
-    }
-
-    for name in archives {
-        println!("cargo:rustc-link-lib=static={name}");
-    }
-}
-
-fn find_archive_link_name(lib_dir: &Path, prefix: &str) -> Option<String> {
-    let exact = lib_dir.join(format!("lib{prefix}.a"));
-    if exact.exists() {
-        return Some(prefix.to_string());
-    }
-
-    let mut matches = Vec::new();
-    let entries = fs::read_dir(lib_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension() != Some(OsStr::new("a")) {
-            continue;
-        }
-        let Some(file) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        if file.starts_with(&format!("lib{prefix}-")) && file.ends_with(".a") {
-            matches.push(file.trim_start_matches("lib").trim_end_matches(".a").to_string());
+    for lib in libs {
+        if !emitted.contains(&lib) {
+            println!("cargo:rustc-link-lib=static={lib}");
         }
     }
-    matches.sort();
-    matches.pop()
-}
 
-fn link_system_libs() {
-    let target = env::var("TARGET").unwrap_or_default();
-    if target.contains("linux") {
+    if cfg!(target_os = "linux") {
         println!("cargo:rustc-link-lib=pthread");
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=dl");
         println!("cargo:rustc-link-lib=rt");
-    } else if target.contains("apple") {
-        println!("cargo:rustc-link-lib=c++");
-        println!("cargo:rustc-link-lib=framework=Foundation");
-        println!("cargo:rustc-link-lib=framework=AudioToolbox");
-        println!("cargo:rustc-link-lib=framework=AVFoundation");
-    } else if target.contains("windows") {
-        println!("cargo:rustc-link-lib=ws2_32");
-        println!("cargo:rustc-link-lib=iphlpapi");
-        println!("cargo:rustc-link-lib=ole32");
-        println!("cargo:rustc-link-lib=winmm");
+        println!("cargo:rustc-link-lib=uuid");
     }
 }
 
-#[cfg(feature = "bindgen")]
-fn generate_bindings(include_dir: &Path) {
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
+fn generate_bindings(root: &Path) {
+    let include_dir = root.join("include");
+
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
         .allowlist_function("pj_.*")
         .allowlist_function("pjsip_.*")
-        .allowlist_function("pjsua_.*")
         .allowlist_type("pj_.*")
         .allowlist_type("pjsip_.*")
-        .allowlist_type("pjsua_.*")
         .allowlist_var("PJ_.*")
         .allowlist_var("PJSIP_.*")
-        .allowlist_var("PJSUA_.*")
-        .blocklist_type("max_align_t")
-        .derive_default(true)
         .generate()
-        .expect("failed to generate pjproject bindings");
-    bindings.write_to_file(out_path).expect("failed to write bindings");
+        .expect("unable to generate PJSIP bindings");
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    bindings
+        .write_to_file(out_dir.join("bindings.rs"))
+        .expect("could not write bindings.rs");
 }
