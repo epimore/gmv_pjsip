@@ -1,0 +1,21 @@
+[package]
+name = "gmv_pjsip_sys"
+version = "0.1.0"
+edition = "2021"
+links = "pjsip"
+build = "build.rs"
+
+[lib]
+name = "gmv_pjsip_sys"
+path = "src/lib.rs"
+
+[features]
+default = ["bindgen"]
+bindgen = ["dep:bindgen"]
+
+[build-dependencies]
+bindgen = { version = "0.70", optional = true }
+cc = "1"
+
+[dependencies]
+libc = "0.2"

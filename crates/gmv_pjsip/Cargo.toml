@@ -1,0 +1,9 @@
+[package]
+name = "gmv_pjsip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gmv_pjsip_sys = { path = "../gmv_pjsip_sys" }
+thiserror = "2"
+libc = "0.2"
