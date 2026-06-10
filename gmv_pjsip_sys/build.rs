@@ -448,8 +448,37 @@ fn compile_shim_if_possible(include_dirs: &[PathBuf]) {
         build.include(dir);
     }
 
-    build.flag_if_supported("-Wno-unused-parameter");
+    // The auth shim is a tiny internal C bridge. It includes PJPROJECT headers,
+    // and some PJPROJECT builds intentionally override macros in config_site.h,
+    // for example PJ_HAS_SSL_SOCK. That may produce harmless compiler warnings
+    // which otherwise bubble up to the final application as Cargo warnings.
+    //
+    // Default behavior: suppress C compiler warnings for this shim only.
+    // Real C compile errors are still reported and still fail the build.
+    //
+    // Debugging behavior:
+    //   GMV_PJSIP_SYS_SHOW_C_WARNINGS=1 cargo build
+    //
+    // This keeps downstream applications clean while still allowing local
+    // investigation when needed.
+    if env::var_os("GMV_PJSIP_SYS_SHOW_C_WARNINGS").is_some() {
+        build.flag_if_supported("-Wno-unused-parameter");
+        build.flag_if_supported("-Wno-macro-redefined");
+    } else if is_msvc_target() {
+        build.flag("/W0");
+    } else {
+        build.flag("-w");
+    }
+
     build.compile("gmv_pjsip_auth_shim");
+}
+
+fn target_env() -> String {
+    env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default()
+}
+
+fn is_msvc_target() -> bool {
+    is_windows_target() && target_env() == "msvc"
 }
 
 fn write_bindings(envs: &EnvVars, include_dirs: &[PathBuf], output_binding_path: &Path) {
