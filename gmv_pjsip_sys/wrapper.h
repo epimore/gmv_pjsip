@@ -12,6 +12,7 @@
 
 #include <pjsip.h>
 #include <pjsip/sip_auth.h>
+#include <pjsip/sip_auth_msg.h>
 #include <pjsip/sip_config.h>
 #include <pjsip/sip_endpoint.h>
 #include <pjsip/sip_errno.h>
@@ -44,3 +45,5 @@
 // #include <pjmedia-codec.h>
 // #include <pjmedia/transport.h>
 // #include <pjmedia/transport_udp.h>
+
+#include "shim.h"

@@ -22,6 +22,8 @@ impl EnvVars {
     fn init() -> Self {
         println!("cargo:rerun-if-changed=build.rs");
         println!("cargo:rerun-if-changed=wrapper.h");
+        println!("cargo:rerun-if-changed=shim.h");
+        println!("cargo:rerun-if-changed=shim.c");
         println!("cargo:rerun-if-changed=src/bindings.rs");
 
         for name in [
@@ -100,6 +102,7 @@ fn main() {
         pkg_config_linking(None, &envs)
     };
 
+    compile_shim_if_possible(&include_dirs);
     write_bindings(&envs, &include_dirs, &output_binding_path);
 }
 
@@ -381,6 +384,30 @@ fn pkg_config_linking(pkg_config_path: Option<&PathBuf>, envs: &EnvVars) -> Vec<
     include_dirs
 }
 
+fn compile_shim_if_possible(include_dirs: &[PathBuf]) {
+    if include_dirs.is_empty() {
+        println!("cargo:warning=skip compiling PJSIP auth shim because no include dir is available");
+        return;
+    }
+
+    let mut build = cc::Build::new();
+    build.file("shim.c");
+    build.include(".");
+
+    if !is_windows_target() {
+        build.define("PJ_AUTOCONF", Some("1"));
+    } else {
+        build.define("PJ_WIN32", Some("1"));
+    }
+
+    for dir in include_dirs {
+        build.include(dir);
+    }
+
+    build.flag_if_supported("-Wno-unused-parameter");
+    build.compile("gmv_pjsip_auth_shim");
+}
+
 fn write_bindings(envs: &EnvVars, include_dirs: &[PathBuf], output_binding_path: &Path) {
     if let Some(binding_path) = envs.pjsip_binding_path.as_ref() {
         use_prebuilt_binding(binding_path, output_binding_path);
@@ -409,9 +436,11 @@ fn generate_bindings(include_dirs: &[PathBuf], output_binding_path: &Path) {
         .allowlist_function("pj_.*")
         .allowlist_function("pjlib_.*")
         .allowlist_function("pjsip_.*")
+        .allowlist_function("gmv_pjsip_.*")
         .allowlist_type("pj_.*")
         .allowlist_type("pjlib_.*")
         .allowlist_type("pjsip_.*")
+        .allowlist_type("gmv_pjsip_.*")
         .allowlist_var("PJ_.*")
         .allowlist_var("PJLIB_.*")
         .allowlist_var("PJSIP_.*")

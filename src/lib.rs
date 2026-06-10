@@ -1,45 +1,34 @@
-//! Safe GB28181-oriented wrapper over pjproject.
+//! Safe GB28181-oriented SIP context layer.
 //!
-//! This crate deliberately keeps all `gmv_pjsip_sys` access inside `gmv_pjsip`.
-//! `gmv_session` should use the safe structs/functions exported here and should not call raw PJSIP
-//! symbols directly.
-//!
-//! Current integration model:
-//! - PJSIP is initialized through [`runtime::PjRuntime`].
-//! - PJSIP endpoint, transaction layer and UA layer are initialized by runtime.
-//! - Incoming bytes are validated by `pjsip_parse_msg()` and copied into an owned [`message::SipMessage`].
-//! - Tokio UDP/TCP IO stays in gmv and is bridged by [`transport::SipAssociation`].
-//! - GB28181 business semantics stay in `gmv/session/src/gb/sip`.
+//! Boundary:
+//! - `gmv_pjsip_sys` mirrors raw pjproject C symbols.
+//! - `gmv_pjsip` owns SIP parsing/building/transaction/dialog context.
+//! - `session` depends on this crate and never manipulates raw PJSIP pointers.
 
+pub mod auth;
 pub mod builder;
-pub mod dialog;
+pub mod context;
 pub mod endpoint;
 pub mod error;
+pub mod gb28181;
 pub mod message;
-pub mod runtime;
-pub mod transaction;
+pub mod parser;
 pub mod transport;
+pub mod types;
 
-pub use builder::{
-    build_ack_for_invite_2xx, build_request, build_response, new_branch_token, new_call_id,
-    new_tag, RequestOptions, ResponseOptions,
-};
-pub use dialog::{DialogId, DialogState, DialogStore, InviteDialog};
-pub use endpoint::{EndpointRxResult, SipEndpoint, SipEvent, SipEventKind};
-pub use error::{pj_strerror, status_to_result, PjError, Result};
-pub use message::{
-    ensure_name_addr, extract_tag, extract_uri_from_name_addr, SipKind, SipMessage,
-};
-pub use runtime::{PjPool, PjRuntime};
-pub use transaction::{
-    ClientTransaction, ClientTransactionKey, ServerTransaction, ServerTransactionKey,
-    ServerTxDecision, TransactionStore,
-};
-pub use transport::{sent_by_from_addr, sip_uri_host_port, SipAssociation, SipTransport, SipTxPacket};
+pub use bytes::Bytes;
 
-/// Convenience initializer for applications that only need one SIP endpoint.
-pub fn create_endpoint(user_agent: impl Into<String>) -> Result<(std::sync::Arc<PjRuntime>, SipEndpoint)> {
-    let runtime = std::sync::Arc::new(PjRuntime::new("gmv_pjsip")?);
-    let endpoint = SipEndpoint::new(runtime.clone(), user_agent);
-    Ok((runtime, endpoint))
-}
+pub use auth::{AuthAlgorithm, AuthConfig, AuthCredential, AuthDecision, CredentialKind, PasswordProvider, StaticPasswordProvider};
+pub use context::{
+    CallStore, DialogId, DialogState, DialogStore, InviteCall, InviteState, RegisterBinding,
+    RegisterStore, SipContext, SipLocalConfig, TransactionStore,
+};
+pub use endpoint::{
+    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInvite, CreateMessage, IncomingInviteEvent,
+    InviteAcceptedEvent, MessageEvent, MessageKind, RegisterEvent, SipAction, SipEndpoint,
+    SipEvent, SipOutput,
+};
+pub use error::{Result, SipError};
+pub use message::{HeaderMapExt, SipHeader, SipMessage, SipMethod, SipPacketKind, SipResponseStatus};
+pub use transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
+pub use types::{CSeq, CallId, DeviceId, SipUri, StreamId};

@@ -108,3 +108,15 @@ To expose PJNATH/PJMEDIA later:
 1. uncomment the corresponding headers in `wrapper.h`;
 2. uncomment the corresponding allowlist lines in `build.rs`;
 3. prefer pkg-config so system libraries selected by the PJPROJECT build are emitted correctly.
+
+## PJSIP auth shim
+
+This package also includes `shim.c`/`shim.h`, a tiny C shim around PJPROJECT's
+Digest Authentication API. It exposes stable C functions for Rust so the safe
+`gmv_pjsip` layer can call `pjsip_auth_create_digest2()` without depending on
+bindgen's generated layout names for `pjsip_cred_info` and auth enum constants.
+
+The shim supports MD5, SHA-256, and SHA-512-256 when the linked PJPROJECT build
+supports them. Full `pjsip_auth_srv_verify()` usage is kept as the next step once
+`gmv_pjsip` retains `pjsip_rx_data`/`pjsip_tx_data` handles through parsing and
+response generation.
