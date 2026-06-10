@@ -1,8 +1,3 @@
-//! Error handling for the safe `gmv_pjsip` wrapper.
-//!
-//! Keep all raw pjproject status/error conversion in this module so business
-//! crates never depend on `gmv_pjsip_sys` directly.
-
 use std::ffi::CStr;
 
 use gmv_pjsip_sys as sys;
@@ -14,51 +9,42 @@ pub enum PjError {
     #[error("pjproject error {status}: {message}")]
     Status { status: i32, message: String },
 
-    #[error("SIP parse error: {0}")]
-    Parse(String),
+    #[error("pjproject returned null pointer: {0}")]
+    Null(&'static str),
 
-    #[error("SIP protocol error: {0}")]
-    Protocol(String),
-
-    #[error("transaction error: {0}")]
-    Transaction(String),
-
-    #[error("dialog error: {0}")]
-    Dialog(String),
-
-    #[error("transport error: {0}")]
-    Transport(String),
-
-    #[error("invalid utf8: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-
-    #[error("nul byte in string: {0}")]
+    #[error("invalid nul byte in string: {0}")]
     Nul(#[from] std::ffi::NulError),
 
-    #[error("poisoned lock: {0}")]
-    Poisoned(&'static str),
+    #[error("invalid SIP message: {0}")]
+    InvalidSip(String),
+
+    #[error("missing SIP header: {0}")]
+    MissingHeader(&'static str),
+
+    #[error("unsupported SIP flow: {0}")]
+    Unsupported(&'static str),
+
+    #[error("I/O level transport is not bound: {0}")]
+    TransportNotBound(&'static str),
 }
 
+#[inline]
 pub fn status_to_result(status: sys::pj_status_t) -> Result<()> {
     if status == 0 {
-        return Ok(());
+        Ok(())
+    } else {
+        Err(PjError::Status {
+            status,
+            message: pj_strerror(status),
+        })
     }
-
-    Err(PjError::Status {
-        status,
-        message: pj_strerror(status),
-    })
 }
 
 pub fn pj_strerror(status: sys::pj_status_t) -> String {
     let mut buf = [0i8; 256];
-
     unsafe {
+        // pj_strerror() always writes a NUL-terminated string when buf size > 0.
         sys::pj_strerror(status, buf.as_mut_ptr(), buf.len() as sys::pj_size_t);
         CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned()
     }
-}
-
-pub(crate) fn poisoned(name: &'static str) -> PjError {
-    PjError::Poisoned(name)
 }

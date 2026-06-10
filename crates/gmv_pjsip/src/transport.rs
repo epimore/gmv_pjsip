@@ -1,30 +1,26 @@
-//! Transport bridge types between gmv Tokio IO and the SIP core.
-//!
-//! This crate does not bind sockets. The caller owns UDP/TCP IO and passes
-//! received bytes into `SipEndpoint::rx_bytes()`. Outbound bytes are queued as
-//! `SipTxPacket` values and the caller writes them through its existing IO.
-
-use std::collections::VecDeque;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Mutex;
-
-use crate::error::{poisoned, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SipTransportProtocol {
+pub enum SipTransport {
     Udp,
     Tcp,
     Tls,
 }
 
-impl fmt::Display for SipTransportProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl SipTransport {
+    pub fn as_str(self) -> &'static str {
         match self {
-            SipTransportProtocol::Udp => f.write_str("UDP"),
-            SipTransportProtocol::Tcp => f.write_str("TCP"),
-            SipTransportProtocol::Tls => f.write_str("TLS"),
+            Self::Udp => "UDP",
+            Self::Tcp => "TCP",
+            Self::Tls => "TLS",
         }
+    }
+}
+
+impl fmt::Display for SipTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -32,27 +28,7 @@ impl fmt::Display for SipTransportProtocol {
 pub struct SipAssociation {
     pub local_addr: SocketAddr,
     pub remote_addr: SocketAddr,
-    pub protocol: SipTransportProtocol,
-}
-
-impl SipAssociation {
-    pub fn new(
-        local_addr: SocketAddr,
-        remote_addr: SocketAddr,
-        protocol: SipTransportProtocol,
-    ) -> Self {
-        Self {
-            local_addr,
-            remote_addr,
-            protocol,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct SipRxPacket {
-    pub association: SipAssociation,
-    pub bytes: Vec<u8>,
+    pub transport: SipTransport,
 }
 
 #[derive(Debug, Clone)]
@@ -61,31 +37,19 @@ pub struct SipTxPacket {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
-pub struct TransportBridge {
-    tx_queue: Mutex<VecDeque<SipTxPacket>>,
+impl SipTxPacket {
+    pub fn new(association: SipAssociation, bytes: Vec<u8>) -> Self {
+        Self { association, bytes }
+    }
 }
 
-impl TransportBridge {
-    pub fn new() -> Self {
-        Self::default()
+pub fn sent_by_from_addr(addr: SocketAddr) -> String {
+    match addr {
+        SocketAddr::V4(v4) => format!("{}:{}", v4.ip(), v4.port()),
+        SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
     }
+}
 
-    pub fn enqueue(&self, packet: SipTxPacket) -> Result<()> {
-        let mut q = self
-            .tx_queue
-            .lock()
-            .map_err(|_| poisoned("TransportBridge.tx_queue"))?;
-        q.push_back(packet);
-        Ok(())
-    }
-
-    pub fn drain(&self) -> Result<Vec<SipTxPacket>> {
-        let mut q = self
-            .tx_queue
-            .lock()
-            .map_err(|_| poisoned("TransportBridge.tx_queue"))?;
-
-        Ok(q.drain(..).collect())
-    }
+pub fn sip_uri_host_port(addr: SocketAddr) -> String {
+    sent_by_from_addr(addr)
 }

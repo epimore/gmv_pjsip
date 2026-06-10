@@ -1,159 +1,135 @@
-//! pjproject process/runtime initialization.
-//!
-//! This module intentionally exposes a small safe surface:
-//! - initialize pjlib / pjlib-util once;
-//! - own a pj caching pool factory;
-//! - validate raw SIP bytes with `pjsip_parse_msg()`.
-//!
-//! Higher level SIP transaction/dialog state is kept in Rust-side wrappers in
-//! this iteration. The struct layout leaves room for adding a real
-//! `pjsip_endpoint` + custom transport bridge later without changing session's
-//! public dependency boundary.
-
 use std::ffi::CString;
-use std::ptr;
+use std::mem;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use gmv_pjsip_sys as sys;
 
-use crate::error::{poisoned, status_to_result, PjError, Result};
+use crate::error::{status_to_result, PjError, Result};
 
-static PJ_GLOBAL_INITED: AtomicBool = AtomicBool::new(false);
-static PJ_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
+static PJ_RUNTIME_ALIVE: AtomicBool = AtomicBool::new(false);
 
-#[derive(Debug)]
+/// Owns pjlib/pjsip global initialization, caching pool, endpoint, transaction layer and UA layer.
+///
+/// Create one instance at process startup and keep it alive while SIP code is running.
+///
+/// This layer intentionally initializes only SIP-control modules. RTP/PS/FLV/HLS/DASH media stays in gmv.
 pub struct PjRuntime {
-    inner: Arc<PjRuntimeInner>,
+    cpool: Box<sys::pj_caching_pool>,
+    endpt: NonNull<sys::pjsip_endpoint>,
 }
 
-#[derive(Debug)]
-struct PjRuntimeInner {
-    caching_pool: Mutex<Box<sys::pj_caching_pool>>,
-    owns_global_init: bool,
-}
-
-impl Clone for PjRuntime {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
+// PJSIP itself is C code with its own internal locking. The endpoint pointer may be shared by higher
+// level gmv services, but callers must still serialize endpoint mutation where required.
+unsafe impl Send for PjRuntime {}
+unsafe impl Sync for PjRuntime {}
 
 impl PjRuntime {
-    /// Initialize pjproject global state and create one caching pool factory.
-    ///
-    /// Create one `PjRuntime` during process startup and share it through
-    /// `SipEndpoint`. Calling this repeatedly is tolerated, but the first
-    /// owner performs global `pj_shutdown()` on drop.
-    pub fn init() -> Result<Self> {
-        let _guard = PJ_GLOBAL_LOCK.lock().map_err(|_| poisoned("PJ_GLOBAL_LOCK"))?;
-
-        let owns_global_init = if !PJ_GLOBAL_INITED.load(Ordering::SeqCst) {
-            unsafe {
-                status_to_result(sys::pj_init())?;
-                status_to_result(sys::pjlib_util_init())?;
-            }
-            PJ_GLOBAL_INITED.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        };
-
-        let mut caching_pool = Box::<sys::pj_caching_pool>::new(unsafe { std::mem::zeroed() });
-        unsafe {
-            sys::pj_caching_pool_init(caching_pool.as_mut(), ptr::null(), 0);
+    pub fn new(name: &str) -> Result<Self> {
+        if PJ_RUNTIME_ALIVE.swap(true, Ordering::SeqCst) {
+            return Err(PjError::Unsupported(
+                "PjRuntime::new() must be called once; share it with Arc<PjRuntime>",
+            ));
         }
 
-        Ok(Self {
-            inner: Arc::new(PjRuntimeInner {
-                caching_pool: Mutex::new(caching_pool),
-                owns_global_init,
-            }),
-        })
+        let init_result = unsafe { status_to_result(sys::pj_init()) };
+        if let Err(err) = init_result {
+            PJ_RUNTIME_ALIVE.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+
+        let util_result = unsafe { status_to_result(sys::pjlib_util_init()) };
+        if let Err(err) = util_result {
+            unsafe { sys::pj_shutdown() };
+            PJ_RUNTIME_ALIVE.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+
+        let mut cpool: Box<sys::pj_caching_pool> = Box::new(unsafe { mem::zeroed() });
+        unsafe {
+            sys::pj_caching_pool_init(cpool.as_mut(), ptr::null(), 0);
+        }
+
+        let mut endpt: *mut sys::pjsip_endpoint = ptr::null_mut();
+        let cname = CString::new(name)?;
+        let create_result = unsafe {
+            status_to_result(sys::pjsip_endpt_create(
+                &mut cpool.factory,
+                cname.as_ptr(),
+                &mut endpt,
+            ))
+        };
+        if let Err(err) = create_result {
+            unsafe {
+                sys::pj_caching_pool_destroy(cpool.as_mut());
+                sys::pj_shutdown();
+            }
+            PJ_RUNTIME_ALIVE.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+
+        let endpt = NonNull::new(endpt).ok_or(PjError::Null("pjsip_endpt_create"))?;
+
+        unsafe {
+            status_to_result(sys::pjsip_tsx_layer_init_module(endpt.as_ptr()))?;
+            status_to_result(sys::pjsip_ua_init_module(endpt.as_ptr(), ptr::null_mut()))?;
+        }
+
+        Ok(Self { cpool, endpt })
     }
 
-    /// Validate a SIP packet using pjproject's parser.
-    ///
-    /// The returned PJSIP message pointer is not exposed because it is tied to
-    /// the temporary pool. Higher layers receive a Rust-owned `SipMessageView`
-    /// from `message.rs`.
-    pub fn validate_sip_packet(&self, raw: &[u8]) -> Result<()> {
-        if raw.is_empty() {
-            return Err(PjError::Parse("empty SIP packet".to_string()));
-        }
+    #[inline]
+    pub fn endpoint_ptr(&self) -> *mut sys::pjsip_endpoint {
+        self.endpt.as_ptr()
+    }
 
-        let pool_name = CString::new("gmv_pjsip_parse")?;
-        let mut cp = self
-            .inner
-            .caching_pool
-            .lock()
-            .map_err(|_| poisoned("PjRuntime.caching_pool"))?;
+    #[inline]
+    pub fn pool_factory_ptr(&self) -> *mut sys::pj_pool_factory {
+        // pjsip APIs expect pj_pool_factory*. pj_caching_pool has public `factory` field in pjlib.
+        &self.cpool.factory as *const _ as *mut sys::pj_pool_factory
+    }
 
+    pub fn create_pool(&self, name: &str, initial: usize, increment: usize) -> Result<PjPool> {
+        let cname = CString::new(name)?;
         let pool = unsafe {
             sys::pj_pool_create(
-                &mut cp.factory,
-                pool_name.as_ptr(),
-                4096,
-                4096,
+                self.pool_factory_ptr(),
+                cname.as_ptr(),
+                initial as sys::pj_size_t,
+                increment as sys::pj_size_t,
                 None,
             )
         };
 
-        if pool.is_null() {
-            return Err(PjError::Status {
-                status: -1,
-                message: "pj_pool_create failed".to_string(),
-            });
-        }
-
-        let parse_result = (|| {
-            let mut buf = raw.to_vec();
-            // pjsip_parse_msg() receives an explicit length, but keeping a NUL
-            // guard is cheap and matches pjproject examples.
-            buf.push(0);
-
-            let msg = unsafe {
-                sys::pjsip_parse_msg(
-                    pool,
-                    buf.as_mut_ptr() as *mut i8,
-                    raw.len() as sys::pj_size_t,
-                    ptr::null_mut(),
-                )
-            };
-
-            if msg.is_null() {
-                Err(PjError::Parse("pjsip_parse_msg failed".to_string()))
-            } else {
-                Ok(())
-            }
-        })();
-
-        unsafe {
-            sys::pj_pool_release(pool);
-        }
-
-        parse_result
+        let pool = NonNull::new(pool).ok_or(PjError::Null("pj_pool_create"))?;
+        Ok(PjPool { pool })
     }
 }
 
-impl Drop for PjRuntimeInner {
+impl Drop for PjRuntime {
     fn drop(&mut self) {
-        if let Ok(mut cp) = self.caching_pool.lock() {
-            unsafe {
-                sys::pj_caching_pool_destroy(cp.as_mut());
-            }
+        unsafe {
+            sys::pjsip_endpt_destroy(self.endpt.as_ptr());
+            sys::pj_caching_pool_destroy(self.cpool.as_mut());
+            sys::pj_shutdown();
         }
+        PJ_RUNTIME_ALIVE.store(false, Ordering::SeqCst);
+    }
+}
 
-        if self.owns_global_init {
-            if let Ok(_guard) = PJ_GLOBAL_LOCK.lock() {
-                if PJ_GLOBAL_INITED.swap(false, Ordering::SeqCst) {
-                    unsafe {
-                        sys::pj_shutdown();
-                    }
-                }
-            }
-        }
+pub struct PjPool {
+    pool: NonNull<sys::pj_pool_t>,
+}
+
+impl PjPool {
+    #[inline]
+    pub fn as_ptr(&self) -> *mut sys::pj_pool_t {
+        self.pool.as_ptr()
+    }
+}
+
+impl Drop for PjPool {
+    fn drop(&mut self) {
+        unsafe { sys::pj_pool_release(self.pool.as_ptr()) };
     }
 }

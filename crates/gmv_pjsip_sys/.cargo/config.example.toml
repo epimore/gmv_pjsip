@@ -1,0 +1,20 @@
+# Copy this file to .cargo/config.toml in the main application workspace when needed.
+# The sys crate defaults to pkg-config if no explicit PJSIP_* link path is set.
+
+# Recommended: main application builds/installs PJPROJECT and exposes its .pc file.
+# [env]
+# PJSIP_PKG_CONFIG_PATH = { value = "third_party/pjproject-2.17/dist/lib/pkgconfig", relative = true }
+
+# Manual static/split-library link path.
+# [env]
+# PJSIP_INCLUDE_DIR = { value = "third_party/pjproject-2.17/dist/include", relative = true }
+# PJSIP_LIBS_DIR    = { value = "third_party/pjproject-2.17/dist/lib", relative = true }
+
+# Manual dynamic/import-library path.
+# [env]
+# PJSIP_INCLUDE_DIR = { value = "third_party/pjproject-2.17/dist/include", relative = true }
+# PJSIP_DLL_PATH    = { value = "third_party/pjproject-2.17/dist/lib/libpjproject.so", relative = true }
+
+# Pre-generated bindgen output.
+# [env]
+# PJSIP_BINDING_PATH = { value = "third_party/pjproject-2.17/bindings/bindings.rs", relative = true }

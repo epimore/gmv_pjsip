@@ -1,205 +1,122 @@
-//! Main safe endpoint facade used by `session`.
-//!
-//! `io.rs` should call `rx_bytes()` and then handle emitted events. When
-//! business code decides a response/request must be sent, call the builder
-//! helpers and `queue_tx()` / `drain_tx()`.
-
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::builder::{self, ResponseOptions};
-use crate::dialog::{DialogStore, InviteDialog};
+use crate::builder::{build_response, ResponseOptions};
+use crate::dialog::DialogStore;
 use crate::error::{PjError, Result};
-use crate::message::SipMessageView;
+use crate::message::{SipKind, SipMessage};
 use crate::runtime::PjRuntime;
-use crate::transaction::{ClientTxDecision, ClientTxKey, ServerTxDecision, ServerTxKey, TransactionStore};
-use crate::transport::{SipAssociation, SipTxPacket, TransportBridge};
+use crate::transaction::{ServerTxDecision, TransactionStore};
+use crate::transport::{SipAssociation, SipTxPacket};
 
 #[derive(Debug, Clone)]
-pub struct SipEndpointConfig {
-    pub user_agent: String,
+pub enum SipEventKind {
+    Request(SipMessage),
+    Response(SipMessage),
 }
 
-impl Default for SipEndpointConfig {
-    fn default() -> Self {
-        Self {
-            user_agent: "Gmv PJSIP".to_string(),
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct SipEvent {
+    pub association: SipAssociation,
+    pub kind: SipEventKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub enum EndpointRxResult {
+    Event(SipEvent),
+    Tx(SipTxPacket),
+    Drop,
+}
+
+/// High-level endpoint facade used by gmv_session.
+///
+/// Runtime initialization uses real PJSIP endpoint + transaction + UA modules. Bytes are validated
+/// by PJSIP parser. Tokio UDP/TCP sockets remain in gmv and are represented by SipAssociation.
+#[derive(Clone)]
 pub struct SipEndpoint {
-    runtime: PjRuntime,
-    config: SipEndpointConfig,
-    transactions: Arc<TransactionStore>,
-    dialogs: Arc<DialogStore>,
-    transport: Arc<TransportBridge>,
-}
-
-#[derive(Debug, Clone)]
-pub enum SipEvent {
-    IncomingRequest {
-        association: SipAssociation,
-        tx_key: ServerTxKey,
-        message: SipMessageView,
-    },
-    IncomingResponse {
-        association: SipAssociation,
-        tx_key: Option<ClientTxKey>,
-        message: SipMessageView,
-    },
-    DuplicateRequestResponse {
-        association: SipAssociation,
-        bytes: Vec<u8>,
-    },
-    DuplicateInvite2xxAck {
-        association: SipAssociation,
-        bytes: Vec<u8>,
-    },
-    ReplayedRequest {
-        association: SipAssociation,
-        message: SipMessageView,
-    },
-    UnknownResponse {
-        association: SipAssociation,
-        message: SipMessageView,
-    },
+    runtime: Arc<PjRuntime>,
+    tx_store: TransactionStore,
+    dialogs: DialogStore,
+    pub user_agent: String,
+    pub server_tx_ttl: Duration,
 }
 
 impl SipEndpoint {
-    pub fn new(runtime: PjRuntime, config: SipEndpointConfig) -> Self {
+    pub fn new(runtime: Arc<PjRuntime>, user_agent: impl Into<String>) -> Self {
         Self {
             runtime,
-            config,
-            transactions: Arc::new(TransactionStore::new()),
-            dialogs: Arc::new(DialogStore::new()),
-            transport: Arc::new(TransportBridge::new()),
+            tx_store: TransactionStore::default(),
+            dialogs: DialogStore::default(),
+            user_agent: user_agent.into(),
+            server_tx_ttl: Duration::from_secs(64),
         }
     }
 
-    pub fn user_agent(&self) -> &str {
-        &self.config.user_agent
+    pub fn runtime(&self) -> &PjRuntime {
+        &self.runtime
     }
 
-    pub fn transactions(&self) -> Arc<TransactionStore> {
-        Arc::clone(&self.transactions)
+    pub fn transactions(&self) -> &TransactionStore {
+        &self.tx_store
     }
 
-    pub fn dialogs(&self) -> Arc<DialogStore> {
-        Arc::clone(&self.dialogs)
+    pub fn dialogs(&self) -> &DialogStore {
+        &self.dialogs
     }
 
-    pub fn rx_bytes(&self, association: SipAssociation, bytes: &[u8]) -> Result<Vec<SipEvent>> {
-        let message = SipMessageView::parse(&self.runtime, bytes)?;
-
-        if message.is_request() {
-            match self.transactions.on_request(&association, &message)? {
-                ServerTxDecision::New(tx_key) => Ok(vec![SipEvent::IncomingRequest {
-                    association,
-                    tx_key,
-                    message,
-                }]),
-                ServerTxDecision::DuplicateReturnLastResponse(bytes) => {
-                    Ok(vec![SipEvent::DuplicateRequestResponse { association, bytes }])
-                }
-                ServerTxDecision::DuplicateNoResponse => Ok(Vec::new()),
-                ServerTxDecision::ReplayedReject => Ok(vec![SipEvent::ReplayedRequest {
-                    association,
-                    message,
-                }]),
-            }
-        } else {
-            match self.transactions.on_response(&message)? {
-                ClientTxDecision::Matched(tx_key) => Ok(vec![SipEvent::IncomingResponse {
-                    association,
-                    tx_key: Some(tx_key),
-                    message,
-                }]),
-                ClientTxDecision::DuplicateInvite2xxAck(bytes) => {
-                    Ok(vec![SipEvent::DuplicateInvite2xxAck { association, bytes }])
-                }
-                ClientTxDecision::Unknown => Ok(vec![SipEvent::UnknownResponse {
-                    association,
-                    message,
-                }]),
-            }
-        }
+    pub fn parse(&self, raw: &[u8]) -> Result<SipMessage> {
+        SipMessage::parse(&self.runtime, raw)
     }
 
-    pub fn complete_request(
-        &self,
-        association: SipAssociation,
-        tx_key: &ServerTxKey,
-        response: Vec<u8>,
-    ) -> Result<()> {
-        self.transactions
-            .store_server_response(tx_key, response.clone())?;
-        self.queue_tx(SipTxPacket {
-            association,
-            bytes: response,
-        })
-    }
-
-    pub fn build_and_complete_response(
-        &self,
-        association: SipAssociation,
-        tx_key: &ServerTxKey,
-        req: &SipMessageView,
-        opt: ResponseOptions<'_>,
-    ) -> Result<()> {
-        let response = builder::build_response(req, opt)?;
-        self.complete_request(association, tx_key, response)
-    }
-
-    pub fn queue_tx(&self, packet: SipTxPacket) -> Result<()> {
-        self.transport.enqueue(packet)
-    }
-
-    pub fn drain_tx(&self) -> Result<Vec<SipTxPacket>> {
-        self.transport.drain()
-    }
-
-    pub fn register_client_request(
-        &self,
-        association: SipAssociation,
-        key: ClientTxKey,
-        request: Vec<u8>,
-    ) -> Result<()> {
-        self.transactions.insert_client_request(key, request.clone())?;
-        self.queue_tx(SipTxPacket {
-            association,
-            bytes: request,
-        })
-    }
-
-    pub fn insert_early_dialog(&self, dialog: InviteDialog) -> Result<()> {
-        self.dialogs.insert_early(dialog)
-    }
-
-    /// Handle a 2xx response for a UAC INVITE: confirm dialog and generate ACK.
+    /// Parse incoming bytes and apply SIP transaction-level dedupe for incoming requests.
     ///
-    /// Caller should invoke this after receiving `SipEvent::IncomingResponse`
-    /// whose CSeq method is INVITE and status is 2xx.
-    pub fn confirm_invite_and_queue_ack(
-        &self,
-        association: SipAssociation,
-        resp: &SipMessageView,
-        client_tx_key: &ClientTxKey,
-    ) -> Result<InviteDialog> {
-        let call_id = resp
-            .call_id()
-            .ok_or_else(|| PjError::Dialog("2xx response missing Call-ID".to_string()))?;
-        let dialog = self.dialogs.confirm_early_from_2xx(call_id, resp)?;
-        let ack = dialog.ack_for_2xx(self.user_agent())?;
-        self.transactions.store_invite_ack(client_tx_key, ack.clone())?;
-        self.queue_tx(SipTxPacket {
-            association,
-            bytes: ack,
-        })?;
-        Ok(dialog)
+    /// The returned `Event` should be handled by session/src/gb/sip. The returned `Tx` is an automatic
+    /// transaction response, such as returning the previous response for a retransmitted request.
+    pub fn rx_bytes(&self, association: SipAssociation, raw: &[u8]) -> Result<EndpointRxResult> {
+        let msg = self.parse(raw)?;
+
+        match &msg.kind {
+            SipKind::Request { .. } => match self
+                .tx_store
+                .on_server_request(&association, &msg, self.server_tx_ttl)
+            {
+                Some(ServerTxDecision::New(_)) => Ok(EndpointRxResult::Event(SipEvent {
+                    association,
+                    kind: SipEventKind::Request(msg),
+                })),
+                Some(ServerTxDecision::DuplicateReturn(bytes)) => {
+                    Ok(EndpointRxResult::Tx(SipTxPacket::new(association, bytes)))
+                }
+                Some(ServerTxDecision::DuplicateProcessing) => Ok(EndpointRxResult::Drop),
+                Some(ServerTxDecision::ReplayConflict) => {
+                    let bytes = build_response(
+                        &self.runtime,
+                        &msg,
+                        ResponseOptions {
+                            code: 400,
+                            reason: "Bad Request",
+                            user_agent: &self.user_agent,
+                            body: None,
+                            content_type: None,
+                            extra_headers: Vec::new(),
+                        },
+                    )?;
+                    Ok(EndpointRxResult::Tx(SipTxPacket::new(association, bytes)))
+                }
+                None => Err(PjError::InvalidSip(
+                    "request cannot be converted into transaction key".into(),
+                )),
+            },
+            SipKind::Response { .. } => Ok(EndpointRxResult::Event(SipEvent {
+                association,
+                kind: SipEventKind::Response(msg),
+            })),
+        }
     }
 
-    pub fn expire_transactions(&self) -> Result<()> {
-        self.transactions.expire()
+    pub fn store_response_for_request(&self, assoc: &SipAssociation, req: &SipMessage, resp: &[u8]) {
+        if let Some(key) = crate::transaction::ServerTransactionKey::from_request(assoc, req) {
+            self.tx_store.store_server_response(&key, resp.to_vec());
+        }
     }
 }

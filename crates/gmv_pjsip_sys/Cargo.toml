@@ -4,18 +4,16 @@ version = "0.1.0"
 edition = "2021"
 links = "pjsip"
 build = "build.rs"
-
-[lib]
-name = "gmv_pjsip_sys"
-path = "src/lib.rs"
+description = "Low-level Rust FFI bindings for PJPROJECT/PJSIP used by gmv_pjsip."
+license = "MIT OR Apache-2.0"
 
 [features]
 default = ["bindgen"]
 bindgen = ["dep:bindgen"]
 
-[build-dependencies]
-bindgen = { version = "0.70", optional = true }
-cc = "1"
-
 [dependencies]
 libc = "0.2"
+
+[build-dependencies]
+bindgen = { version = "0.70", optional = true }
+pkg-config = "0.3"
