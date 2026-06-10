@@ -15,7 +15,7 @@ use crate::endpoint::{
 };
 use crate::error::{Result, SipError};
 use crate::gb28181::sdp::SdpInfo;
-use crate::message::{extract_user_from_uri_like, HeaderMapExt, SipMessage, SipMethod, SipPacketKind};
+use crate::message::{ensure_tag, extract_user_from_uri_like, HeaderMapExt, SipMessage, SipMethod, SipPacketKind};
 use crate::parser::parse_sip_message;
 use crate::transport::{SipPacketMeta, SipTransportProtocol};
 
@@ -49,6 +49,15 @@ pub struct SipContext {
     nonces: NonceStore,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub expired_transactions: usize,
+    pub expired_registers: usize,
+    pub expired_calls: usize,
+    pub expired_dialogs: usize,
+    pub expired_nonces: usize,
+}
+
 impl SipContext {
     pub fn new(local: SipLocalConfig) -> Arc<Self> {
         let ttl = local.transaction_ttl;
@@ -61,6 +70,20 @@ impl SipContext {
             calls: CallStore::new(),
             nonces: NonceStore::new(nonce_ttl),
         })
+    }
+
+    pub fn cleanup_expired(&self) -> CleanupReport {
+        self.cleanup_expired_with(self.local.transaction_ttl)
+    }
+
+    pub fn cleanup_expired_with(&self, terminated_retain_for: Duration) -> CleanupReport {
+        CleanupReport {
+            expired_transactions: self.transactions.cleanup(),
+            expired_registers: self.registers.cleanup(),
+            expired_calls: self.calls.cleanup_terminated(terminated_retain_for),
+            expired_dialogs: self.dialogs.cleanup_terminated(terminated_retain_for),
+            expired_nonces: self.nonces.cleanup(),
+        }
     }
 
     pub fn on_packet(&self, bytes: Bytes, meta: SipPacketMeta) -> Result<SipAction> {
@@ -213,13 +236,23 @@ impl SipContext {
         let call_id = msg.call_id()?;
         let remote_tag = msg.from_tag().unwrap_or_else(new_tag);
         let local_tag = msg.to_tag().unwrap_or_else(new_tag);
-        let dialog_id = DialogId { call_id: call_id.clone(), local_tag: local_tag.clone(), remote_tag };
+        let local_header = ensure_tag(msg.header("To").unwrap_or_default(), &local_tag);
+        let remote_header = msg.header("From").unwrap_or_default().to_string();
+        let dialog_id = DialogId {
+            call_id: call_id.clone(),
+            local_tag: local_tag.clone(),
+            remote_tag,
+        };
         self.dialogs.insert(SipDialog {
             id: dialog_id.clone(),
-            local_uri: msg.header("To").unwrap_or_default().to_string(),
-            remote_uri: msg.header("From").unwrap_or_default().to_string(),
+            local_uri: local_header,
+            remote_uri: remote_header,
             local_contact: self.local.contact(meta.protocol),
-            remote_target: msg.contact().or_else(|| msg.request_uri().map(ToOwned::to_owned)).unwrap_or_default(),
+            remote_target: msg
+                .contact()
+                .or_else(|| msg.request_uri().map(ToOwned::to_owned))
+                .unwrap_or_default(),
+            protocol: meta.protocol,
             local_cseq: 1,
             remote_cseq: msg.cseq()?.number,
             route_set: Vec::new(),
@@ -327,6 +360,7 @@ impl SipContext {
             stream_id: req.stream_id,
             ssrc: req.ssrc,
             invite_cseq: cseq,
+            protocol: req.protocol,
             state: InviteState::Calling,
             local_sdp: Some(req.sdp),
             remote_sdp: None,
@@ -350,8 +384,9 @@ impl SipContext {
             id: dialog_id.clone(),
             local_uri: msg.header("From").unwrap_or_default().to_string(),
             remote_uri: msg.header("To").unwrap_or_default().to_string(),
-            local_contact: self.local.contact(SipTransportProtocol::Udp),
+            local_contact: self.local.contact(call.protocol),
             remote_target: remote_target.clone(),
+            protocol: call.protocol,
             local_cseq: call.invite_cseq,
             remote_cseq: 0,
             route_set: Vec::new(),
@@ -388,13 +423,13 @@ impl SipContext {
         let start_line = format!("ACK {} SIP/2.0", dialog.remote_target);
         let branch = new_branch();
         let headers = vec![
-            ("Via".into(), via(&self.local.public_host, self.local.listen_port, SipTransportProtocol::Udp, &branch)),
+            ("Via".into(), via(&self.local.public_host, self.local.listen_port, dialog.protocol, &branch)),
             ("Max-Forwards".into(), "70".into()),
-            ("From".into(), format!("<{}>;tag={}", self.local.local_uri(), dialog.id.local_tag)),
-            ("To".into(), format!("<sip:{}@{}>;tag={}", call.device_id, self.local.domain, dialog.id.remote_tag)),
+            ("From".into(), dialog.local_uri.clone()),
+            ("To".into(), dialog.remote_uri.clone()),
             ("Call-ID".into(), dialog.id.call_id.clone()),
             ("CSeq".into(), format!("{} ACK", call.invite_cseq)),
-            ("Contact".into(), dialog.local_contact),
+            ("Contact".into(), dialog.local_contact.clone()),
             ("User-Agent".into(), self.local.user_agent.clone()),
         ];
         Ok(build_request(&start_line, &headers, None, None))
@@ -414,13 +449,13 @@ impl SipContext {
         let start_line = format!("BYE {} SIP/2.0", dialog.remote_target);
         let branch = new_branch();
         let headers = vec![
-            ("Via".into(), via(&self.local.public_host, self.local.listen_port, SipTransportProtocol::Udp, &branch)),
+            ("Via".into(), via(&self.local.public_host, self.local.listen_port, dialog.protocol, &branch)),
             ("Max-Forwards".into(), "70".into()),
-            ("From".into(), format!("<{}>;tag={}", self.local.local_uri(), dialog.id.local_tag)),
-            ("To".into(), format!("<sip:{}@{}>;tag={}", call.device_id, self.local.domain, dialog.id.remote_tag)),
+            ("From".into(), dialog.local_uri.clone()),
+            ("To".into(), dialog.remote_uri.clone()),
             ("Call-ID".into(), dialog.id.call_id.clone()),
             ("CSeq".into(), format!("{} BYE", cseq)),
-            ("Contact".into(), dialog.local_contact),
+            ("Contact".into(), dialog.local_contact.clone()),
             ("User-Agent".into(), self.local.user_agent.clone()),
         ];
         self.calls.update_state(&call.call_id, InviteState::Terminating);

@@ -4,6 +4,14 @@
 #include <pjlib.h>
 #include <pjsip/sip_auth.h>
 
+/*
+ * PJSIP_AUTH_ALGORITHM_SHA256 and PJSIP_AUTH_ALGORITHM_SHA512_256 are
+ * enum constants, not preprocessor macros. Do not test them with #if defined().
+ * Version validation is performed in build.rs for pkg-config and explicit
+ * PJSIP_INCLUDE_DIR builds. If an older PJPROJECT header is used, normal C
+ * compilation will still fail at the enum/function references below.
+ */
+
 static pj_str_t gmv_pj_str(const char *s) {
     pj_str_t out;
     out.ptr = (char *)(s ? s : "");

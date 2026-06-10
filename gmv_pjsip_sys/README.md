@@ -20,7 +20,7 @@ The safe API should live in `gmv_pjsip`. Application/session crates should not d
 2. `PJSIP_DLL_PATH` &mdash; explicit dynamic/import library path from the main app.
 3. `PJSIP_LIBS_DIR` &mdash; explicit library directory from the main app.
 4. `PJSIP_PKG_CONFIG_PATH` &mdash; explicit pkg-config directory from the main app.
-5. default pkg-config probe for `libpjproject`.
+5. default pkg-config probe for `libpjproject` >= 2.15.1.
 
 `pkg-config` does not download dependencies. It only discovers an installed PJPROJECT package and returns compile/link metadata. Build or install PJPROJECT in the main workspace, CI image, Dockerfile, or bootstrap script.
 
@@ -117,6 +117,6 @@ Digest Authentication API. It exposes stable C functions for Rust so the safe
 bindgen's generated layout names for `pjsip_cred_info` and auth enum constants.
 
 The shim supports MD5, SHA-256, and SHA-512-256 when the linked PJPROJECT build
-supports them. Full `pjsip_auth_srv_verify()` usage is kept as the next step once
+supports them. The build script rejects pkg-config discovered PJPROJECT versions older than 2.15.1; PJPROJECT 2.17 is recommended. Full `pjsip_auth_srv_verify()` usage is kept as the next step once
 `gmv_pjsip` retains `pjsip_rx_data`/`pjsip_tx_data` handles through parsing and
 response generation.

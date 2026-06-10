@@ -25,16 +25,38 @@ pub struct RegisterStore {
 }
 
 impl RegisterStore {
-    pub fn new() -> Self { Self { bindings: DashMap::new() } }
-    pub fn upsert(&self, binding: RegisterBinding) { self.bindings.insert(binding.device_id.clone(), binding); }
-    pub fn remove(&self, device_id: &str) -> Option<RegisterBinding> { self.bindings.remove(device_id).map(|(_, v)| v) }
-    pub fn get(&self, device_id: &str) -> Option<RegisterBinding> { self.bindings.get(device_id).map(|v| v.clone()) }
-    pub fn cleanup(&self) {
+    pub fn new() -> Self {
+        Self {
+            bindings: DashMap::new(),
+        }
+    }
+
+    pub fn upsert(&self, binding: RegisterBinding) {
+        self.bindings.insert(binding.device_id.clone(), binding);
+    }
+
+    pub fn remove(&self, device_id: &str) -> Option<RegisterBinding> {
+        self.bindings.remove(device_id).map(|(_, v)| v)
+    }
+
+    pub fn get(&self, device_id: &str) -> Option<RegisterBinding> {
+        self.bindings.get(device_id).map(|v| v.clone())
+    }
+
+    pub fn cleanup(&self) -> usize {
         let now = Instant::now();
+        let before = self.bindings.len();
         self.bindings.retain(|_, b| b.expires_at > now);
+        before.saturating_sub(self.bindings.len())
     }
 }
 
-impl Default for RegisterStore { fn default() -> Self { Self::new() } }
+impl Default for RegisterStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-pub fn expires_at(expires: u32) -> Instant { Instant::now() + Duration::from_secs(expires as u64) }
+pub fn expires_at(expires: u32) -> Instant {
+    Instant::now() + Duration::from_secs(expires as u64)
+}

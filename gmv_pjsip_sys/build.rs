@@ -5,6 +5,7 @@ use std::{
 };
 
 const PKG_CONFIG_NAME: &str = "libpjproject";
+const MIN_PJPROJECT_VERSION: &str = "2.15.1";
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -145,6 +146,15 @@ fn verify_include_dir(include_dir: &Path) {
             );
         }
     }
+
+    // Do not validate manual include/lib mode via `pj/version.h`.
+    //
+    // PJPROJECT install prefixes do not consistently ship version metadata under
+    // `$prefix/include/pj/version.h`. In manual mode, API availability is
+    // validated by compiling `shim.c` against the selected headers.
+    //
+    // Version validation is kept only for pkg-config mode, where
+    // `libpjproject.pc` provides a reliable version string.
 }
 
 fn dynamic_linking(dll_path: &Path) {
@@ -288,8 +298,8 @@ fn is_pjproject_split_lib(lib: &str) -> bool {
         "pjlib-util",
         "pj",
     ]
-    .iter()
-    .any(|base| matches_pj_lib(lib, base))
+        .iter()
+        .any(|base| matches_pj_lib(lib, base))
 }
 
 fn emit_ordered_static_pj_libs(libs: &[String]) {
@@ -367,6 +377,15 @@ fn pkg_config_linking(pkg_config_path: Option<&PathBuf>, envs: &EnvVars) -> Vec<
             )
         });
 
+    if version_less_than(&library.version, MIN_PJPROJECT_VERSION) {
+        panic!(
+            "pkg-config found `{PKG_CONFIG_NAME}` version {}, but gmv_pjsip_sys requires >= {MIN_PJPROJECT_VERSION} \
+             for PJSIP digest helper APIs. PJPROJECT 2.17 is recommended. \
+             Set PJSIP_PKG_CONFIG_PATH/PJSIP_INCLUDE_DIR/PJSIP_LIBS_DIR to the intended PJPROJECT build.",
+            library.version
+        );
+    }
+
     let mut include_dirs: Vec<PathBuf> = library.include_paths;
 
     if let Some(dir) = envs.pjsip_include_dir.as_ref() {
@@ -382,6 +401,31 @@ fn pkg_config_linking(pkg_config_path: Option<&PathBuf>, envs: &EnvVars) -> Vec<
     }
 
     include_dirs
+}
+
+fn version_less_than(found: &str, minimum: &str) -> bool {
+    let found_parts = version_parts(found);
+    let min_parts = version_parts(minimum);
+    for idx in 0..found_parts.len().max(min_parts.len()) {
+        let a = *found_parts.get(idx).unwrap_or(&0);
+        let b = *min_parts.get(idx).unwrap_or(&0);
+        if a < b {
+            return true;
+        }
+        if a > b {
+            return false;
+        }
+    }
+    false
+}
+
+fn version_parts(version: &str) -> Vec<u32> {
+    version
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .take(3)
+        .map(|part| part.parse::<u32>().unwrap_or(0))
+        .collect()
 }
 
 fn compile_shim_if_possible(include_dirs: &[PathBuf]) {

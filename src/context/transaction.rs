@@ -30,7 +30,12 @@ pub struct TransactionStore {
 }
 
 impl TransactionStore {
-    pub fn new(ttl: Duration) -> Self { Self { ttl, server: DashMap::new() } }
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            server: DashMap::new(),
+        }
+    }
 
     pub fn key_from_request(msg: &SipMessage, remote_addr: SocketAddr) -> Option<ServerTransactionKey> {
         let call_id = msg.call_id().ok()?;
@@ -63,14 +68,25 @@ impl TransactionStore {
 
     pub fn store_response(&self, key: &ServerTransactionKey, response: Bytes) {
         let now = Instant::now();
-        self.server.entry(key.clone())
-            .and_modify(|tx| { tx.last_seen = now; tx.last_response = Some(response.clone()); })
-            .or_insert(ServerTransaction { key: key.clone(), created_at: now, last_seen: now, last_response: Some(response) });
+        self.server
+            .entry(key.clone())
+            .and_modify(|tx| {
+                tx.last_seen = now;
+                tx.last_response = Some(response.clone());
+            })
+            .or_insert(ServerTransaction {
+                key: key.clone(),
+                created_at: now,
+                last_seen: now,
+                last_response: Some(response),
+            });
     }
 
-    pub fn cleanup(&self) {
+    pub fn cleanup(&self) -> usize {
         let ttl = self.ttl;
         let now = Instant::now();
+        let before = self.server.len();
         self.server.retain(|_, tx| now.duration_since(tx.last_seen) <= ttl);
+        before.saturating_sub(self.server.len())
     }
 }

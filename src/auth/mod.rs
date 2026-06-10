@@ -184,9 +184,11 @@ impl NonceStore {
         self.items.get(nonce).map(|v| Instant::now() <= *v).unwrap_or(false)
     }
 
-    pub fn cleanup(&self) {
+    pub fn cleanup(&self) -> usize {
         let now = Instant::now();
+        let before = self.items.len();
         self.items.retain(|_, expires| *expires > now);
+        before.saturating_sub(self.items.len())
     }
 }
 
@@ -224,7 +226,7 @@ impl std::fmt::Debug for VerifyDigestRequest<'_> {
         f.debug_struct("VerifyDigestRequest")
             .field("method", &self.method)
             .field("uri", &self.uri)
-            .field("authorization", &self.authorization)
+            .field("authorization", &"<redacted>")
             .field("realm", &self.realm)
             .field("nonce", &"<redacted>")
             .field("provider", &"<PasswordProvider>")

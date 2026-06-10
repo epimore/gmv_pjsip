@@ -1,6 +1,7 @@
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
 use crate::error::{Result, SipError};
 
+#[allow(dead_code)]
 pub fn create_digest_response(
     credential: &AuthCredential,
     method: &str,

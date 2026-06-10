@@ -21,7 +21,7 @@ pub use bytes::Bytes;
 pub use auth::{AuthAlgorithm, AuthConfig, AuthCredential, AuthDecision, CredentialKind, PasswordProvider, StaticPasswordProvider};
 pub use context::{
     CallStore, DialogId, DialogState, DialogStore, InviteCall, InviteState, RegisterBinding,
-    RegisterStore, SipContext, SipLocalConfig, TransactionStore,
+    CleanupReport, RegisterStore, SipContext, SipLocalConfig, TransactionStore,
 };
 pub use endpoint::{
     AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInvite, CreateMessage, IncomingInviteEvent,
