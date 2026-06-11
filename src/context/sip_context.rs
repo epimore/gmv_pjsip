@@ -14,7 +14,6 @@ use crate::context::{
     expires_at, CallStore, DialogId, DialogState, DialogStore, InviteCall, InviteState,
     RegisterBinding, RegisterStore, SipDialog, TransactionStore,
 };
-use crate::CreateSubscribe;
 use crate::endpoint::{
     AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInfo, CreateInvite, CreateMessage,
     CreatePlaybackSeekInfo, CreatePlaybackSpeedInfo, CreatePresetQueryMessage,
@@ -26,10 +25,12 @@ use crate::error::{Result, SipError};
 use crate::gb28181::sdp::{build_talk_sdp, SdpInfo, TalkSdpOptions};
 use crate::gb28181::xml;
 use crate::message::{
-    ensure_tag, extract_user_from_uri_like, HeaderMapExt, SipMessage, SipMethod, SipPacketKind,
+    ensure_tag, extract_uri, extract_user_from_uri_like, HeaderMapExt, SipMessage, SipMethod,
+    SipPacketKind,
 };
 use crate::parser::parse_sip_message;
 use crate::transport::{SipPacketMeta, SipTransportProtocol};
+use crate::CreateSubscribe;
 
 #[derive(Clone, Debug)]
 pub struct SipLocalConfig {
@@ -431,12 +432,18 @@ impl SipContext {
             local_contact: self.local.contact(meta.protocol),
             remote_target: msg
                 .contact()
-                .or_else(|| msg.request_uri().map(ToOwned::to_owned))
+                .as_deref()
+                .map(request_uri_value)
+                .or_else(|| msg.request_uri().map(request_uri_value))
                 .unwrap_or_default(),
             protocol: meta.protocol,
             local_cseq: 1,
             remote_cseq: msg.cseq()?.number,
-            route_set: Vec::new(),
+            route_set: msg
+                .headers("Record-Route")
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
             state: DialogState::Early,
             created_at: Instant::now(),
             updated_at: Instant::now(),
@@ -780,8 +787,16 @@ impl SipContext {
         };
         let remote_target = msg
             .contact()
+            .as_deref()
+            .map(request_uri_value)
             .unwrap_or_else(|| format!("sip:{}@{}", call.device_id, self.local.domain));
         let remote_sdp = String::from_utf8_lossy(&msg.body).to_string();
+        let route_set = msg
+            .headers("Record-Route")
+            .into_iter()
+            .rev()
+            .map(ToOwned::to_owned)
+            .collect();
 
         self.dialogs.insert(SipDialog {
             id: dialog_id.clone(),
@@ -792,7 +807,7 @@ impl SipContext {
             protocol: call.protocol,
             local_cseq: call.invite_cseq,
             remote_cseq: 0,
-            route_set: Vec::new(),
+            route_set,
             state: DialogState::Confirmed,
             created_at: Instant::now(),
             updated_at: Instant::now(),
@@ -832,9 +847,11 @@ impl SipContext {
             .dialogs
             .get(&dialog_id)
             .ok_or_else(|| SipError::DialogNotFound(call_id.into()))?;
-        let start_line = format!("ACK {} SIP/2.0", dialog.remote_target);
+        let (request_uri, routes) =
+            request_target_and_routes(&dialog.remote_target, &dialog.route_set);
+        let start_line = format!("ACK {request_uri} SIP/2.0");
         let branch = new_branch();
-        let headers = vec![
+        let mut headers = vec![
             (
                 "Via".into(),
                 via(
@@ -852,6 +869,7 @@ impl SipContext {
             ("Contact".into(), dialog.local_contact.clone()),
             ("User-Agent".into(), self.local.user_agent.clone()),
         ];
+        headers.extend(routes.into_iter().map(|route| ("Route".into(), route)));
         Ok(build_request(&start_line, &headers, None, None))
     }
 
@@ -866,7 +884,9 @@ impl SipContext {
             .dialogs
             .next_local_cseq(&dialog_id)
             .unwrap_or(dialog.local_cseq + 1);
-        let start_line = format!("INFO {} SIP/2.0", dialog.remote_target);
+        let (request_uri, routes) =
+            request_target_and_routes(&dialog.remote_target, &dialog.route_set);
+        let start_line = format!("INFO {request_uri} SIP/2.0");
         let branch = new_branch();
         let mut headers = vec![
             (
@@ -886,6 +906,7 @@ impl SipContext {
             ("Contact".into(), dialog.local_contact.clone()),
             ("User-Agent".into(), self.local.user_agent.clone()),
         ];
+        headers.extend(routes.into_iter().map(|route| ("Route".into(), route)));
         headers.extend(req.extra_headers);
         let _ = call;
         Ok(build_request(
@@ -1032,9 +1053,11 @@ impl SipContext {
             .dialogs
             .next_local_cseq(&dialog_id)
             .unwrap_or(dialog.local_cseq + 1);
-        let start_line = format!("BYE {} SIP/2.0", dialog.remote_target);
+        let (request_uri, routes) =
+            request_target_and_routes(&dialog.remote_target, &dialog.route_set);
+        let start_line = format!("BYE {request_uri} SIP/2.0");
         let branch = new_branch();
-        let headers = vec![
+        let mut headers = vec![
             (
                 "Via".into(),
                 via(
@@ -1052,6 +1075,7 @@ impl SipContext {
             ("Contact".into(), dialog.local_contact.clone()),
             ("User-Agent".into(), self.local.user_agent.clone()),
         ];
+        headers.extend(routes.into_iter().map(|route| ("Route".into(), route)));
         self.calls
             .update_state(&call.call_id, InviteState::Terminating);
         self.dialogs
@@ -1104,7 +1128,8 @@ impl SipContext {
         let to_header = req
             .to_header
             .unwrap_or_else(|| format!("<{}>", req.target_uri));
-        let start_line = format!("SUBSCRIBE {} SIP/2.0", req.target_uri);
+        let (request_uri, routes) = request_target_and_routes(&req.target_uri, &req.route_set);
+        let start_line = format!("SUBSCRIBE {request_uri} SIP/2.0");
         let mut headers = vec![
             (
                 "Via".into(),
@@ -1128,11 +1153,7 @@ impl SipContext {
             ("Expires".into(), req.expires.to_string()),
             ("User-Agent".into(), self.local.user_agent.clone()),
         ];
-        headers.extend(
-            req.route_set
-                .into_iter()
-                .map(|route| ("Route".to_string(), route)),
-        );
+        headers.extend(routes.into_iter().map(|route| ("Route".to_string(), route)));
         Ok(build_request(
             &start_line,
             &headers,
@@ -1150,6 +1171,29 @@ fn contact_supports_lr(contact: &str) -> bool {
             .next()
             .is_some_and(|name| name.trim().eq_ignore_ascii_case("lr"))
     })
+}
+
+fn request_target_and_routes(remote_target: &str, route_set: &[String]) -> (String, Vec<String>) {
+    let remote_uri = request_uri_value(remote_target);
+    let Some(first_route) = route_set.first() else {
+        return (remote_uri, Vec::new());
+    };
+    if contact_supports_lr(first_route) {
+        return (remote_uri, route_set.to_vec());
+    }
+
+    let request_uri = request_uri_value(first_route);
+    let mut routes = route_set[1..].to_vec();
+    routes.push(format!("<{remote_uri}>"));
+    (request_uri, routes)
+}
+
+fn request_uri_value(value: &str) -> String {
+    if value.contains('<') {
+        extract_uri(value).unwrap_or_else(|| value.trim().to_string())
+    } else {
+        value.trim().to_string()
+    }
 }
 
 fn parse_expires(msg: &SipMessage) -> Option<u32> {

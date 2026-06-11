@@ -9,7 +9,7 @@ use gmv_pjsip::auth::{
 use gmv_pjsip::message::HeaderMapExt;
 use gmv_pjsip::parser::parse_sip_message;
 use gmv_pjsip::{
-    CreateBye, CreateInvite, SipContext, SipEvent, SipLocalConfig, SipPacketMeta,
+    CreateBye, CreateInvite, CreateSubscribe, SipContext, SipEvent, SipLocalConfig, SipPacketMeta,
     SipTransportProtocol,
 };
 
@@ -254,6 +254,8 @@ To: {};tag=device-to-tag\r\n\
 Call-ID: {}\r\n\
 CSeq: 7 INVITE\r\n\
 Contact: <sip:34020000001320000001@192.168.1.20:5060;transport=tcp>\r\n\
+Record-Route: <sip:proxy1.example.com;lr>\r\n\
+Record-Route: <sip:proxy2.example.com;lr>\r\n\
 Content-Type: application/sdp\r\n\
 Content-Length: {}\r\n\r\n{}",
         header(&invite, "Via"),
@@ -274,11 +276,21 @@ Content-Length: {}\r\n\r\n{}",
     }
 
     let ack = &out.sends[0].1;
-    assert!(String::from_utf8_lossy(ack).starts_with("ACK "));
+    assert!(
+        String::from_utf8_lossy(ack)
+            .starts_with("ACK sip:34020000001320000001@192.168.1.20:5060;transport=tcp SIP/2.0"),
+        "{}",
+        String::from_utf8_lossy(ack)
+    );
     assert!(header(ack, "Via").starts_with("SIP/2.0/TCP"));
     assert_eq!(header(ack, "CSeq"), "7 ACK");
     assert_eq!(header(ack, "From"), from);
     assert!(header(ack, "To").contains("device-to-tag"));
+    let parsed_ack = parse_sip_message(ack.clone()).unwrap();
+    assert_eq!(
+        parsed_ack.headers("Route"),
+        vec!["<sip:proxy2.example.com;lr>", "<sip:proxy1.example.com;lr>"]
+    );
 }
 
 #[test]
@@ -307,6 +319,7 @@ To: {};tag=device-to-tag\r\n\
 Call-ID: invite-call-2\r\n\
 CSeq: 1 INVITE\r\n\
 Contact: <sip:34020000001320000001@192.168.1.20:5060;transport=tcp>\r\n\
+Record-Route: <sip:proxy.example.com;lr>\r\n\
 Content-Length: 0\r\n\r\n",
         header(&invite, "Via"),
         header(&invite, "From"),
@@ -322,9 +335,15 @@ Content-Length: 0\r\n\r\n",
             stream_id: None,
         })
         .unwrap();
-    assert!(String::from_utf8_lossy(&bye).starts_with("BYE "));
+    assert!(
+        String::from_utf8_lossy(&bye)
+            .starts_with("BYE sip:34020000001320000001@192.168.1.20:5060;transport=tcp SIP/2.0"),
+        "{}",
+        String::from_utf8_lossy(&bye)
+    );
     assert!(header(&bye, "Via").starts_with("SIP/2.0/TCP"));
     assert_eq!(header(&bye, "CSeq"), "2 BYE");
+    assert_eq!(header(&bye, "Route"), "<sip:proxy.example.com;lr>");
 
     let remote_bye = Bytes::from(format!(
         "BYE sip:34020000002000000001@192.168.1.10:5060;transport=tcp SIP/2.0\r\n\
@@ -421,6 +440,7 @@ To: {};tag=device-to-tag\r\n\
 Call-ID: info-call-1\r\n\
 CSeq: 11 INVITE\r\n\
 Contact: <sip:34020000001320000001@192.168.1.20:5060;transport=tcp>\r\n\
+Record-Route: <sip:proxy.example.com;lr>\r\n\
 Content-Length: 0\r\n\r\n",
         header(&invite, "Via"),
         header(&invite, "From"),
@@ -440,6 +460,7 @@ Content-Length: 0\r\n\r\n",
         .unwrap();
     assert!(String::from_utf8_lossy(&seek).starts_with("INFO "));
     assert!(header(&seek, "Via").starts_with("SIP/2.0/TCP"));
+    assert_eq!(header(&seek, "Route"), "<sip:proxy.example.com;lr>");
     assert!(String::from_utf8_lossy(&seek).contains("Range: npt=12.500-"));
 
     let speed = ctx
@@ -453,6 +474,7 @@ Content-Length: 0\r\n\r\n",
         .unwrap();
     assert!(String::from_utf8_lossy(&speed).contains("Scale: 4.000"));
     assert!(String::from_utf8_lossy(&speed).contains("Range: npt=20.000-"));
+    assert_eq!(header(&speed, "Route"), "<sip:proxy.example.com;lr>");
 }
 
 #[test]
@@ -597,6 +619,8 @@ From: <sip:34020000001320000001@3402000000>;tag=from1\r\n\
 To: <sip:34020000002000000001@3402000000>;tag=to1\r\n\
 Call-ID: notify-call-1\r\n\
 CSeq: 3 NOTIFY\r\n\
+Event: Catalog;id=123456\r\n\
+Subscription-State: active;expires=3500\r\n\
 Content-Type: Application/MANSCDP+xml\r\n\
 Content-Length: {}\r\n\r\n{}",
         body.len(),
@@ -613,10 +637,73 @@ Content-Length: {}\r\n\r\n{}",
             assert_eq!(event.method, gmv_pjsip::SipMethod::Notify);
             assert_eq!(event.call_id.as_deref(), Some("notify-call-1"));
             assert_eq!(event.cseq, Some(3));
+            assert_eq!(event.event.as_deref(), Some("Catalog;id=123456"));
+            assert_eq!(event.from_tag.as_deref(), Some("from1"));
+            assert_eq!(event.to_tag.as_deref(), Some("to1"));
+            assert_eq!(
+                event.subscription_state.as_deref(),
+                Some("active;expires=3500")
+            );
             assert_eq!(
                 event.content_type.as_deref(),
                 Some("Application/MANSCDP+xml")
             );
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_builder_and_response_expose_dialog_metadata() {
+    let ctx = SipContext::new(local_config());
+    let request = ctx
+        .create_subscribe(CreateSubscribe {
+            target_uri: "sip:34020000001320000001@192.168.1.20:5060".into(),
+            body: Bytes::from_static(b"<Query><CmdType>Catalog</CmdType></Query>"),
+            content_type: "Application/MANSCDP+xml".into(),
+            protocol: SipTransportProtocol::Udp,
+            call_id: Some("subscribe-call-2".into()),
+            cseq: Some(12),
+            event: "Catalog;id=987654".into(),
+            expires: 3600,
+            from_header: None,
+            to_header: None,
+            route_set: vec!["<sip:proxy.example.com;lr>".into()],
+        })
+        .unwrap();
+    let parsed = parse_sip_message(request).unwrap();
+    assert_eq!(parsed.method(), Some(&gmv_pjsip::SipMethod::Subscribe));
+    assert_eq!(parsed.call_id().unwrap(), "subscribe-call-2");
+    assert_eq!(parsed.header("Event"), Some("Catalog;id=987654"));
+    assert_eq!(parsed.header("Expires"), Some("3600"));
+    assert_eq!(parsed.header("Route"), Some("<sip:proxy.example.com;lr>"));
+    assert!(parsed.header("Contact").is_some());
+
+    let response = Bytes::from_static(
+        b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 192.168.1.10:5060;branch=z9hG4bK-response\r\n\
+From: <sip:34020000002000000001@3402000000>;tag=local1\r\n\
+To: <sip:34020000001320000001@3402000000>;tag=remote1\r\n\
+Call-ID: subscribe-call-2\r\n\
+CSeq: 12 SUBSCRIBE\r\n\
+Contact: <sip:34020000001320000001@192.168.1.20:5080>\r\n\
+Record-Route: <sip:proxy1.example.com;lr>\r\n\
+Record-Route: <sip:proxy2.example.com;lr>\r\n\
+Expires: 3500\r\n\
+Content-Length: 0\r\n\r\n",
+    );
+    let out = ctx
+        .handle_rx_packet(response, meta(SipTransportProtocol::Udp))
+        .unwrap();
+    match out.event.unwrap() {
+        SipEvent::StandardResponse(event) => {
+            assert_eq!(event.method, gmv_pjsip::SipMethod::Subscribe);
+            assert_eq!(event.call_id, "subscribe-call-2");
+            assert_eq!(event.cseq, 12);
+            assert_eq!(event.status, 200);
+            assert_eq!(event.to_tag.as_deref(), Some("remote1"));
+            assert_eq!(event.expires, Some(3500));
+            assert_eq!(event.record_routes.len(), 2);
         }
         other => panic!("unexpected event: {other:?}"),
     }
