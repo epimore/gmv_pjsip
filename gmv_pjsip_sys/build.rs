@@ -147,14 +147,11 @@ fn verify_include_dir(include_dir: &Path) {
         }
     }
 
-    // Do not validate manual include/lib mode via `pj/version.h`.
-    //
-    // PJPROJECT install prefixes do not consistently ship version metadata under
-    // `$prefix/include/pj/version.h`. In manual mode, API availability is
-    // validated by compiling `shim.c` against the selected headers.
-    //
-    // Version validation is kept only for pkg-config mode, where
-    // `libpjproject.pc` provides a reliable version string.
+    // Manual include/lib mode intentionally does not validate pj/version.h.
+    // Installed PJPROJECT include trees do not consistently ship version metadata.
+    // API availability is validated by compiling shim.c. pkg-config mode still
+    // validates the libpjproject.pc version string.
+
 }
 
 fn dynamic_linking(dll_path: &Path) {
@@ -298,8 +295,8 @@ fn is_pjproject_split_lib(lib: &str) -> bool {
         "pjlib-util",
         "pj",
     ]
-        .iter()
-        .any(|base| matches_pj_lib(lib, base))
+    .iter()
+    .any(|base| matches_pj_lib(lib, base))
 }
 
 fn emit_ordered_static_pj_libs(libs: &[String]) {
@@ -448,19 +445,9 @@ fn compile_shim_if_possible(include_dirs: &[PathBuf]) {
         build.include(dir);
     }
 
-    // The auth shim is a tiny internal C bridge. It includes PJPROJECT headers,
-    // and some PJPROJECT builds intentionally override macros in config_site.h,
-    // for example PJ_HAS_SSL_SOCK. That may produce harmless compiler warnings
-    // which otherwise bubble up to the final application as Cargo warnings.
-    //
-    // Default behavior: suppress C compiler warnings for this shim only.
-    // Real C compile errors are still reported and still fail the build.
-    //
-    // Debugging behavior:
-    //   GMV_PJSIP_SYS_SHOW_C_WARNINGS=1 cargo build
-    //
-    // This keeps downstream applications clean while still allowing local
-    // investigation when needed.
+    // Keep downstream applications clean. PJPROJECT headers may emit harmless
+    // warnings caused by config_site.h overrides. Real C compile errors still
+    // fail the build. Set GMV_PJSIP_SYS_SHOW_C_WARNINGS=1 to inspect warnings.
     if env::var_os("GMV_PJSIP_SYS_SHOW_C_WARNINGS").is_some() {
         build.flag_if_supported("-Wno-unused-parameter");
         build.flag_if_supported("-Wno-macro-redefined");
@@ -471,14 +458,6 @@ fn compile_shim_if_possible(include_dirs: &[PathBuf]) {
     }
 
     build.compile("gmv_pjsip_auth_shim");
-}
-
-fn target_env() -> String {
-    env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default()
-}
-
-fn is_msvc_target() -> bool {
-    is_windows_target() && target_env() == "msvc"
 }
 
 fn write_bindings(envs: &EnvVars, include_dirs: &[PathBuf], output_binding_path: &Path) {
@@ -557,8 +536,16 @@ fn target_os() -> String {
     env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| env::consts::OS.to_owned())
 }
 
+fn target_env() -> String {
+    env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default()
+}
+
 fn is_windows_target() -> bool {
     target_os() == "windows"
+}
+
+fn is_msvc_target() -> bool {
+    is_windows_target() && target_env() == "msvc"
 }
 
 fn emit_platform_system_libs() {

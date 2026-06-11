@@ -1,90 +1,80 @@
 # gmv_pjsip
 
-`gmv_pjsip` is a GB28181-oriented SIP context library built around PJPROJECT/PJSIP.
-It is intended to sit between GMV's async IO/session layer and the low-level
-`gmv_pjsip_sys` FFI bindings.
+`gmv_pjsip` is the GB28181-oriented SIP context layer used by GMV.
 
-## Crates
-
-- `gmv_pjsip_sys`: low-level PJPROJECT/PJSIP bindgen crate.
-- `gmv_pjsip`: safe SIP parsing, response/request building, REGISTER/MESSAGE/INVITE/BYE context, transaction de-duplication, dialog state, and digest-auth helpers.
-
-## Build model
-
-`gmv_pjsip_sys` does **not** download PJPROJECT. The main application, CI image,
-Dockerfile, or bootstrap script should build/install PJPROJECT and then expose it
-to Cargo through one of these mechanisms:
-
-```toml
-# .cargo/config.toml in the main application, not committed by this library.
-[env]
-PJSIP_INCLUDE_DIR = { value = "third_party/pjproject-2.17/dist/include", relative = true }
-PJSIP_LIBS_DIR    = { value = "third_party/pjproject-2.17/dist/lib", relative = true }
-```
-
-or:
-
-```toml
-[env]
-PJSIP_PKG_CONFIG_PATH = { value = "third_party/pjproject-2.17/dist/lib/pkgconfig", relative = true }
-```
-
-Supported environment variables:
-
-- `PJSIP_INCLUDE_DIR`
-- `PJSIP_DLL_PATH`
-- `PJSIP_PKG_CONFIG_PATH`
-- `PJSIP_LIBS_DIR`
-- `PJSIP_BINDING_PATH`
-
-Priority:
+Layering:
 
 ```text
-PJSIP_DLL_PATH > PJSIP_LIBS_DIR > PJSIP_PKG_CONFIG_PATH > system pkg-config
+gmv_pjsip_sys  -> raw PJPROJECT/PJSIP FFI and auth shim
+gmv_pjsip      -> safe SIP parser/builder/context/dialog/transaction API
+session         -> business logic; does not build SIP headers manually
 ```
 
-`pkg-config` is only a discovery mechanism. It does not download dependencies.
-The default `pkg-config` path requires `libpjproject >= 2.15.1`; PJPROJECT 2.17
-is recommended for GMV.
+## Current mid-term capabilities
 
-## Runtime boundary
+- REGISTER digest challenge/verify and registration binding context.
+- MESSAGE handling and automatic 200 OK response.
+- INVITE dialog/call context and ACK/BYE generation.
+- In-dialog INFO safe API for playback seek/speed.
+- Talk-specific INVITE + SDP helpers.
+- Snapshot/preset helper APIs:
+  - PresetQuery MESSAGE body generation.
+  - SnapShotConfig MESSAGE body generation.
+  - UploadSnapShotFinished event extraction with `snapshot_session_id`.
+- Timed cleanup of transactions, registers, dialogs, calls, and nonce cache.
 
-`session` should depend on `gmv_pjsip`, not `gmv_pjsip_sys`.
+## Build configuration
 
-Recommended flow:
+Prefer project-controlled PJPROJECT 2.17+ builds:
 
-```text
-io.rs receives bytes
-  -> SipContext::handle_rx_packet(bytes, meta)
-  -> SipAction / SipEvent
-  -> GMV session handles business events
-  -> io.rs sends SipOutput bytes
+```toml
+[env]
+PJSIP_INCLUDE_DIR = { value = "../gmv/third_party/pjproject-2.17/dist/include", relative = true }
+PJSIP_LIBS_DIR    = { value = "../gmv/third_party/pjproject-2.17/dist/lib", relative = true }
 ```
 
-SIP header correctness, Call-ID/CSeq/tag/branch generation, transaction replay,
-REGISTER bindings, Dialog state, INVITE/ACK/BYE state, and digest helpers are
-centralized in this crate.
+`pkg-config` is also supported. If no explicit environment variables are set,
+`gmv_pjsip_sys` probes `libpjproject` through the default pkg-config path.
 
-## Authentication status
+## New business APIs
 
-The production path uses PJSIP digest calculation through `gmv_pjsip_sys` shim
-functions. A pure Rust MD5 fallback is kept for tests or builds without
-PJPROJECT by disabling default features.
+Playback seek/speed should use:
 
-Full `pjsip_auth_srv_verify()` / `pjsip_auth_srv_challenge2()` integration is a
-future step because it requires retaining live `pjsip_rx_data` / `pjsip_tx_data`
-objects across the parser/auth/builder boundary.
-
-## Tests
-
-With PJPROJECT available:
-
-```bash
-cargo test
+```rust
+SipContext::create_playback_seek_info(...)
+SipContext::create_playback_speed_info(...)
 ```
 
-Without PJPROJECT, run the Rust-only flow tests with the fallback digest path:
+Talk should use:
 
-```bash
-cargo test --no-default-features
+```rust
+SipContext::create_talk_invite(...)
 ```
+
+Preset snapshot support should use:
+
+```rust
+SipContext::create_preset_query_message(...)
+SipContext::create_snapshot_control_message(...)
+```
+
+Incoming snapshot completion is delivered as:
+
+```rust
+SipEvent::Message(MessageEvent {
+    kind: MessageKind::UploadSnapshotFinished,
+    snapshot_session_id: Some(...),
+    ..
+})
+```
+
+## Notes
+
+`gmv_pjsip` owns SIP context. Session/business code should not manually compose
+Via, From/To tag, Call-ID, CSeq, branch, Contact, ACK, BYE, or in-dialog INFO
+headers.
+
+
+## SIP method coverage
+
+The safe layer recognizes the standard method set used by GB28181 and common SIP extensions: ACK, BYE, CANCEL, INFO, INVITE, MESSAGE, NOTIFY, OPTIONS, PRACK, PUBLISH, REFER, REGISTER, SUBSCRIBE, UPDATE. See `SIP_METHODS.md` for response policy and extension handling.

@@ -10,11 +10,14 @@ use crate::context::{
     RegisterBinding, RegisterStore, SipDialog, TransactionStore,
 };
 use crate::endpoint::{
-    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInvite, CreateMessage, IncomingInviteEvent,
-    InviteAcceptedEvent, MessageEvent, MessageKind, RegisterEvent, SipAction, SipEvent,
+    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInfo, CreateInvite, CreateMessage, CreatePlaybackSeekInfo,
+    CreatePlaybackSpeedInfo, CreatePresetQueryMessage, CreateSnapshotControlMessage,
+    CreateTalkInvite, IncomingInviteEvent, InviteAcceptedEvent, MessageEvent, MessageKind,
+    RegisterEvent, SipAction, SipEvent, StandardRequestEvent, StandardResponseEvent,
 };
 use crate::error::{Result, SipError};
-use crate::gb28181::sdp::SdpInfo;
+use crate::gb28181::sdp::{build_talk_sdp, SdpInfo, TalkSdpOptions};
+use crate::gb28181::xml;
 use crate::message::{ensure_tag, extract_user_from_uri_like, HeaderMapExt, SipMessage, SipMethod, SipPacketKind};
 use crate::parser::parse_sip_message;
 use crate::transport::{SipPacketMeta, SipTransportProtocol};
@@ -103,16 +106,27 @@ impl SipContext {
             self.transactions.mark_seen(key.clone());
         }
 
-        let action = match method {
-            SipMethod::Register => self.handle_register(&msg, &meta),
-            SipMethod::Message => self.handle_message(&msg, &meta),
-            SipMethod::Invite => self.handle_incoming_invite(&msg, &meta),
-            SipMethod::Ack => self.handle_ack(&msg),
-            SipMethod::Bye => self.handle_bye(&msg),
-            SipMethod::Cancel => self.handle_cancel(&msg),
-            SipMethod::Options => self.simple_ok(&msg, None),
-            SipMethod::Other(m) => Err(SipError::UnsupportedMethod(m)),
-        }?;
+        let action = if let Some(action) = self.validate_request_method_cseq(&msg, &method)? {
+            action
+        } else {
+            match method {
+                SipMethod::Register => self.handle_register(&msg, &meta),
+                SipMethod::Message => self.handle_message(&msg, &meta),
+                SipMethod::Invite => self.handle_incoming_invite(&msg, &meta),
+                SipMethod::Info => self.simple_ok(&msg, None),
+                SipMethod::Ack => self.handle_ack(&msg),
+                SipMethod::Bye => self.handle_bye(&msg),
+                SipMethod::Cancel => self.handle_cancel(&msg),
+                SipMethod::Options => self.handle_options(&msg, &meta),
+                SipMethod::Notify => self.handle_standard_in_dialog_request(&msg, &meta, SipMethod::Notify, true),
+                SipMethod::Update => self.handle_standard_in_dialog_request(&msg, &meta, SipMethod::Update, true),
+                SipMethod::Prack => self.handle_standard_in_dialog_request(&msg, &meta, SipMethod::Prack, true),
+                SipMethod::Publish | SipMethod::Refer | SipMethod::Subscribe => {
+                    self.not_implemented(&msg, Some(method))
+                }
+                SipMethod::Other(_) => self.not_implemented(&msg, Some(method)),
+            }?
+        };
 
         if let (Some(key), Some(bytes)) = (tx_key.as_ref(), action.first_tx_bytes()) {
             self.transactions.store_response(key, bytes.clone());
@@ -138,11 +152,64 @@ impl SipContext {
             return Ok(SipAction::Event(SipEvent::InviteFailed { call_id, status: code }));
         }
 
+        if cseq.method.eq_ignore_ascii_case("INFO") {
+            if (100..200).contains(&code) {
+                return Ok(SipAction::Event(SipEvent::InfoProceeding { call_id, status: code }));
+            }
+            if (200..300).contains(&code) {
+                return Ok(SipAction::Event(SipEvent::InfoAccepted { call_id, status: code }));
+            }
+            return Ok(SipAction::Event(SipEvent::InfoFailed { call_id, status: code }));
+        }
+
         if cseq.method.eq_ignore_ascii_case("BYE") && (200..300).contains(&code) {
             self.calls.update_state(&call_id, InviteState::Terminated);
             return Ok(SipAction::Event(SipEvent::ByeConfirmed(ByeEvent { call_id, stream_id: None, device_id: None })));
         }
-        Ok(SipAction::Ignore)
+
+        Ok(SipAction::Event(SipEvent::StandardResponse(StandardResponseEvent {
+            method: SipMethod::parse(&cseq.method),
+            call_id,
+            status: code,
+        })))
+    }
+
+    fn validate_request_method_cseq(&self, msg: &SipMessage, method: &SipMethod) -> Result<Option<SipAction>> {
+        let cseq = match msg.cseq() {
+            Ok(cseq) => cseq,
+            Err(_) => {
+                let resp = build_response(
+                    msg,
+                    ResponseOptions {
+                        status_code: 400,
+                        reason: Some("Bad CSeq".into()),
+                        server: Some(self.local.user_agent.clone()),
+                        extra_headers: self.standard_capability_headers(),
+                        ..Default::default()
+                    },
+                );
+                return Ok(Some(SipAction::Send(resp)));
+            }
+        };
+
+        if !cseq.method.eq_ignore_ascii_case(method.as_str()) {
+            let resp = build_response(
+                msg,
+                ResponseOptions {
+                    status_code: 400,
+                    reason: Some("CSeq Method Mismatch".into()),
+                    server: Some(self.local.user_agent.clone()),
+                    extra_headers: vec![
+                        ("Allow".into(), SipMethod::allow_header_value().into()),
+                        ("Warning".into(), format!("CSeq method {} does not match request method {}", cseq.method, method)),
+                    ],
+                    ..Default::default()
+                },
+            );
+            return Ok(Some(SipAction::Send(resp)));
+        }
+
+        Ok(None)
     }
 
     fn handle_register(&self, msg: &SipMessage, meta: &SipPacketMeta) -> Result<SipAction> {
@@ -219,13 +286,18 @@ impl SipContext {
     }
 
     fn handle_message(&self, msg: &SipMessage, meta: &SipPacketMeta) -> Result<SipAction> {
+        let body_text = String::from_utf8_lossy(&msg.body);
+        let cmd_type = xml::cmd_type_lossy(&body_text);
         let event = SipEvent::Message(MessageEvent {
             kind: classify_message_body(&msg.body),
-            device_id: extract_user_from_uri_like(msg.header("From").unwrap_or_default()),
+            device_id: xml::device_id_lossy(&body_text)
+                .or_else(|| extract_user_from_uri_like(msg.header("From").unwrap_or_default())),
             call_id: msg.call_id().ok(),
             cseq: msg.cseq().ok().map(|c| c.number),
             association: meta.association(),
             content_type: msg.header("Content-Type").map(ToOwned::to_owned),
+            cmd_type,
+            snapshot_session_id: xml::session_id_lossy(&body_text),
             body: msg.body.clone(),
         });
         let resp = build_response(msg, ResponseOptions { status_code: 200, server: Some(self.local.user_agent.clone()), ..Default::default() });
@@ -309,6 +381,107 @@ impl SipContext {
         let event = SipEvent::Cancel(CancelEvent { call_id });
         let resp = build_response(msg, ResponseOptions { status_code: 200, server: Some(self.local.user_agent.clone()), ..Default::default() });
         Ok(SipAction::SendAndEvent { bytes: resp, event })
+    }
+
+    fn handle_options(&self, msg: &SipMessage, meta: &SipPacketMeta) -> Result<SipAction> {
+        let resp = build_response(
+            msg,
+            ResponseOptions {
+                status_code: 200,
+                server: Some(self.local.user_agent.clone()),
+                contact: Some(self.local.contact(meta.protocol)),
+                extra_headers: self.standard_capability_headers(),
+                ..Default::default()
+            },
+        );
+        Ok(SipAction::Send(resp))
+    }
+
+    fn handle_standard_in_dialog_request(
+        &self,
+        msg: &SipMessage,
+        meta: &SipPacketMeta,
+        method: SipMethod,
+        emit_event: bool,
+    ) -> Result<SipAction> {
+        let call_id = msg.call_id().ok();
+
+        if method.is_dialog_method() {
+            match call_id.as_deref().and_then(|id| self.dialogs.get_by_call_id(id)) {
+                Some(dialog) => self.dialogs.update_state(&dialog.id, DialogState::Confirmed),
+                None if matches!(method, SipMethod::Notify) => {}
+                None => return self.dialog_missing(msg),
+            }
+        }
+
+        let event = emit_event.then(|| self.standard_request_event(msg, meta, method));
+        self.simple_ok_with_headers(msg, self.standard_capability_headers(), event)
+    }
+
+    fn standard_request_event(&self, msg: &SipMessage, meta: &SipPacketMeta, method: SipMethod) -> SipEvent {
+        SipEvent::StandardRequest(StandardRequestEvent {
+            method,
+            call_id: msg.call_id().ok(),
+            cseq: msg.cseq().ok().map(|c| c.number),
+            association: meta.association(),
+            content_type: msg.header("Content-Type").map(ToOwned::to_owned),
+            body: msg.body.clone(),
+        })
+    }
+
+    fn standard_capability_headers(&self) -> Vec<(String, String)> {
+        vec![
+            ("Allow".into(), SipMethod::allow_header_value().into()),
+            ("Accept".into(), "application/sdp, Application/MANSCDP+xml, Application/MANSRTSP".into()),
+        ]
+    }
+
+    fn not_implemented(&self, msg: &SipMessage, method: Option<SipMethod>) -> Result<SipAction> {
+        let mut headers = self.standard_capability_headers();
+        if let Some(method) = method {
+            headers.push(("Unsupported-Method".into(), method.to_string()));
+        }
+        let resp = build_response(
+            msg,
+            ResponseOptions {
+                status_code: 501,
+                server: Some(self.local.user_agent.clone()),
+                extra_headers: headers,
+                ..Default::default()
+            },
+        );
+        Ok(SipAction::Send(resp))
+    }
+
+    fn dialog_missing(&self, msg: &SipMessage) -> Result<SipAction> {
+        let resp = build_response(
+            msg,
+            ResponseOptions {
+                status_code: 481,
+                server: Some(self.local.user_agent.clone()),
+                extra_headers: self.standard_capability_headers(),
+                ..Default::default()
+            },
+        );
+        Ok(SipAction::Send(resp))
+    }
+
+    fn simple_ok_with_headers(
+        &self,
+        msg: &SipMessage,
+        extra_headers: Vec<(String, String)>,
+        event: Option<SipEvent>,
+    ) -> Result<SipAction> {
+        let resp = build_response(
+            msg,
+            ResponseOptions {
+                status_code: 200,
+                server: Some(self.local.user_agent.clone()),
+                extra_headers,
+                ..Default::default()
+            },
+        );
+        Ok(match event { Some(event) => SipAction::SendAndEvent { bytes: resp, event }, None => SipAction::Send(resp) })
     }
 
     fn simple_ok(&self, msg: &SipMessage, event: Option<SipEvent>) -> Result<SipAction> {
@@ -435,6 +608,118 @@ impl SipContext {
         Ok(build_request(&start_line, &headers, None, None))
     }
 
+
+    /// Build an in-dialog SIP INFO request. This is the safe primitive used by
+    /// playback seek/speed and future GB28181 in-dialog controls. The caller
+    /// supplies only business body/content-type; dialog headers are generated
+    /// from stored SIP context.
+    pub fn create_info(&self, req: CreateInfo) -> Result<Bytes> {
+        let (call, dialog_id, dialog) = self.resolve_call_dialog(req.call_id.as_deref(), req.stream_id.as_deref())?;
+        let cseq = self.dialogs.next_local_cseq(&dialog_id).unwrap_or(dialog.local_cseq + 1);
+        let start_line = format!("INFO {} SIP/2.0", dialog.remote_target);
+        let branch = new_branch();
+        let mut headers = vec![
+            ("Via".into(), via(&self.local.public_host, self.local.listen_port, dialog.protocol, &branch)),
+            ("Max-Forwards".into(), "70".into()),
+            ("From".into(), dialog.local_uri.clone()),
+            ("To".into(), dialog.remote_uri.clone()),
+            ("Call-ID".into(), dialog.id.call_id.clone()),
+            ("CSeq".into(), format!("{} INFO", cseq)),
+            ("Contact".into(), dialog.local_contact.clone()),
+            ("User-Agent".into(), self.local.user_agent.clone()),
+        ];
+        headers.extend(req.extra_headers);
+        let _ = call;
+        Ok(build_request(&start_line, &headers, Some(req.body), Some(&req.content_type)))
+    }
+
+    pub fn create_playback_seek_info(&self, req: CreatePlaybackSeekInfo) -> Result<Bytes> {
+        let body = xml::build_mansrtsp_seek_body(req.seek_second, req.rtsp_cseq.unwrap_or(1));
+        self.create_info(CreateInfo {
+            call_id: req.call_id,
+            stream_id: req.stream_id,
+            body: Bytes::from(body),
+            content_type: xml::CONTENT_TYPE_MANSRTSP.to_string(),
+            extra_headers: Vec::new(),
+        })
+    }
+
+    pub fn create_playback_speed_info(&self, req: CreatePlaybackSpeedInfo) -> Result<Bytes> {
+        let body = xml::build_mansrtsp_speed_body(req.scale, req.range_start_second, req.rtsp_cseq.unwrap_or(1));
+        self.create_info(CreateInfo {
+            call_id: req.call_id,
+            stream_id: req.stream_id,
+            body: Bytes::from(body),
+            content_type: xml::CONTENT_TYPE_MANSRTSP.to_string(),
+            extra_headers: Vec::new(),
+        })
+    }
+
+    pub fn create_talk_invite(&self, req: CreateTalkInvite) -> Result<Bytes> {
+        let ssrc = req.ssrc.unwrap_or_else(|| rand::random::<u32>());
+        let sdp = build_talk_sdp(TalkSdpOptions {
+            ip: req.media_ip,
+            port: req.media_port,
+            ssrc,
+            payload_type: req.payload_type,
+            codec: req.codec,
+            mode: req.mode,
+        });
+        self.create_invite(CreateInvite {
+            device_id: req.device_id,
+            channel_id: req.channel_id,
+            stream_id: req.talk_id,
+            target_uri: req.target_uri,
+            sdp,
+            ssrc: Some(ssrc),
+            protocol: req.protocol,
+            call_id: req.call_id,
+            cseq: req.cseq,
+            subject: req.subject,
+        })
+    }
+
+    pub fn create_preset_query_message(&self, req: CreatePresetQueryMessage) -> Result<Bytes> {
+        self.create_message(CreateMessage {
+            target_uri: req.target_uri,
+            body: Bytes::from(xml::build_preset_query_xml(&req.device_id)),
+            content_type: xml::CONTENT_TYPE_MANSCDP_XML.to_string(),
+            protocol: req.protocol,
+            call_id: req.call_id,
+            cseq: req.cseq,
+        })
+    }
+
+    pub fn create_snapshot_control_message(&self, req: CreateSnapshotControlMessage) -> Result<Bytes> {
+        self.create_message(CreateMessage {
+            target_uri: req.target_uri,
+            body: Bytes::from(xml::build_snapshot_control_xml(
+                &req.channel_id,
+                req.snap_num,
+                req.interval,
+                &req.upload_url,
+                &req.session_id,
+            )),
+            content_type: xml::CONTENT_TYPE_MANSCDP_XML.to_string(),
+            protocol: req.protocol,
+            call_id: req.call_id,
+            cseq: req.cseq,
+        })
+    }
+
+    fn resolve_call_dialog(&self, call_id: Option<&str>, stream_id: Option<&str>) -> Result<(InviteCall, DialogId, SipDialog)> {
+        let call = if let Some(call_id) = call_id {
+            self.calls.get(call_id).ok_or_else(|| SipError::CallNotFound(call_id.into()))?
+        } else if let Some(stream_id) = stream_id {
+            self.calls.get_by_stream(stream_id).ok_or_else(|| SipError::CallNotFound(stream_id.into()))?
+        } else {
+            return Err(SipError::CallNotFound("missing call_id or stream_id".into()));
+        };
+        let dialog_id = call.dialog_id.clone().ok_or_else(|| SipError::DialogNotFound(call.call_id.clone()))?;
+        let dialog = self.dialogs.get(&dialog_id).ok_or_else(|| SipError::DialogNotFound(call.call_id.clone()))?;
+        Ok((call, dialog_id, dialog))
+    }
+
     pub fn create_bye(&self, req: CreateBye) -> Result<Bytes> {
         let call = if let Some(call_id) = req.call_id.as_deref() {
             self.calls.get(call_id).ok_or_else(|| SipError::CallNotFound(call_id.into()))?
@@ -497,9 +782,17 @@ fn auth_username(auth: &AuthDecision) -> Option<String> {
 
 fn classify_message_body(body: &Bytes) -> MessageKind {
     let text = String::from_utf8_lossy(body);
-    if text.contains("<CmdType>Keepalive</CmdType>") { MessageKind::Keepalive }
-    else if text.contains("<CmdType>Catalog</CmdType>") { MessageKind::Catalog }
-    else if text.contains("<CmdType>DeviceInfo</CmdType>") { MessageKind::DeviceInfo }
-    else if text.contains("<CmdType>Alarm</CmdType>") { MessageKind::Alarm }
-    else { MessageKind::Unknown }
+    match xml::cmd_type_lossy(&text).as_deref() {
+        Some("Keepalive") => MessageKind::Keepalive,
+        Some("Catalog") => MessageKind::Catalog,
+        Some("DeviceInfo") => MessageKind::DeviceInfo,
+        Some("RecordInfo") => MessageKind::RecordInfo,
+        Some("Alarm") => MessageKind::Alarm,
+        Some("MediaStatus") => MessageKind::MediaStatus,
+        Some("DeviceControl") => MessageKind::DeviceControl,
+        Some("DeviceConfig") => MessageKind::DeviceConfig,
+        Some("PresetQuery") => MessageKind::PresetQuery,
+        Some("UploadSnapShotFinished") => MessageKind::UploadSnapshotFinished,
+        _ => MessageKind::Unknown,
+    }
 }

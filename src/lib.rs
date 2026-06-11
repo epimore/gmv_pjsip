@@ -24,11 +24,14 @@ pub use context::{
     CleanupReport, RegisterStore, SipContext, SipLocalConfig, TransactionStore,
 };
 pub use endpoint::{
-    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInvite, CreateMessage, IncomingInviteEvent,
+    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInfo, CreateInvite, CreateMessage, CreatePlaybackSeekInfo,
+    CreatePlaybackSpeedInfo, CreatePresetQueryMessage, CreateSnapshotControlMessage,
+    CreateTalkInvite, IncomingInviteEvent,
     InviteAcceptedEvent, MessageEvent, MessageKind, RegisterEvent, SipAction, SipEndpoint,
-    SipEvent, SipOutput,
+    SipEvent, SipOutput, StandardRequestEvent, StandardResponseEvent,
 };
 pub use error::{Result, SipError};
 pub use message::{HeaderMapExt, SipHeader, SipMessage, SipMethod, SipPacketKind, SipResponseStatus};
+pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
 pub use transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
 pub use types::{CSeq, CallId, DeviceId, SipUri, StreamId};

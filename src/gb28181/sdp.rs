@@ -46,3 +46,64 @@ pub fn build_play_sdp(opts: PlaySdpOptions) -> String {
         opts.ssrc, opts.ip, opts.ip, opts.port, opts.payload_type, opts.payload_type, opts.ssrc
     )
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TalkAudioCodec {
+    /// G.711 A-law, common GB28181 talk payload.
+    G711A,
+    /// G.711 μ-law.
+    G711U,
+    /// L16/8000 mono PCM. Kept for private interop.
+    L16,
+}
+
+impl TalkAudioCodec {
+    pub fn rtpmap(self, payload_type: u8) -> String {
+        match self {
+            TalkAudioCodec::G711A => format!("{} PCMA/8000", payload_type),
+            TalkAudioCodec::G711U => format!("{} PCMU/8000", payload_type),
+            TalkAudioCodec::L16 => format!("{} L16/8000/1", payload_type),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TalkSdpMode {
+    SendRecv,
+    SendOnly,
+    RecvOnly,
+}
+
+impl TalkSdpMode {
+    pub fn as_sdp_attr(self) -> &'static str {
+        match self {
+            TalkSdpMode::SendRecv => "sendrecv",
+            TalkSdpMode::SendOnly => "sendonly",
+            TalkSdpMode::RecvOnly => "recvonly",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TalkSdpOptions {
+    pub ip: String,
+    pub port: u16,
+    pub ssrc: u32,
+    pub payload_type: u8,
+    pub codec: TalkAudioCodec,
+    pub mode: TalkSdpMode,
+}
+
+pub fn build_talk_sdp(opts: TalkSdpOptions) -> String {
+    format!(
+        "v=0\r\no={} 0 0 IN IP4 {}\r\ns=Talk\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP {}\r\na={}\r\na=rtpmap:{}\r\ny={}\r\n",
+        opts.ssrc,
+        opts.ip,
+        opts.ip,
+        opts.port,
+        opts.payload_type,
+        opts.mode.as_sdp_attr(),
+        opts.codec.rtpmap(opts.payload_type),
+        opts.ssrc
+    )
+}

@@ -19,3 +19,10 @@ impl fmt::Display for DeviceId { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fm
 impl fmt::Display for StreamId { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
 impl fmt::Display for CallId { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
 impl fmt::Display for SipUri { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { self.0.fmt(f) } }
+
+
+impl CSeq {
+    pub fn sip_method(&self) -> crate::message::SipMethod {
+        crate::message::SipMethod::parse(&self.method)
+    }
+}
