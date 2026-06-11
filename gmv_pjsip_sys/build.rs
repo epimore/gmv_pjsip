@@ -151,7 +151,6 @@ fn verify_include_dir(include_dir: &Path) {
     // Installed PJPROJECT include trees do not consistently ship version metadata.
     // API availability is validated by compiling shim.c. pkg-config mode still
     // validates the libpjproject.pc version string.
-
 }
 
 fn dynamic_linking(dll_path: &Path) {
@@ -160,7 +159,10 @@ fn dynamic_linking(dll_path: &Path) {
     }
 
     let dll_dir = dll_path.parent().unwrap_or_else(|| {
-        panic!("PJSIP_DLL_PATH has no parent directory: {}", dll_path.display())
+        panic!(
+            "PJSIP_DLL_PATH has no parent directory: {}",
+            dll_path.display()
+        )
     });
 
     let file_name = dll_path
@@ -427,7 +429,9 @@ fn version_parts(version: &str) -> Vec<u32> {
 
 fn compile_shim_if_possible(include_dirs: &[PathBuf]) {
     if include_dirs.is_empty() {
-        println!("cargo:warning=skip compiling PJSIP auth shim because no include dir is available");
+        println!(
+            "cargo:warning=skip compiling PJSIP auth shim because no include dir is available"
+        );
         return;
     }
 

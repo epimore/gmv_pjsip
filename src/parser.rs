@@ -7,8 +7,9 @@ pub fn parse_sip_message(bytes: Bytes) -> Result<SipMessage> {
     let (head_end, body_start) = find_header_boundary(&bytes)
         .ok_or_else(|| SipError::InvalidPacket("missing SIP header/body delimiter".into()))?;
 
-    let head = std::str::from_utf8(&bytes[..head_end])
-        .map_err(|e| SipError::InvalidPacket(format!("SIP headers are not valid UTF-8/ASCII text: {e}")))?;
+    let head = std::str::from_utf8(&bytes[..head_end]).map_err(|e| {
+        SipError::InvalidPacket(format!("SIP headers are not valid UTF-8/ASCII text: {e}"))
+    })?;
 
     let mut lines = head.lines().map(|l| l.trim_end_matches('\r'));
     let start_line = lines

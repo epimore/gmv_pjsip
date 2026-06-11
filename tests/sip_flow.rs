@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use gmv_pjsip::auth::{AuthAlgorithm, AuthConfig, StaticPasswordProvider};
+use gmv_pjsip::auth::{
+    AuthAlgorithm, AuthConfig, AuthRequirement, PasswordProvider, StaticPasswordProvider,
+};
 use gmv_pjsip::message::HeaderMapExt;
 use gmv_pjsip::parser::parse_sip_message;
 use gmv_pjsip::{
@@ -44,6 +46,20 @@ fn header(bytes: &Bytes, name: &str) -> String {
 
 fn call_id(bytes: &Bytes) -> String {
     header(bytes, "Call-ID")
+}
+
+struct PolicyPasswordProvider {
+    requirement: AuthRequirement,
+}
+
+impl PasswordProvider for PolicyPasswordProvider {
+    fn requirement_for(&self, _username: &str, _realm: &str) -> AuthRequirement {
+        self.requirement
+    }
+
+    fn password_for(&self, _username: &str, _realm: &str) -> Option<String> {
+        Some("123456".into())
+    }
 }
 
 #[test]
@@ -103,7 +119,13 @@ Content-Length: 0\r\n\r\n",
         .handle_rx_packet(request.clone(), meta(SipTransportProtocol::Udp))
         .unwrap();
     assert_eq!(first.sends.len(), 1);
-    assert!(matches!(first.event, Some(SipEvent::Register(_))));
+    match first.event {
+        Some(SipEvent::Register(event)) => {
+            assert_eq!(event.call_id, "reg-call-1");
+            assert_eq!(event.cseq, 1);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
     assert!(String::from_utf8_lossy(&first.sends[0].1).starts_with("SIP/2.0 200 OK"));
 
     let second = ctx
@@ -112,6 +134,66 @@ Content-Length: 0\r\n\r\n",
     assert_eq!(second.sends.len(), 1);
     assert!(second.event.is_none());
     assert_eq!(first.sends[0].1, second.sends[0].1);
+}
+
+#[test]
+fn register_auth_policy_can_disable_digest_for_one_device() {
+    let mut cfg = local_config();
+    cfg.auth = AuthConfig::digest(
+        "3402000000",
+        Arc::new(PolicyPasswordProvider {
+            requirement: AuthRequirement::Disabled,
+        }),
+        AuthAlgorithm::Md5,
+    );
+    let ctx = SipContext::new(cfg);
+    let request = Bytes::from_static(
+        b"REGISTER sip:34020000002000000001@3402000000 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 192.168.1.20:5060;branch=z9hG4bK-reg-policy-1;rport\r\n\
+From: <sip:34020000001320000001@3402000000>;tag=from1\r\n\
+To: <sip:34020000001320000001@3402000000>\r\n\
+Call-ID: reg-policy-call-1\r\n\
+CSeq: 1 REGISTER\r\n\
+Contact: <sip:34020000001320000001@192.168.1.20:5060>\r\n\
+Expires: 3600\r\n\
+Content-Length: 0\r\n\r\n",
+    );
+
+    let out = ctx
+        .handle_rx_packet(request, meta(SipTransportProtocol::Udp))
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.sends[0].1).starts_with("SIP/2.0 200 OK"));
+    assert!(matches!(out.event, Some(SipEvent::Register(_))));
+}
+
+#[test]
+fn register_auth_policy_rejects_disabled_device() {
+    let mut cfg = local_config();
+    cfg.auth = AuthConfig::digest(
+        "3402000000",
+        Arc::new(PolicyPasswordProvider {
+            requirement: AuthRequirement::Forbidden,
+        }),
+        AuthAlgorithm::Md5,
+    );
+    let ctx = SipContext::new(cfg);
+    let request = Bytes::from_static(
+        b"REGISTER sip:34020000002000000001@3402000000 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 192.168.1.20:5060;branch=z9hG4bK-reg-policy-2;rport\r\n\
+From: <sip:34020000001320000001@3402000000>;tag=from1\r\n\
+To: <sip:34020000001320000001@3402000000>\r\n\
+Call-ID: reg-policy-call-2\r\n\
+CSeq: 1 REGISTER\r\n\
+Contact: <sip:34020000001320000001@192.168.1.20:5060>\r\n\
+Expires: 3600\r\n\
+Content-Length: 0\r\n\r\n",
+    );
+
+    let out = ctx
+        .handle_rx_packet(request, meta(SipTransportProtocol::Udp))
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.sends[0].1).starts_with("SIP/2.0 403 Forbidden"));
+    assert!(out.event.is_none());
 }
 
 #[test]
@@ -344,7 +426,9 @@ Content-Length: 0\r\n\r\n",
         header(&invite, "From"),
         header(&invite, "To")
     ));
-    let _ = ctx.handle_rx_packet(response, meta(SipTransportProtocol::Tcp)).unwrap();
+    let _ = ctx
+        .handle_rx_packet(response, meta(SipTransportProtocol::Tcp))
+        .unwrap();
 
     let seek = ctx
         .create_playback_seek_info(CreatePlaybackSeekInfo {
@@ -401,7 +485,9 @@ fn snapshot_message_helpers_and_upload_finished_event() {
         })
         .unwrap();
     assert!(String::from_utf8_lossy(&snapshot).contains("<SnapShotConfig>"));
-    assert!(String::from_utf8_lossy(&snapshot).contains("<SessionID>snapshot-session-1</SessionID>"));
+    assert!(
+        String::from_utf8_lossy(&snapshot).contains("<SessionID>snapshot-session-1</SessionID>")
+    );
 
     let body = r#"<?xml version="1.0"?><Notify><CmdType>UploadSnapShotFinished</CmdType><DeviceID>34020000001320000002</DeviceID><SessionID>snapshot-session-1</SessionID></Notify>"#;
     let request = Bytes::from(format!(
@@ -416,11 +502,16 @@ Content-Length: {}\r\n\r\n{}",
         body.len(),
         body
     ));
-    let out = ctx.handle_rx_packet(request, meta(SipTransportProtocol::Udp)).unwrap();
+    let out = ctx
+        .handle_rx_packet(request, meta(SipTransportProtocol::Udp))
+        .unwrap();
     match out.event.unwrap() {
         SipEvent::Message(event) => {
             assert_eq!(format!("{:?}", event.kind), "UploadSnapshotFinished");
-            assert_eq!(event.snapshot_session_id.as_deref(), Some("snapshot-session-1"));
+            assert_eq!(
+                event.snapshot_session_id.as_deref(),
+                Some("snapshot-session-1")
+            );
         }
         other => panic!("unexpected event: {other:?}"),
     }
@@ -485,8 +576,14 @@ Content-Length: 0\r\n\r\n",
     assert!(allow.contains("REGISTER"));
     assert!(allow.contains("PRACK"));
     assert!(allow.contains("UPDATE"));
-    assert!(response.header("Accept").unwrap().contains("Application/MANSCDP+xml"));
-    assert!(response.header("Contact").unwrap().contains("transport=tcp"));
+    assert!(response
+        .header("Accept")
+        .unwrap()
+        .contains("Application/MANSCDP+xml"));
+    assert!(response
+        .header("Contact")
+        .unwrap()
+        .contains("transport=tcp"));
 }
 
 #[test]
@@ -516,7 +613,10 @@ Content-Length: {}\r\n\r\n{}",
             assert_eq!(event.method, gmv_pjsip::SipMethod::Notify);
             assert_eq!(event.call_id.as_deref(), Some("notify-call-1"));
             assert_eq!(event.cseq, Some(3));
-            assert_eq!(event.content_type.as_deref(), Some("Application/MANSCDP+xml"));
+            assert_eq!(
+                event.content_type.as_deref(),
+                Some("Application/MANSCDP+xml")
+            );
         }
         other => panic!("unexpected event: {other:?}"),
     }

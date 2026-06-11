@@ -108,7 +108,13 @@ impl SipMethod {
     pub fn is_dialog_method(&self) -> bool {
         matches!(
             self,
-            Self::Ack | Self::Bye | Self::Info | Self::Notify | Self::Prack | Self::Refer | Self::Update
+            Self::Ack
+                | Self::Bye
+                | Self::Info
+                | Self::Notify
+                | Self::Prack
+                | Self::Refer
+                | Self::Update
         )
     }
 
@@ -160,8 +166,15 @@ pub struct SipResponseStatus {
 
 #[derive(Clone, Debug)]
 pub enum SipPacketKind {
-    Request { method: SipMethod, uri: String, version: String },
-    Response { version: String, status: SipResponseStatus },
+    Request {
+        method: SipMethod,
+        uri: String,
+        version: String,
+    },
+    Response {
+        version: String,
+        status: SipResponseStatus,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -244,7 +257,9 @@ impl SipMessage {
     }
 
     pub fn via_branch(&self) -> Option<String> {
-        self.header("Via").or_else(|| self.header("v")).and_then(extract_branch)
+        self.header("Via")
+            .or_else(|| self.header("v"))
+            .and_then(extract_branch)
     }
 
     pub fn contact(&self) -> Option<String> {
@@ -256,12 +271,21 @@ pub fn parse_cseq(value: &str) -> Result<CSeq> {
     let mut parts = value.split_whitespace();
     let number = parts
         .next()
-        .ok_or(SipError::InvalidHeader { name: "CSeq", reason: "missing number".into() })?
+        .ok_or(SipError::InvalidHeader {
+            name: "CSeq",
+            reason: "missing number".into(),
+        })?
         .parse::<u32>()
-        .map_err(|e| SipError::InvalidHeader { name: "CSeq", reason: e.to_string() })?;
+        .map_err(|e| SipError::InvalidHeader {
+            name: "CSeq",
+            reason: e.to_string(),
+        })?;
     let method = parts
         .next()
-        .ok_or(SipError::InvalidHeader { name: "CSeq", reason: "missing method".into() })?
+        .ok_or(SipError::InvalidHeader {
+            name: "CSeq",
+            reason: "missing method".into(),
+        })?
         .to_ascii_uppercase();
     Ok(CSeq { number, method })
 }
@@ -304,6 +328,18 @@ pub fn extract_user_from_uri_like(value: &str) -> Option<String> {
     } else {
         Some(rest[..end].to_string())
     }
+}
+
+pub fn extract_uri(value: &str) -> Option<String> {
+    let value = value.trim();
+    if let (Some(start), Some(end)) = (value.find('<'), value.find('>')) {
+        if end > start + 1 {
+            return Some(value[start + 1..end].trim().to_string());
+        }
+    }
+    let end = value.find(';').unwrap_or(value.len());
+    let uri = value[..end].trim();
+    (!uri.is_empty()).then(|| uri.to_string())
 }
 
 pub fn reason_phrase(code: u16) -> &'static str {

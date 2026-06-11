@@ -18,20 +18,25 @@ pub mod types;
 
 pub use bytes::Bytes;
 
-pub use auth::{AuthAlgorithm, AuthConfig, AuthCredential, AuthDecision, CredentialKind, PasswordProvider, StaticPasswordProvider};
+pub use auth::{
+    AuthAlgorithm, AuthConfig, AuthCredential, AuthDecision, AuthRequirement, CredentialKind,
+    PasswordProvider, StaticPasswordProvider,
+};
 pub use context::{
-    CallStore, DialogId, DialogState, DialogStore, InviteCall, InviteState, RegisterBinding,
-    CleanupReport, RegisterStore, SipContext, SipLocalConfig, TransactionStore,
+    CallStore, CleanupReport, DialogId, DialogState, DialogStore, InviteCall, InviteState,
+    RegisterBinding, RegisterStore, SipContext, SipLocalConfig, TransactionStore,
 };
 pub use endpoint::{
-    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInfo, CreateInvite, CreateMessage, CreatePlaybackSeekInfo,
-    CreatePlaybackSpeedInfo, CreatePresetQueryMessage, CreateSnapshotControlMessage,
-    CreateTalkInvite, IncomingInviteEvent,
-    InviteAcceptedEvent, MessageEvent, MessageKind, RegisterEvent, SipAction, SipEndpoint,
-    SipEvent, SipOutput, StandardRequestEvent, StandardResponseEvent,
+    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInfo, CreateInvite, CreateMessage,
+    CreatePlaybackSeekInfo, CreatePlaybackSpeedInfo, CreatePresetQueryMessage, CreateSubscribe,
+    CreateSnapshotControlMessage, CreateTalkInvite, IncomingInviteEvent, InviteAcceptedEvent,
+    MessageEvent, MessageKind, RegisterEvent, SipAction, SipEndpoint, SipEvent, SipOutput,
+    StandardRequestEvent, StandardResponseEvent,
 };
 pub use error::{Result, SipError};
-pub use message::{HeaderMapExt, SipHeader, SipMessage, SipMethod, SipPacketKind, SipResponseStatus};
 pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
+pub use message::{
+    HeaderMapExt, SipHeader, SipMessage, SipMethod, SipPacketKind, SipResponseStatus,
+};
 pub use transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
 pub use types::{CSeq, CallId, DeviceId, SipUri, StreamId};

@@ -48,7 +48,8 @@ impl CallStore {
     }
 
     pub fn insert(&self, call: InviteCall) {
-        self.by_stream.insert(call.stream_id.clone(), call.call_id.clone());
+        self.by_stream
+            .insert(call.stream_id.clone(), call.call_id.clone());
         self.calls.insert(call.call_id.clone(), call);
     }
 
@@ -62,7 +63,8 @@ impl CallStore {
     }
 
     pub fn update(&self, call: InviteCall) {
-        self.by_stream.insert(call.stream_id.clone(), call.call_id.clone());
+        self.by_stream
+            .insert(call.stream_id.clone(), call.call_id.clone());
         self.calls.insert(call.call_id.clone(), call);
     }
 
@@ -86,7 +88,8 @@ impl CallStore {
             .iter()
             .filter_map(|item| {
                 let call = item.value();
-                let removable_state = matches!(call.state, InviteState::Terminated | InviteState::Failed);
+                let removable_state =
+                    matches!(call.state, InviteState::Terminated | InviteState::Failed);
                 if removable_state && now.duration_since(call.updated_at) >= retain_for {
                     Some(call.call_id.clone())
                 } else {

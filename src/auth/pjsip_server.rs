@@ -36,7 +36,11 @@ impl PjAuthServer {
         ))
     }
 
-    pub fn challenge_tdata(&self, _tdata: PjTxDataHandle<'_>, _algorithm: AuthAlgorithm) -> Result<()> {
+    pub fn challenge_tdata(
+        &self,
+        _tdata: PjTxDataHandle<'_>,
+        _algorithm: AuthAlgorithm,
+    ) -> Result<()> {
         Err(SipError::AuthFailed(
             "PJSIP tdata challenge path is reserved; current adapter builds textual challenge while digest verification uses PJSIP".into(),
         ))

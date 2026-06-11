@@ -33,7 +33,10 @@ pub fn create_digest_response(
     algorithm: AuthAlgorithm,
 ) -> Result<String> {
     if !is_algorithm_supported(algorithm) {
-        return Err(SipError::AuthFailed(format!("PJSIP does not support digest algorithm {}", algorithm.iana_name())));
+        return Err(SipError::AuthFailed(format!(
+            "PJSIP does not support digest algorithm {}",
+            algorithm.iana_name()
+        )));
     }
 
     let username = cstring("username", &credential.username)?;
@@ -73,7 +76,9 @@ pub fn create_digest_response(
     };
 
     if status != 0 {
-        return Err(SipError::AuthFailed(format!("pjsip_auth_create_digest2 failed: pj_status={status}")));
+        return Err(SipError::AuthFailed(format!(
+            "pjsip_auth_create_digest2 failed: pj_status={status}"
+        )));
     }
 
     let digest = unsafe { CStr::from_ptr(out.as_ptr()) }

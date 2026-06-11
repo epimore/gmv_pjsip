@@ -29,19 +29,36 @@ mod pjsip_digest;
 pub mod pjsip_server;
 
 pub trait PasswordProvider: Send + Sync + 'static {
+    fn requirement_for(&self, _username: &str, _realm: &str) -> AuthRequirement {
+        AuthRequirement::Required
+    }
+
     fn password_for(&self, username: &str, realm: &str) -> Option<String>;
 
     /// Override this when the storage already contains HA1 instead of a plain
     /// password. HA1 must match the selected digest algorithm.
-    fn credential_for(&self, username: &str, realm: &str, algorithm: AuthAlgorithm) -> Option<AuthCredential> {
-        self.password_for(username, realm).map(|password| AuthCredential {
-            username: username.to_owned(),
-            realm: realm.to_owned(),
-            secret: password,
-            kind: CredentialKind::PlainPassword,
-            algorithm,
-        })
+    fn credential_for(
+        &self,
+        username: &str,
+        realm: &str,
+        algorithm: AuthAlgorithm,
+    ) -> Option<AuthCredential> {
+        self.password_for(username, realm)
+            .map(|password| AuthCredential {
+                username: username.to_owned(),
+                realm: realm.to_owned(),
+                secret: password,
+                kind: CredentialKind::PlainPassword,
+                algorithm,
+            })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthRequirement {
+    Disabled,
+    Required,
+    Forbidden,
 }
 
 #[derive(Clone, Debug)]
@@ -52,7 +69,11 @@ pub struct StaticPasswordProvider {
 
 impl PasswordProvider for StaticPasswordProvider {
     fn password_for(&self, username: &str, _realm: &str) -> Option<String> {
-        if username == self.username { Some(self.password.clone()) } else { None }
+        if username == self.username {
+            Some(self.password.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -144,7 +165,9 @@ impl AuthAlgorithm {
     }
 
     pub fn from_header(value: Option<&str>, default: Self) -> Self {
-        let Some(value) = value else { return default; };
+        let Some(value) = value else {
+            return default;
+        };
         match value.trim_matches('"').to_ascii_uppercase().as_str() {
             "SHA-256" | "SHA256" => Self::Sha256,
             "SHA-512-256" | "SHA512-256" | "SHA512_256" => Self::Sha512_256,
@@ -172,16 +195,28 @@ pub struct NonceStore {
 }
 
 impl NonceStore {
-    pub fn new(ttl: Duration) -> Self { Self { items: DashMap::new(), ttl } }
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            items: DashMap::new(),
+            ttl,
+        }
+    }
 
     pub fn issue(&self) -> String {
-        let nonce: String = rand::thread_rng().sample_iter(&Alphanumeric).take(32).map(char::from).collect();
+        let nonce: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
         self.items.insert(nonce.clone(), Instant::now() + self.ttl);
         nonce
     }
 
     pub fn valid(&self, nonce: &str) -> bool {
-        self.items.get(nonce).map(|v| Instant::now() <= *v).unwrap_or(false)
+        self.items
+            .get(nonce)
+            .map(|v| Instant::now() <= *v)
+            .unwrap_or(false)
     }
 
     pub fn cleanup(&self) -> usize {
@@ -205,8 +240,13 @@ pub fn parse_digest_authorization(value: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let s = value.trim().strip_prefix("Digest").unwrap_or(value).trim();
     for part in s.split(',') {
-        let Some((k, v)) = part.trim().split_once('=') else { continue; };
-        out.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string());
+        let Some((k, v)) = part.trim().split_once('=') else {
+            continue;
+        };
+        out.insert(
+            k.trim().to_ascii_lowercase(),
+            v.trim().trim_matches('"').to_string(),
+        );
     }
     out
 }
@@ -236,21 +276,34 @@ impl std::fmt::Debug for VerifyDigestRequest<'_> {
 
 pub fn verify_digest_response(req: VerifyDigestRequest<'_>) -> Result<String> {
     let parts = parse_digest_authorization(req.authorization);
-    let username = parts.get("username").ok_or_else(|| SipError::AuthFailed("missing username".into()))?;
-    let nonce = parts.get("nonce").ok_or_else(|| SipError::AuthFailed("missing nonce".into()))?;
-    let response = parts.get("response").ok_or_else(|| SipError::AuthFailed("missing response".into()))?;
+    let username = parts
+        .get("username")
+        .ok_or_else(|| SipError::AuthFailed("missing username".into()))?;
+    let nonce = parts
+        .get("nonce")
+        .ok_or_else(|| SipError::AuthFailed("missing nonce".into()))?;
+    let response = parts
+        .get("response")
+        .ok_or_else(|| SipError::AuthFailed("missing response".into()))?;
     let req_uri = parts.get("uri").map(String::as_str).unwrap_or(req.uri);
-    let algorithm = AuthAlgorithm::from_header(parts.get("algorithm").map(String::as_str), req.default_algorithm);
+    let algorithm = AuthAlgorithm::from_header(
+        parts.get("algorithm").map(String::as_str),
+        req.default_algorithm,
+    );
 
     if !algorithm.is_supported() {
-        return Err(SipError::AuthFailed(format!("digest algorithm {} is not supported", algorithm.iana_name())));
+        return Err(SipError::AuthFailed(format!(
+            "digest algorithm {} is not supported",
+            algorithm.iana_name()
+        )));
     }
 
     if !req.nonce_store.valid(nonce) {
         return Err(SipError::AuthFailed("nonce expired or unknown".into()));
     }
 
-    let credential = req.provider
+    let credential = req
+        .provider
         .credential_for(username, req.realm, algorithm)
         .ok_or_else(|| SipError::AuthFailed("credential not found".into()))?;
 
@@ -269,7 +322,11 @@ pub fn verify_digest_response(req: VerifyDigestRequest<'_>) -> Result<String> {
         algorithm,
     )?;
 
-    if expected.eq_ignore_ascii_case(response) { Ok(username.clone()) } else { Err(SipError::AuthFailed("digest response mismatch".into())) }
+    if expected.eq_ignore_ascii_case(response) {
+        Ok(username.clone())
+    } else {
+        Err(SipError::AuthFailed("digest response mismatch".into()))
+    }
 }
 
 pub fn create_digest_response(
@@ -284,7 +341,9 @@ pub fn create_digest_response(
 ) -> Result<String> {
     #[cfg(feature = "pjsip-sys")]
     {
-        return pjsip_digest::create_digest_response(credential, method, uri, nonce, nc, cnonce, qop, algorithm);
+        return pjsip_digest::create_digest_response(
+            credential, method, uri, nonce, nc, cnonce, qop, algorithm,
+        );
     }
     #[cfg(not(feature = "pjsip-sys"))]
     {

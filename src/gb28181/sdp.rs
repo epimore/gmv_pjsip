@@ -11,7 +11,10 @@ pub struct SdpInfo {
 
 impl SdpInfo {
     pub fn parse_lossy(sdp: &str) -> Self {
-        let mut out = SdpInfo { raw: sdp.to_string(), ..Default::default() };
+        let mut out = SdpInfo {
+            raw: sdp.to_string(),
+            ..Default::default()
+        };
         for line in sdp.lines().map(str::trim) {
             if let Some(v) = line.strip_prefix("s=") {
                 out.session_name = Some(v.to_string());

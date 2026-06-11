@@ -37,7 +37,10 @@ impl TransactionStore {
         }
     }
 
-    pub fn key_from_request(msg: &SipMessage, remote_addr: SocketAddr) -> Option<ServerTransactionKey> {
+    pub fn key_from_request(
+        msg: &SipMessage,
+        remote_addr: SocketAddr,
+    ) -> Option<ServerTransactionKey> {
         let call_id = msg.call_id().ok()?;
         let cseq = msg.cseq().ok()?;
         Some(ServerTransactionKey {
@@ -86,7 +89,8 @@ impl TransactionStore {
         let ttl = self.ttl;
         let now = Instant::now();
         let before = self.server.len();
-        self.server.retain(|_, tx| now.duration_since(tx.last_seen) <= ttl);
+        self.server
+            .retain(|_, tx| now.duration_since(tx.last_seen) <= ttl);
         before.saturating_sub(self.server.len())
     }
 }

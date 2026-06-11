@@ -1,10 +1,10 @@
 use bytes::Bytes;
 
 use crate::context::{DialogId, SipContext};
-use crate::gb28181::sdp::{SdpInfo, TalkAudioCodec, TalkSdpMode};
-use crate::transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
 use crate::error::{Result, SipError};
+use crate::gb28181::sdp::{SdpInfo, TalkAudioCodec, TalkSdpMode};
 use crate::message::SipMethod;
+use crate::transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
 
 pub type SipEndpoint = SipContext;
 
@@ -37,7 +37,10 @@ impl SipAction {
             SipAction::Send(b) => sends.push((association, b)),
             SipAction::SendMany(v) => sends.extend(v.into_iter().map(|b| (association.clone(), b))),
             SipAction::Event(e) => event = Some(e),
-            SipAction::SendAndEvent { bytes, event: e } => { sends.push((association, bytes)); event = Some(e); }
+            SipAction::SendAndEvent { bytes, event: e } => {
+                sends.push((association, bytes));
+                event = Some(e);
+            }
             SipAction::SendManyAndEvent { bytes, event: e } => {
                 sends.extend(bytes.into_iter().map(|b| (association.clone(), b)));
                 event = Some(e);
@@ -59,12 +62,31 @@ pub enum SipEvent {
     Register(RegisterEvent),
     Message(MessageEvent),
     IncomingInvite(IncomingInviteEvent),
-    InviteProceeding { call_id: String, status: u16 },
+    InviteProceeding {
+        call_id: String,
+        status: u16,
+    },
     InviteAccepted(InviteAcceptedEvent),
-    InviteFailed { call_id: String, status: u16 },
-    InfoProceeding { call_id: String, status: u16 },
-    InfoAccepted { call_id: String, status: u16 },
-    InfoFailed { call_id: String, status: u16 },
+    InviteFailed {
+        call_id: String,
+        stream_id: String,
+        status: u16,
+    },
+    InfoProceeding {
+        call_id: String,
+        cseq: u32,
+        status: u16,
+    },
+    InfoAccepted {
+        call_id: String,
+        cseq: u32,
+        status: u16,
+    },
+    InfoFailed {
+        call_id: String,
+        cseq: u32,
+        status: u16,
+    },
     Ack(AckEvent),
     Bye(ByeEvent),
     ByeConfirmed(ByeEvent),
@@ -73,7 +95,6 @@ pub enum SipEvent {
     StandardResponse(StandardResponseEvent),
 }
 
-
 #[derive(Clone, Debug)]
 pub struct StandardRequestEvent {
     pub method: SipMethod,
@@ -81,6 +102,10 @@ pub struct StandardRequestEvent {
     pub cseq: Option<u32>,
     pub association: SipAssociation,
     pub content_type: Option<String>,
+    pub event: Option<String>,
+    pub from_tag: Option<String>,
+    pub to_tag: Option<String>,
+    pub subscription_state: Option<String>,
     pub body: Bytes,
 }
 
@@ -88,18 +113,29 @@ pub struct StandardRequestEvent {
 pub struct StandardResponseEvent {
     pub method: SipMethod,
     pub call_id: String,
+    pub cseq: u32,
     pub status: u16,
+    pub contact: Option<String>,
+    pub record_routes: Vec<String>,
+    pub from_header: Option<String>,
+    pub to_header: Option<String>,
+    pub to_tag: Option<String>,
+    pub expires: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub struct RegisterEvent {
     pub device_id: String,
     pub contact: Option<String>,
+    pub support_lr: bool,
     pub expires: u32,
+    pub call_id: String,
+    pub cseq: u32,
     pub authorized: bool,
     pub username: Option<String>,
     pub association: SipAssociation,
     pub user_agent: Option<String>,
+    pub gb_version: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,7 +193,9 @@ pub struct InviteAcceptedEvent {
 }
 
 #[derive(Clone, Debug)]
-pub struct AckEvent { pub call_id: String }
+pub struct AckEvent {
+    pub call_id: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct ByeEvent {
@@ -167,7 +205,9 @@ pub struct ByeEvent {
 }
 
 #[derive(Clone, Debug)]
-pub struct CancelEvent { pub call_id: String }
+pub struct CancelEvent {
+    pub call_id: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct CreateInvite {
@@ -216,6 +256,21 @@ pub struct CreateMessage {
     pub protocol: SipTransportProtocol,
     pub call_id: Option<String>,
     pub cseq: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CreateSubscribe {
+    pub target_uri: String,
+    pub body: Bytes,
+    pub content_type: String,
+    pub protocol: SipTransportProtocol,
+    pub call_id: Option<String>,
+    pub cseq: Option<u32>,
+    pub event: String,
+    pub expires: u32,
+    pub from_header: Option<String>,
+    pub to_header: Option<String>,
+    pub route_set: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

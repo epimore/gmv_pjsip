@@ -52,7 +52,8 @@ impl DialogStore {
     }
 
     pub fn insert(&self, dialog: SipDialog) {
-        self.by_call_id.insert(dialog.id.call_id.clone(), dialog.id.clone());
+        self.by_call_id
+            .insert(dialog.id.call_id.clone(), dialog.id.clone());
         self.dialogs.insert(dialog.id.clone(), dialog);
     }
 

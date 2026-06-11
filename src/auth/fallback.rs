@@ -20,16 +20,32 @@ pub fn create_digest_response(
     }
 
     let ha1 = match credential.kind {
-        CredentialKind::PlainPassword => format!("{:x}", md5::compute(format!("{}:{}:{}", credential.username, credential.realm, credential.secret))),
+        CredentialKind::PlainPassword => format!(
+            "{:x}",
+            md5::compute(format!(
+                "{}:{}:{}",
+                credential.username, credential.realm, credential.secret
+            ))
+        ),
         CredentialKind::DigestHa1 => credential.secret.clone(),
     };
     let ha2 = format!("{:x}", md5::compute(format!("{}:{}", method, uri)));
 
     if let Some(qop) = qop.filter(|q| !q.is_empty()) {
         let nc = nc.ok_or_else(|| SipError::AuthFailed("qop auth requires nc".into()))?;
-        let cnonce = cnonce.ok_or_else(|| SipError::AuthFailed("qop auth requires cnonce".into()))?;
-        Ok(format!("{:x}", md5::compute(format!("{}:{}:{}:{}:{}:{}", ha1, nonce, nc, cnonce, qop, ha2))))
+        let cnonce =
+            cnonce.ok_or_else(|| SipError::AuthFailed("qop auth requires cnonce".into()))?;
+        Ok(format!(
+            "{:x}",
+            md5::compute(format!(
+                "{}:{}:{}:{}:{}:{}",
+                ha1, nonce, nc, cnonce, qop, ha2
+            ))
+        ))
     } else {
-        Ok(format!("{:x}", md5::compute(format!("{}:{}:{}", ha1, nonce, ha2))))
+        Ok(format!(
+            "{:x}",
+            md5::compute(format!("{}:{}:{}", ha1, nonce, ha2))
+        ))
     }
 }
