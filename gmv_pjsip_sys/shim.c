@@ -82,7 +82,7 @@ int gmv_pjsip_auth_create_digest2(
     pj_bzero(digest_buf, sizeof(digest_buf));
     pj_str_t result;
     result.ptr = digest_buf;
-    result.slen = 0;
+    result.slen = (pj_ssize_t)sizeof(digest_buf);
 
     pj_str_t nonce_s = gmv_pj_str(nonce);
     pj_str_t uri_s = gmv_pj_str(uri);

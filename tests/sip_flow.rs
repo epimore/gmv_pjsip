@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use gmv_pjsip::auth::{
-    AuthAlgorithm, AuthConfig, AuthRequirement, PasswordProvider, StaticPasswordProvider,
+    create_digest_response, AuthAlgorithm, AuthConfig, AuthCredential, AuthRequirement,
+    CredentialKind, PasswordProvider, StaticPasswordProvider,
 };
 use gmv_pjsip::message::HeaderMapExt;
 use gmv_pjsip::parser::parse_sip_message;
@@ -48,6 +49,19 @@ fn call_id(bytes: &Bytes) -> String {
     header(bytes, "Call-ID")
 }
 
+fn digest_param(value: &str, name: &str) -> String {
+    value
+        .split(',')
+        .find_map(|part| {
+            let part = part.trim().strip_prefix("Digest ").unwrap_or(part.trim());
+            let (key, value) = part.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().trim_matches('"').to_string())
+        })
+        .unwrap_or_else(|| panic!("missing digest parameter: {name}"))
+}
+
 struct PolicyPasswordProvider {
     requirement: AuthRequirement,
 }
@@ -83,6 +97,7 @@ Call-ID: reg-auth-call-1\r\n\
 CSeq: 1 REGISTER\r\n\
 Contact: <sip:34020000001320000001@192.168.1.20:5060>\r\n\
 Expires: 3600\r\n\
+X-GB-Ver: 3.0\r\n\
 Content-Length: 0\r\n\r\n",
     );
 
@@ -97,6 +112,88 @@ Content-Length: 0\r\n\r\n",
     assert!(www.contains("Digest"));
     assert!(www.contains(r#"realm="3402000000""#));
     assert!(www.contains(r#"qop="auth""#));
+    assert_eq!(response.header("X-GB-Ver"), Some("3.0"));
+}
+
+#[test]
+fn register_with_valid_digest_is_authorized_and_echoes_gb_version() {
+    let username = "34020000001320000001";
+    let realm = "3402000000";
+    let password = "123456";
+    let uri = "sip:34020000002000000001@3402000000";
+    let mut cfg = local_config();
+    cfg.auth = AuthConfig::digest(
+        realm,
+        Arc::new(StaticPasswordProvider {
+            username: username.into(),
+            password: password.into(),
+        }),
+        AuthAlgorithm::Md5,
+    );
+    let ctx = SipContext::new(cfg);
+    let challenge_request = Bytes::from(format!(
+        "REGISTER {uri} SIP/2.0\r\n\
+Via: SIP/2.0/UDP 192.168.1.20:5060;branch=z9hG4bK-reg-auth-ok-1;rport\r\n\
+From: <sip:{username}@{realm}>;tag=from1\r\n\
+To: <sip:{username}@{realm}>\r\n\
+Call-ID: reg-auth-ok-call\r\n\
+CSeq: 1 REGISTER\r\n\
+Contact: <sip:{username}@192.168.1.20:5060>\r\n\
+Expires: 3600\r\n\
+X-GB-Ver: 3.0\r\n\
+Content-Length: 0\r\n\r\n"
+    ));
+    let challenge = ctx
+        .handle_rx_packet(challenge_request, meta(SipTransportProtocol::Udp))
+        .unwrap();
+    let challenge_response = parse_sip_message(challenge.sends[0].1.clone()).unwrap();
+    assert_eq!(challenge_response.status_code(), Some(401));
+    assert_eq!(challenge_response.header("X-GB-Ver"), Some("3.0"));
+    let nonce = digest_param(
+        challenge_response.header("WWW-Authenticate").unwrap(),
+        "nonce",
+    );
+    let nc = "00000001";
+    let cnonce = "0a4f113b";
+    let qop = "auth";
+    let response = create_digest_response(
+        &AuthCredential {
+            username: username.into(),
+            realm: realm.into(),
+            secret: password.into(),
+            kind: CredentialKind::PlainPassword,
+            algorithm: AuthAlgorithm::Md5,
+        },
+        "REGISTER",
+        uri,
+        &nonce,
+        Some(nc),
+        Some(cnonce),
+        Some(qop),
+        AuthAlgorithm::Md5,
+    )
+    .unwrap();
+    let authenticated_request = Bytes::from(format!(
+        "REGISTER {uri} SIP/2.0\r\n\
+Via: SIP/2.0/UDP 192.168.1.20:5060;branch=z9hG4bK-reg-auth-ok-2;rport\r\n\
+From: <sip:{username}@{realm}>;tag=from1\r\n\
+To: <sip:{username}@{realm}>\r\n\
+Call-ID: reg-auth-ok-call\r\n\
+CSeq: 2 REGISTER\r\n\
+Contact: <sip:{username}@192.168.1.20:5060>\r\n\
+Authorization: Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop={qop}, nc={nc}\r\n\
+Expires: 3600\r\n\
+X-GB-Ver: 3.0\r\n\
+Content-Length: 0\r\n\r\n"
+    ));
+
+    let out = ctx
+        .handle_rx_packet(authenticated_request, meta(SipTransportProtocol::Udp))
+        .unwrap();
+    let response = parse_sip_message(out.sends[0].1.clone()).unwrap();
+    assert_eq!(response.status_code(), Some(200));
+    assert_eq!(response.header("X-GB-Ver"), Some("3.0"));
+    assert!(matches!(out.event, Some(SipEvent::Register(_))));
 }
 
 #[test]
@@ -186,6 +283,7 @@ Call-ID: reg-policy-call-2\r\n\
 CSeq: 1 REGISTER\r\n\
 Contact: <sip:34020000001320000001@192.168.1.20:5060>\r\n\
 Expires: 3600\r\n\
+X-GB-Ver: 3.0\r\n\
 Content-Length: 0\r\n\r\n",
     );
 
@@ -193,6 +291,7 @@ Content-Length: 0\r\n\r\n",
         .handle_rx_packet(request, meta(SipTransportProtocol::Udp))
         .unwrap();
     assert!(String::from_utf8_lossy(&out.sends[0].1).starts_with("SIP/2.0 403 Forbidden"));
+    assert_eq!(header(&out.sends[0].1, "X-GB-Ver"), "3.0");
     assert!(out.event.is_none());
 }
 

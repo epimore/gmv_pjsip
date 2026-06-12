@@ -303,19 +303,23 @@ impl SipContext {
         let auth = self.authenticate_request(msg, "REGISTER")?;
         match &auth {
             AuthDecision::Challenge { header_value, .. } => {
+                let mut extra_headers = register_response_headers(msg);
+                extra_headers.push(("WWW-Authenticate".into(), header_value.clone()));
                 let resp = build_response(
                     msg,
                     ResponseOptions {
                         status_code: 401,
                         server: Some(self.local.user_agent.clone()),
                         to_tag: Some(new_tag()),
-                        extra_headers: vec![("WWW-Authenticate".into(), header_value.clone())],
+                        extra_headers,
                         ..Default::default()
                     },
                 );
                 return Ok(SipAction::Send(resp));
             }
             AuthDecision::Forbidden(reason) => {
+                let mut extra_headers = register_response_headers(msg);
+                extra_headers.push(("Warning".into(), reason.clone()));
                 let resp = build_response(
                     msg,
                     ResponseOptions {
@@ -323,7 +327,7 @@ impl SipContext {
                         reason: Some("Forbidden".into()),
                         server: Some(self.local.user_agent.clone()),
                         to_tag: Some(new_tag()),
-                        extra_headers: vec![("Warning".into(), reason.clone())],
+                        extra_headers,
                         ..Default::default()
                     },
                 );
@@ -374,6 +378,8 @@ impl SipContext {
             user_agent: msg.header("User-Agent").map(ToOwned::to_owned),
             gb_version: msg.header("X-GB-Ver").map(ToOwned::to_owned),
         });
+        let mut extra_headers = register_response_headers(msg);
+        extra_headers.push(("Expires".into(), expires.to_string()));
         let resp = build_response(
             msg,
             ResponseOptions {
@@ -381,7 +387,7 @@ impl SipContext {
                 server: Some(self.local.user_agent.clone()),
                 to_tag: Some(new_tag()),
                 contact: msg.contact(),
-                extra_headers: vec![("Expires".into(), expires.to_string())],
+                extra_headers,
                 ..Default::default()
             },
         );
@@ -1194,6 +1200,14 @@ fn request_uri_value(value: &str) -> String {
     } else {
         value.trim().to_string()
     }
+}
+
+fn register_response_headers(msg: &SipMessage) -> Vec<(String, String)> {
+    msg.header("X-GB-Ver")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![("X-GB-Ver".into(), value.into())])
+        .unwrap_or_default()
 }
 
 fn parse_expires(msg: &SipMessage) -> Option<u32> {
