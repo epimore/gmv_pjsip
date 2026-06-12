@@ -120,3 +120,30 @@ The shim supports MD5, SHA-256, and SHA-512-256 when the linked PJPROJECT build
 supports them. The build script rejects pkg-config discovered PJPROJECT versions older than 2.15.1; PJPROJECT 2.17 is recommended. Full `pjsip_auth_srv_verify()` usage is kept as the next step once
 `gmv_pjsip` retains `pjsip_rx_data`/`pjsip_tx_data` handles through parsing and
 response generation.
+
+## Native runtime prototype
+
+`shim.h` also exposes version 1 of the `gmv_sip_*` C ABI. The prototype owns
+PJLIB, a PJSIP endpoint, the transaction layer, IPv4 UDP/TCP listeners, and one
+event-polling thread. Its lifecycle is:
+
+```text
+gmv_sip_runtime_config_init
+gmv_sip_runtime_create
+gmv_sip_runtime_start
+gmv_sip_runtime_stop
+gmv_sip_runtime_destroy
+```
+
+The current integration harness binds loopback random ports and verifies UDP
+`OPTIONS` and TCP `MESSAGE` requests receive stateful `200 OK` responses. Event
+callbacks report the request method, transport, response status, and raw
+PJPROJECT status.
+
+Prototype constraints:
+
+- only one active runtime is supported per process;
+- callback string views are borrowed and valid only during the callback;
+- IPv4 UDP/TCP is supported; TLS and IPv6 are deferred;
+- REGISTER authentication, dialogs, INVITE, SUBSCRIBE, and `session` backend
+  switching are not part of this prototype.

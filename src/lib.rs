@@ -13,6 +13,8 @@ pub mod error;
 pub mod gb28181;
 pub mod message;
 pub mod parser;
+#[cfg(feature = "pjsip-sys")]
+pub mod runtime;
 pub mod transport;
 pub mod types;
 
@@ -37,6 +39,11 @@ pub use error::{Result, SipError};
 pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
 pub use message::{
     HeaderMapExt, SipHeader, SipMessage, SipMethod, SipPacketKind, SipResponseStatus,
+};
+#[cfg(feature = "pjsip-sys")]
+pub use runtime::{
+    SipAuthLookupResult, SipOutboundMessage, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
+    SipRuntimeEventKind, SipRuntimeEvents,
 };
 pub use transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
 pub use types::{CSeq, CallId, DeviceId, SipUri, StreamId};

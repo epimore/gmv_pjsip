@@ -68,6 +68,39 @@ SipEvent::Message(MessageEvent {
 })
 ```
 
+## Native PJSIP runtime prototype
+
+With the default `pjsip-sys` feature, `SipRuntime` safely owns the native
+PJLIB/PJSIP runtime:
+
+```rust
+let (runtime, events) = SipRuntime::start(SipRuntimeConfig::default())?;
+let udp_port = runtime.udp_port();
+let tcp_port = runtime.tcp_port();
+runtime.shutdown()?;
+```
+
+Current constraints:
+
+- one active runtime per process;
+- runtime creation, polling ownership, and shutdown stay on one Rust thread;
+- native callback strings are copied into owned `SipRuntimeEvent` values;
+- events use a standard-library receiver, with no Tokio dependency;
+- IPv4 UDP/TCP, OPTIONS, MESSAGE, and REGISTER are implemented;
+- OPTIONS responses advertise the native method set and GB28181 capability;
+- stateful UAS transactions absorb UDP request retransmissions before business
+  event delivery;
+- `SipRuntime::send_message` creates a non-dialog UAC transaction and reports
+  the final response with the caller's `operation_id`;
+- REGISTER credential lookup is asynchronous and completed through
+  `SipRuntime::complete_auth_lookup`;
+- digest verification checks nonce lifetime, request URI, and nonce-count
+  replay, and emits owned registration events;
+- `session` has a prototype bridge with a dedicated runtime thread and
+  batched auth lookup (up to 2,000 keys per batch), plus a typed outbound
+  MESSAGE command channel;
+- `session` still uses the legacy backend by default.
+
 ## Notes
 
 `gmv_pjsip` owns SIP context. Session/business code should not manually compose
