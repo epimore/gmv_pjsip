@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define GMV_SIP_ABI_VERSION 1u
+#define GMV_SIP_ABI_VERSION 4u
 
 typedef struct gmv_sip_runtime gmv_sip_runtime_t;
 
@@ -30,8 +30,14 @@ typedef enum gmv_sip_event_type {
     GMV_SIP_EVENT_REGISTERED = 5,
     GMV_SIP_EVENT_AUTH_REJECTED = 6,
     GMV_SIP_EVENT_UNREGISTERED = 7,
-    GMV_SIP_EVENT_OUTBOUND_RESPONSE = 8
+    GMV_SIP_EVENT_OUTBOUND_RESPONSE = 8,
+    GMV_SIP_EVENT_INCOMING_INVITE = 9
 } gmv_sip_event_type_t;
+
+typedef enum gmv_sip_dialog_method {
+    GMV_SIP_DIALOG_BYE = 1,
+    GMV_SIP_DIALOG_INFO = 2
+} gmv_sip_dialog_method_t;
 
 typedef enum gmv_sip_auth_lookup_result {
     GMV_SIP_AUTH_CREDENTIAL = 1,
@@ -63,10 +69,34 @@ typedef struct gmv_sip_event {
     gmv_sip_string_view_t user_agent;
     gmv_sip_string_view_t gb_version;
     uint64_t operation_id;
+    uint64_t association_id;
+    gmv_sip_string_view_t from_header;
+    gmv_sip_string_view_t to_header;
+    gmv_sip_string_view_t subject;
+    gmv_sip_string_view_t event;
+    gmv_sip_string_view_t subscription_state;
 } gmv_sip_event_t;
 
 typedef void (*gmv_sip_event_callback)(
     const gmv_sip_event_t *event,
+    void *user_data);
+
+typedef struct gmv_sip_send_packet {
+    uint32_t size;
+    uint32_t version;
+    uint64_t send_id;
+    uint64_t transport_id;
+    uint64_t association_id;
+    int32_t transport;
+    gmv_sip_string_view_t data;
+    gmv_sip_string_view_t local_address;
+    uint16_t local_port;
+    gmv_sip_string_view_t remote_address;
+    uint16_t remote_port;
+} gmv_sip_send_packet_t;
+
+typedef int32_t (*gmv_sip_send_callback)(
+    const gmv_sip_send_packet_t *packet,
     void *user_data);
 
 typedef struct gmv_sip_runtime_config {
@@ -84,7 +114,28 @@ typedef struct gmv_sip_runtime_config {
     int32_t auth_algorithm_type;
     uint32_t max_pending_auth;
     uint32_t auth_lookup_timeout_ms;
+    gmv_sip_send_callback send_callback;
+    void *send_user_data;
 } gmv_sip_runtime_config_t;
+
+typedef struct gmv_sip_received_packet {
+    uint32_t size;
+    uint32_t version;
+    uint64_t association_id;
+    int32_t transport;
+    gmv_sip_string_view_t data;
+    gmv_sip_string_view_t local_address;
+    uint16_t local_port;
+    gmv_sip_string_view_t remote_address;
+    uint16_t remote_port;
+} gmv_sip_received_packet_t;
+
+typedef struct gmv_sip_send_completion {
+    uint32_t size;
+    uint32_t version;
+    uint64_t send_id;
+    int64_t sent_bytes;
+} gmv_sip_send_completion_t;
 
 typedef struct gmv_sip_auth_lookup_completion {
     uint32_t size;
@@ -102,11 +153,60 @@ typedef struct gmv_sip_outbound_message {
     uint32_t size;
     uint32_t version;
     uint64_t operation_id;
+    uint64_t association_id;
+    int32_t transport;
     gmv_sip_string_view_t target_uri;
     gmv_sip_string_view_t from_uri;
     gmv_sip_string_view_t content_type;
     gmv_sip_string_view_t body;
 } gmv_sip_outbound_message_t;
+
+typedef struct gmv_sip_outbound_invite {
+    uint32_t size;
+    uint32_t version;
+    uint64_t operation_id;
+    uint64_t association_id;
+    int32_t transport;
+    gmv_sip_string_view_t target_uri;
+    gmv_sip_string_view_t from_uri;
+    gmv_sip_string_view_t contact_uri;
+    gmv_sip_string_view_t subject;
+    gmv_sip_string_view_t sdp;
+} gmv_sip_outbound_invite_t;
+
+typedef struct gmv_sip_dialog_request {
+    uint32_t size;
+    uint32_t version;
+    uint64_t operation_id;
+    int32_t method;
+    gmv_sip_string_view_t call_id;
+    gmv_sip_string_view_t content_type;
+    gmv_sip_string_view_t body;
+} gmv_sip_dialog_request_t;
+
+typedef struct gmv_sip_invite_response {
+    uint32_t size;
+    uint32_t version;
+    uint16_t status_code;
+    gmv_sip_string_view_t call_id;
+    gmv_sip_string_view_t reason;
+} gmv_sip_invite_response_t;
+
+typedef struct gmv_sip_outbound_subscribe {
+    uint32_t size;
+    uint32_t version;
+    uint64_t operation_id;
+    uint64_t association_id;
+    int32_t transport;
+    gmv_sip_string_view_t target_uri;
+    gmv_sip_string_view_t from_uri;
+    gmv_sip_string_view_t contact_uri;
+    gmv_sip_string_view_t call_id;
+    gmv_sip_string_view_t event;
+    uint32_t expires;
+    gmv_sip_string_view_t content_type;
+    gmv_sip_string_view_t body;
+} gmv_sip_outbound_subscribe_t;
 
 uint32_t gmv_sip_abi_version(void);
 void gmv_sip_runtime_config_init(gmv_sip_runtime_config_t *config);
@@ -114,6 +214,7 @@ int32_t gmv_sip_runtime_create(
     const gmv_sip_runtime_config_t *config,
     gmv_sip_runtime_t **out_runtime);
 int32_t gmv_sip_runtime_start(gmv_sip_runtime_t *runtime);
+int32_t gmv_sip_runtime_poll(gmv_sip_runtime_t *runtime);
 int32_t gmv_sip_runtime_stop(gmv_sip_runtime_t *runtime);
 int32_t gmv_sip_runtime_complete_auth_lookup(
     gmv_sip_runtime_t *runtime,
@@ -121,9 +222,30 @@ int32_t gmv_sip_runtime_complete_auth_lookup(
 int32_t gmv_sip_runtime_send_message(
     gmv_sip_runtime_t *runtime,
     const gmv_sip_outbound_message_t *message);
+int32_t gmv_sip_runtime_send_invite(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_outbound_invite_t *invite);
+int32_t gmv_sip_runtime_send_dialog_request(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_dialog_request_t *request);
+int32_t gmv_sip_runtime_respond_invite(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_invite_response_t *response);
+int32_t gmv_sip_runtime_send_subscribe(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_outbound_subscribe_t *subscribe);
+int32_t gmv_sip_runtime_receive_packet(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_received_packet_t *packet);
+int32_t gmv_sip_runtime_complete_send(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_send_completion_t *completion);
+int32_t gmv_sip_runtime_close_transport(
+    gmv_sip_runtime_t *runtime,
+    uint64_t association_id,
+    int32_t transport,
+    int32_t status);
 void gmv_sip_runtime_destroy(gmv_sip_runtime_t *runtime);
-uint16_t gmv_sip_runtime_udp_port(const gmv_sip_runtime_t *runtime);
-uint16_t gmv_sip_runtime_tcp_port(const gmv_sip_runtime_t *runtime);
 int32_t gmv_sip_runtime_last_status(const gmv_sip_runtime_t *runtime);
 int32_t gmv_sip_error_message(
     int32_t status,

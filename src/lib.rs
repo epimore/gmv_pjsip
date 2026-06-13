@@ -1,22 +1,17 @@
-//! Safe GB28181-oriented SIP context layer.
+//! Safe GB28181-oriented native PJSIP runtime.
 //!
 //! Boundary:
-//! - `gmv_pjsip_sys` mirrors raw pjproject C symbols.
-//! - `gmv_pjsip` owns SIP parsing/building/transaction/dialog context.
+//! - `gmv_pjsip_sys` exposes the versioned C shim and custom transport.
+//! - `gmv_pjsip` owns PJSIP runtime, transaction, dialog, INVITE, and subscription state.
 //! - `session` depends on this crate and never manipulates raw PJSIP pointers.
 
 pub mod auth;
-pub mod builder;
-pub mod context;
-pub mod endpoint;
 pub mod error;
 pub mod gb28181;
 pub mod message;
-pub mod parser;
 #[cfg(feature = "pjsip-sys")]
 pub mod runtime;
 pub mod transport;
-pub mod types;
 
 pub use bytes::Bytes;
 
@@ -24,26 +19,13 @@ pub use auth::{
     AuthAlgorithm, AuthConfig, AuthCredential, AuthDecision, AuthRequirement, CredentialKind,
     PasswordProvider, StaticPasswordProvider,
 };
-pub use context::{
-    CallStore, CleanupReport, DialogId, DialogState, DialogStore, InviteCall, InviteState,
-    RegisterBinding, RegisterStore, SipContext, SipLocalConfig, TransactionStore,
-};
-pub use endpoint::{
-    AckEvent, ByeEvent, CancelEvent, CreateBye, CreateInfo, CreateInvite, CreateMessage,
-    CreatePlaybackSeekInfo, CreatePlaybackSpeedInfo, CreatePresetQueryMessage,
-    CreateSnapshotControlMessage, CreateSubscribe, CreateTalkInvite, IncomingInviteEvent,
-    InviteAcceptedEvent, MessageEvent, MessageKind, RegisterEvent, SipAction, SipEndpoint,
-    SipEvent, SipOutput, StandardRequestEvent, StandardResponseEvent,
-};
 pub use error::{Result, SipError};
 pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
-pub use message::{
-    HeaderMapExt, SipHeader, SipMessage, SipMethod, SipPacketKind, SipResponseStatus,
-};
+pub use message::SipMethod;
 #[cfg(feature = "pjsip-sys")]
 pub use runtime::{
-    SipAuthLookupResult, SipOutboundMessage, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
-    SipRuntimeEventKind, SipRuntimeEvents,
+    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipInviteResponse, SipOutboundInvite,
+    SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
+    SipRuntimeEventKind, SipRuntimeEvents, SipRuntimeTransmits, SipTransmit,
 };
 pub use transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};
-pub use types::{CSeq, CallId, DeviceId, SipUri, StreamId};

@@ -63,9 +63,9 @@ pub enum TalkAudioCodec {
 impl TalkAudioCodec {
     pub fn rtpmap(self, payload_type: u8) -> String {
         match self {
-            TalkAudioCodec::G711A => format!("{} PCMA/8000", payload_type),
-            TalkAudioCodec::G711U => format!("{} PCMU/8000", payload_type),
-            TalkAudioCodec::L16 => format!("{} L16/8000/1", payload_type),
+            TalkAudioCodec::G711A => format!("{payload_type} PCMA/8000"),
+            TalkAudioCodec::G711U => format!("{payload_type} PCMU/8000"),
+            TalkAudioCodec::L16 => format!("{payload_type} L16/8000/1"),
         }
     }
 }

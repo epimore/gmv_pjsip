@@ -1,31 +1,40 @@
 # gmv_pjsip
 
-`gmv_pjsip` is the GB28181-oriented SIP context layer used by GMV.
-
-Layering:
+`gmv_pjsip` is GMV's safe GB28181 runtime over PJSIP 2.17.
 
 ```text
-gmv_pjsip_sys  -> raw PJPROJECT/PJSIP FFI and auth shim
-gmv_pjsip      -> safe SIP parser/builder/context/dialog/transaction API
-session         -> business logic; does not build SIP headers manually
+session Rust IO  -> UDP datagrams / TCP chunks
+gmv_pjsip        -> owned commands, events, and send completions
+gmv_pjsip_sys    -> versioned C shim and PJSIP custom transport
+PJSIP            -> parser, transaction, dialog, INVITE, auth, and evsub
 ```
 
-## Current mid-term capabilities
+Rust owns network sockets and TCP associations. The PJSIP owner thread receives
+owned packet data through `pjsip_tpmgr_receive_packet()`. PJSIP outbound
+`send_msg()` calls are copied into `SipTransmit`; Rust IO reports the final
+write result with `SipRuntime::complete_send`.
 
-- REGISTER digest challenge/verify and registration binding context.
-- MESSAGE handling and automatic 200 OK response.
-- INVITE dialog/call context and ACK/BYE generation.
-- In-dialog INFO safe API for playback seek/speed.
-- Talk-specific INVITE + SDP helpers.
-- Snapshot/preset helper APIs:
-  - PresetQuery MESSAGE body generation.
-  - SnapShotConfig MESSAGE body generation.
-  - UploadSnapShotFinished event extraction with `snapshot_session_id`.
-- Timed cleanup of transactions, registers, dialogs, calls, and nonce cache.
+## Runtime coverage
+
+- UDP datagrams and fragmented/coalesced TCP chunks.
+- REGISTER Digest challenge, asynchronous credential lookup, refresh, and
+  unregister.
+- Stateful inbound and outbound MESSAGE and OPTIONS.
+- UAC/UAS INVITE, provisional/final responses, ACK, CANCEL, BYE, and dialog
+  INFO. The safe UAS API currently exposes non-success final responses only.
+- SUBSCRIBE establish, refresh, unsubscribe, and NOTIFY.
+- Owned runtime events with operation, association, Call-ID, CSeq, tag, event,
+  subscription-state, content type, and body metadata.
+- Ordered transport close, pending send completion, and runtime shutdown;
+  session completes pending business waiters with 503 during shutdown.
+
+`SipRuntime` is intentionally `!Send` and `!Sync`. Creation, polling, all PJSIP
+operations, stop, and destroy must stay on the owner thread. Tokio tasks use
+bounded command/event channels and never retain PJSIP pointers.
 
 ## Build configuration
 
-Prefer project-controlled PJPROJECT 2.17+ builds:
+Use the project-controlled PJPROJECT build:
 
 ```toml
 [env]
@@ -33,81 +42,35 @@ PJSIP_INCLUDE_DIR = { value = "../gmv/third_party/pjproject-2.17/dist/include", 
 PJSIP_LIBS_DIR    = { value = "../gmv/third_party/pjproject-2.17/dist/lib", relative = true }
 ```
 
-`pkg-config` is also supported. If no explicit environment variables are set,
-`gmv_pjsip_sys` probes `libpjproject` through the default pkg-config path.
+`session/build_pjsip_bootstrap.sh` builds the pinned source archive. Generated
+`dist/`, bindings, and machine-local configure outputs must not be committed.
 
-## New business APIs
+Prototype capacity defaults are:
 
-Playback seek/speed should use:
+- runtime and SIP IO channel capacity: 32,768;
+- pending REGISTER auth: 20,000;
+- maximum SIP packet: 65,535 bytes;
+- maximum PJSIP transports: 32,768.
 
-```rust
-SipContext::create_playback_seek_info(...)
-SipContext::create_playback_speed_info(...)
+## Safe API
+
+The safe layer exports:
+
+- `SipRuntime::receive_packet`, `close_transport`, and `complete_send`;
+- `send_message`, `send_invite`, `send_dialog_request`, `respond_invite`, and
+  `send_subscribe`;
+- `complete_auth_lookup`;
+- owned `SipRuntimeEvent` and `SipTransmit` receivers.
+
+GB28181 XML and SDP helpers remain in Rust. Session/business code must not
+manually compose Via, From/To tags, Call-ID, CSeq, branch, Contact, ACK, BYE, or
+in-dialog INFO headers.
+
+## Verification
+
+```bash
+cargo test --all-features
+cargo test --no-default-features
+cargo clippy --all-features --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
-
-Talk should use:
-
-```rust
-SipContext::create_talk_invite(...)
-```
-
-Preset snapshot support should use:
-
-```rust
-SipContext::create_preset_query_message(...)
-SipContext::create_snapshot_control_message(...)
-```
-
-Incoming snapshot completion is delivered as:
-
-```rust
-SipEvent::Message(MessageEvent {
-    kind: MessageKind::UploadSnapshotFinished,
-    snapshot_session_id: Some(...),
-    ..
-})
-```
-
-## Native PJSIP runtime prototype
-
-With the default `pjsip-sys` feature, `SipRuntime` safely owns the native
-PJLIB/PJSIP runtime:
-
-```rust
-let (runtime, events) = SipRuntime::start(SipRuntimeConfig::default())?;
-let udp_port = runtime.udp_port();
-let tcp_port = runtime.tcp_port();
-runtime.shutdown()?;
-```
-
-Current constraints:
-
-- one active runtime per process;
-- runtime creation, polling ownership, and shutdown stay on one Rust thread;
-- native callback strings are copied into owned `SipRuntimeEvent` values;
-- events use a standard-library receiver, with no Tokio dependency;
-- IPv4 UDP/TCP, OPTIONS, MESSAGE, and REGISTER are implemented;
-- OPTIONS responses advertise the native method set and GB28181 capability;
-- stateful UAS transactions absorb UDP request retransmissions before business
-  event delivery;
-- `SipRuntime::send_message` creates a non-dialog UAC transaction and reports
-  the final response with the caller's `operation_id`;
-- REGISTER credential lookup is asynchronous and completed through
-  `SipRuntime::complete_auth_lookup`;
-- digest verification checks nonce lifetime, request URI, and nonce-count
-  replay, and emits owned registration events;
-- `session` has a prototype bridge with a dedicated runtime thread and
-  batched auth lookup (up to 2,000 keys per batch), plus a typed outbound
-  MESSAGE command channel;
-- `session` still uses the legacy backend by default.
-
-## Notes
-
-`gmv_pjsip` owns SIP context. Session/business code should not manually compose
-Via, From/To tag, Call-ID, CSeq, branch, Contact, ACK, BYE, or in-dialog INFO
-headers.
-
-
-## SIP method coverage
-
-The safe layer recognizes the standard method set used by GB28181 and common SIP extensions: ACK, BYE, CANCEL, INFO, INVITE, MESSAGE, NOTIFY, OPTIONS, PRACK, PUBLISH, REFER, REGISTER, SUBSCRIBE, UPDATE. See `SIP_METHODS.md` for response policy and extension handling.

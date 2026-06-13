@@ -5,6 +5,7 @@ use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
 use crate::error::{Result, SipError};
 
 fn alg_id(algorithm: AuthAlgorithm) -> c_int {
+    // SAFETY: These shim functions take no pointers and return stable PJSIP enum values.
     unsafe {
         match algorithm {
             AuthAlgorithm::Md5 => gmv_pjsip_sys::gmv_pjsip_auth_alg_md5(),
@@ -15,6 +16,7 @@ fn alg_id(algorithm: AuthAlgorithm) -> c_int {
 }
 
 pub fn is_algorithm_supported(algorithm: AuthAlgorithm) -> bool {
+    // SAFETY: The shim accepts the enum value returned by `alg_id` and retains no data.
     unsafe { gmv_pjsip_sys::gmv_pjsip_auth_is_algorithm_supported(alg_id(algorithm)) != 0 }
 }
 
@@ -22,6 +24,7 @@ fn cstring(name: &str, value: &str) -> Result<CString> {
     CString::new(value).map_err(|_| SipError::AuthFailed(format!("{name} contains NUL byte")))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_digest_response(
     credential: &AuthCredential,
     method: &str,
@@ -49,6 +52,7 @@ pub fn create_digest_response(
     let cnonce = cstring("cnonce", cnonce.unwrap_or_default())?;
     let qop = cstring("qop", qop.unwrap_or_default())?;
 
+    // SAFETY: These shim functions take no pointers and return stable credential enum values.
     let data_type = unsafe {
         match credential.kind {
             CredentialKind::PlainPassword => gmv_pjsip_sys::gmv_pjsip_auth_plain_password_type(),
@@ -57,6 +61,8 @@ pub fn create_digest_response(
     };
 
     let mut out = vec![0 as c_char; 161];
+    // SAFETY: Every input is a live NUL-terminated CString, and `out` is writable
+    // for the exact capacity supplied to the shim. The shim retains no pointers.
     let status = unsafe {
         gmv_pjsip_sys::gmv_pjsip_auth_create_digest2(
             out.as_mut_ptr(),
@@ -81,6 +87,7 @@ pub fn create_digest_response(
         )));
     }
 
+    // SAFETY: A successful shim call guarantees a NUL-terminated digest in `out`.
     let digest = unsafe { CStr::from_ptr(out.as_ptr()) }
         .to_string_lossy()
         .to_string();

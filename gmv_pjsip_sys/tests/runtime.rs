@@ -1,50 +1,92 @@
 use std::ffi::c_void;
-use std::io::{Read, Write};
-use std::mem::MaybeUninit;
-use std::net::{TcpStream, UdpSocket};
+use std::mem::{self, MaybeUninit};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gmv_pjsip_sys::{
-    gmv_sip_abi_version, gmv_sip_event_t, gmv_sip_runtime_config_init, gmv_sip_runtime_config_t,
-    gmv_sip_runtime_create, gmv_sip_runtime_destroy, gmv_sip_runtime_start, gmv_sip_runtime_stop,
-    gmv_sip_runtime_t, gmv_sip_runtime_tcp_port, gmv_sip_runtime_udp_port, gmv_sip_string_view_t,
-    GMV_SIP_ABI_VERSION,
+    gmv_sip_abi_version, gmv_sip_event_t, gmv_sip_received_packet_t, gmv_sip_runtime_complete_send,
+    gmv_sip_runtime_config_init, gmv_sip_runtime_config_t, gmv_sip_runtime_create,
+    gmv_sip_runtime_destroy, gmv_sip_runtime_poll, gmv_sip_runtime_receive_packet,
+    gmv_sip_runtime_start, gmv_sip_runtime_stop, gmv_sip_runtime_t, gmv_sip_send_completion_t,
+    gmv_sip_send_packet_t, gmv_sip_string_view_t,
+    gmv_sip_transport_GMV_SIP_TRANSPORT_UDP as TRANSPORT_UDP, GMV_SIP_ABI_VERSION,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+static BIND_ADDRESS: &[u8] = b"127.0.0.1";
+static REMOTE_ADDRESS: &[u8] = b"127.0.0.1";
 
-unsafe extern "C" fn count_event(_event: *const gmv_sip_event_t, user_data: *mut c_void) {
-    if !user_data.is_null() {
-        // SAFETY: The test keeps this AtomicUsize alive until runtime stop.
-        let count = unsafe { &*(user_data.cast::<AtomicUsize>()) };
-        count.fetch_add(1, Ordering::Relaxed);
+struct CallbackState {
+    events: AtomicUsize,
+    sends: AtomicUsize,
+    send_id: AtomicU64,
+    send_len: AtomicUsize,
+}
+
+impl CallbackState {
+    fn new() -> Self {
+        Self {
+            events: AtomicUsize::new(0),
+            sends: AtomicUsize::new(0),
+            send_id: AtomicU64::new(0),
+            send_len: AtomicUsize::new(0),
+        }
     }
 }
 
-fn config(events: &AtomicUsize) -> gmv_sip_runtime_config_t {
+unsafe extern "C" fn count_event(_event: *const gmv_sip_event_t, user_data: *mut c_void) {
+    if !user_data.is_null() {
+        // SAFETY: The test keeps CallbackState alive until runtime stop.
+        let state = unsafe { &*(user_data.cast::<CallbackState>()) };
+        state.events.fetch_add(1, Ordering::Release);
+    }
+}
+
+unsafe extern "C" fn capture_send(
+    packet: *const gmv_sip_send_packet_t,
+    user_data: *mut c_void,
+) -> i32 {
+    if packet.is_null() || user_data.is_null() {
+        return -1;
+    }
+    // SAFETY: The shim supplies a valid packet for this callback invocation.
+    let packet = unsafe { &*packet };
+    // SAFETY: The test keeps CallbackState alive until runtime stop.
+    let state = unsafe { &*(user_data.cast::<CallbackState>()) };
+    state.send_len.store(packet.data.len, Ordering::Relaxed);
+    state.send_id.store(packet.send_id, Ordering::Relaxed);
+    state.sends.fetch_add(1, Ordering::Release);
+    0
+}
+
+fn view(value: &'static [u8]) -> gmv_sip_string_view_t {
+    gmv_sip_string_view_t {
+        ptr: value.as_ptr().cast(),
+        len: value.len(),
+    }
+}
+
+fn config(state: &CallbackState) -> gmv_sip_runtime_config_t {
     let mut config = MaybeUninit::<gmv_sip_runtime_config_t>::uninit();
     // SAFETY: The C initializer writes the complete config structure.
     unsafe { gmv_sip_runtime_config_init(config.as_mut_ptr()) };
     // SAFETY: The initializer completed successfully for a non-null pointer.
     let mut config = unsafe { config.assume_init() };
-    static BIND_ADDRESS: &[u8] = b"127.0.0.1";
-    config.bind_address = gmv_sip_string_view_t {
-        ptr: BIND_ADDRESS.as_ptr().cast(),
-        len: BIND_ADDRESS.len(),
-    };
-    config.port = 0;
+    config.bind_address = view(BIND_ADDRESS);
+    config.port = 5060;
     config.enable_udp = 1;
     config.enable_tcp = 1;
     config.event_callback = Some(count_event);
-    config.event_user_data = ptr::from_ref(events).cast_mut().cast();
+    config.event_user_data = ptr::from_ref(state).cast_mut().cast();
+    config.send_callback = Some(capture_send);
+    config.send_user_data = ptr::from_ref(state).cast_mut().cast();
     config
 }
 
-fn create_started(events: &AtomicUsize) -> (*mut gmv_sip_runtime_t, u16, u16) {
-    let config = config(events);
+fn create_started(state: &CallbackState) -> *mut gmv_sip_runtime_t {
+    let config = config(state);
     let mut runtime = ptr::null_mut();
     // SAFETY: Config and output pointers are valid for the duration of the call.
     let status = unsafe { gmv_sip_runtime_create(&config, &mut runtime) };
@@ -52,13 +94,7 @@ fn create_started(events: &AtomicUsize) -> (*mut gmv_sip_runtime_t, u16, u16) {
     assert!(!runtime.is_null());
     // SAFETY: Runtime was created successfully and is exclusively owned here.
     assert_eq!(unsafe { gmv_sip_runtime_start(runtime) }, 0);
-    // SAFETY: Runtime remains valid and started.
-    let udp_port = unsafe { gmv_sip_runtime_udp_port(runtime) };
-    // SAFETY: Runtime remains valid and started.
-    let tcp_port = unsafe { gmv_sip_runtime_tcp_port(runtime) };
-    assert_ne!(udp_port, 0);
-    assert_ne!(tcp_port, 0);
-    (runtime, udp_port, tcp_port)
+    runtime
 }
 
 fn stop_destroy(runtime: *mut gmv_sip_runtime_t) {
@@ -70,14 +106,25 @@ fn stop_destroy(runtime: *mut gmv_sip_runtime_t) {
     unsafe { gmv_sip_runtime_destroy(runtime) };
 }
 
+fn wait_for_send(runtime: *mut gmv_sip_runtime_t, state: &CallbackState) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        // SAFETY: Runtime remains valid and is polled by its creating thread.
+        assert_eq!(unsafe { gmv_sip_runtime_poll(runtime) }, 0);
+        if state.sends.load(Ordering::Acquire) > 0 {
+            return state.send_id.load(Ordering::Relaxed);
+        }
+    }
+    panic!("timed out waiting for send callback");
+}
+
 #[test]
 fn abi_rejects_wrong_version() {
     let _guard = TEST_LOCK.lock().expect("lock runtime tests");
     // SAFETY: This function takes no pointers and returns the static ABI version.
-    let abi_version = unsafe { gmv_sip_abi_version() };
-    assert_eq!(abi_version, GMV_SIP_ABI_VERSION);
-    let events = AtomicUsize::new(0);
-    let mut config = config(&events);
+    assert_eq!(unsafe { gmv_sip_abi_version() }, GMV_SIP_ABI_VERSION);
+    let state = CallbackState::new();
+    let mut config = config(&state);
     config.version += 1;
     let mut runtime = ptr::null_mut();
     // SAFETY: Pointers are valid; the invalid version is the behavior under test.
@@ -87,83 +134,77 @@ fn abi_rejects_wrong_version() {
 }
 
 #[test]
-fn runtime_handles_udp_options_and_tcp_message() {
+fn runtime_injects_udp_and_completes_async_send() {
     let _guard = TEST_LOCK.lock().expect("lock runtime tests");
-    let events = AtomicUsize::new(0);
-    let (runtime, udp_port, tcp_port) = create_started(&events);
+    let state = CallbackState::new();
+    let runtime = create_started(&state);
 
-    let udp = UdpSocket::bind("127.0.0.1:0").expect("bind UDP client");
-    udp.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set UDP timeout");
-    let udp_local = udp.local_addr().expect("UDP local address");
-    let options = format!(
-        "OPTIONS sip:127.0.0.1:{udp_port} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {udp_local};branch=z9hG4bK-gmv-options;rport\r\n\
-From: <sip:test@127.0.0.1>;tag=from-options\r\n\
+    static OPTIONS: &[u8] = b"OPTIONS sip:127.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:40000;branch=z9hG4bK-sys;rport\r\n\
+From: <sip:test@127.0.0.1>;tag=sys\r\n\
 To: <sip:gmv@127.0.0.1>\r\n\
-Call-ID: gmv-options-loopback\r\n\
+Call-ID: sys-options\r\n\
 CSeq: 1 OPTIONS\r\n\
 Max-Forwards: 70\r\n\
-Content-Length: 0\r\n\r\n"
+Content-Length: 0\r\n\r\n";
+    let packet = gmv_sip_received_packet_t {
+        size: mem::size_of::<gmv_sip_received_packet_t>() as u32,
+        version: GMV_SIP_ABI_VERSION,
+        association_id: 0,
+        transport: TRANSPORT_UDP as i32,
+        data: view(OPTIONS),
+        local_address: view(BIND_ADDRESS),
+        local_port: 5060,
+        remote_address: view(REMOTE_ADDRESS),
+        remote_port: 40000,
+    };
+    // SAFETY: Runtime and packet pointers are valid; the shim copies all views.
+    assert_eq!(
+        unsafe { gmv_sip_runtime_receive_packet(runtime, &packet) },
+        0
     );
-    udp.send_to(options.as_bytes(), ("127.0.0.1", udp_port))
-        .expect("send OPTIONS");
-    let mut udp_response = [0u8; 2048];
-    let (len, _) = udp
-        .recv_from(&mut udp_response)
-        .expect("receive OPTIONS response");
-    assert!(String::from_utf8_lossy(&udp_response[..len]).starts_with("SIP/2.0 200"));
 
-    let mut tcp = TcpStream::connect(("127.0.0.1", tcp_port)).expect("connect TCP client");
-    tcp.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set TCP timeout");
-    let body = "<?xml version=\"1.0\"?><Notify><CmdType>Keepalive</CmdType></Notify>";
-    let message = format!(
-        "MESSAGE sip:127.0.0.1:{tcp_port} SIP/2.0\r\n\
-Via: SIP/2.0/TCP 127.0.0.1;branch=z9hG4bK-gmv-message;rport\r\n\
-From: <sip:test@127.0.0.1>;tag=from-message\r\n\
-To: <sip:gmv@127.0.0.1>\r\n\
-Call-ID: gmv-message-loopback\r\n\
-CSeq: 1 MESSAGE\r\n\
-Max-Forwards: 70\r\n\
-Content-Type: Application/MANSCDP+xml\r\n\
-Content-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
+    let send_id = wait_for_send(runtime, &state);
+    assert_ne!(send_id, 0);
+    assert!(state.send_len.load(Ordering::Relaxed) > 0);
+    let completion = gmv_sip_send_completion_t {
+        size: mem::size_of::<gmv_sip_send_completion_t>() as u32,
+        version: GMV_SIP_ABI_VERSION,
+        send_id,
+        sent_bytes: state.send_len.load(Ordering::Relaxed) as i64,
+    };
+    // SAFETY: Runtime and completion pointers are valid for this call.
+    assert_eq!(
+        unsafe { gmv_sip_runtime_complete_send(runtime, &completion) },
+        0
     );
-    tcp.write_all(message.as_bytes()).expect("send MESSAGE");
-    let mut tcp_response = [0u8; 2048];
-    let len = tcp
-        .read(&mut tcp_response)
-        .expect("receive MESSAGE response");
-    assert!(String::from_utf8_lossy(&tcp_response[..len]).starts_with("SIP/2.0 200"));
+    // SAFETY: Runtime remains valid and consumes the queued send completion.
+    assert_eq!(unsafe { gmv_sip_runtime_poll(runtime) }, 0);
 
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state.events.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+        // SAFETY: Runtime remains valid and is polled by its creating thread.
+        assert_eq!(unsafe { gmv_sip_runtime_poll(runtime) }, 0);
+    }
+    assert!(state.events.load(Ordering::Relaxed) >= 2);
     stop_destroy(runtime);
-    assert!(events.load(Ordering::Relaxed) >= 4);
 }
 
 #[test]
 fn runtime_can_be_created_and_destroyed_repeatedly() {
     let _guard = TEST_LOCK.lock().expect("lock runtime tests");
-    let events = AtomicUsize::new(0);
-    let config = config(&events);
+    let state = CallbackState::new();
+    let config = config(&state);
     let mut runtime = ptr::null_mut();
     // SAFETY: Config and output pointers are valid for the duration of the call.
     assert_eq!(unsafe { gmv_sip_runtime_create(&config, &mut runtime) }, 0);
-    assert!(!runtime.is_null());
 
     for _ in 0..3 {
         // SAFETY: Runtime was created successfully and is exclusively owned here.
         assert_eq!(unsafe { gmv_sip_runtime_start(runtime) }, 0);
-        // SAFETY: Runtime remains valid and started.
-        assert_ne!(unsafe { gmv_sip_runtime_udp_port(runtime) }, 0);
-        // SAFETY: Runtime remains valid and started.
-        assert_ne!(unsafe { gmv_sip_runtime_tcp_port(runtime) }, 0);
         // SAFETY: Starting an already started runtime is explicitly idempotent.
         assert_eq!(unsafe { gmv_sip_runtime_start(runtime) }, 0);
         // SAFETY: Runtime is exclusively owned by this test.
-        assert_eq!(unsafe { gmv_sip_runtime_stop(runtime) }, 0);
-        // SAFETY: Stop is explicitly idempotent.
         assert_eq!(unsafe { gmv_sip_runtime_stop(runtime) }, 0);
     }
 

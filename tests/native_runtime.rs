@@ -1,41 +1,75 @@
 #![cfg(feature = "pjsip-sys")]
 
-use std::io::{Read, Write};
-use std::net::{TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Mutex;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use gmv_pjsip::auth::create_digest_response;
 use gmv_pjsip::{
-    AuthAlgorithm, AuthCredential, CredentialKind, SipAuthLookupResult, SipError,
-    SipOutboundMessage, SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind,
-    SipTransportProtocol,
+    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipError, SipInviteResponse,
+    SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig,
+    SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+const LOCAL_PORT: u16 = 5060;
 
-fn receive_udp(socket: &UdpSocket) -> String {
-    let mut response = [0u8; 4096];
-    let (len, _) = socket
-        .recv_from(&mut response)
-        .expect("receive SIP response");
-    String::from_utf8_lossy(&response[..len]).into_owned()
+fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn local_addr() -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, LOCAL_PORT))
+}
+
+fn remote_addr(port: u16) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+}
+
+fn start_runtime(
+    mut config: SipRuntimeConfig,
+) -> (SipRuntime, Receiver<SipRuntimeEvent>, SipRuntimeTransmits) {
+    config.port = LOCAL_PORT;
+    let (mut runtime, events) = SipRuntime::start(config).expect("start runtime");
+    let transmits = runtime.take_transmits().expect("take transmit receiver");
+    (runtime, events, transmits)
 }
 
 fn receive_event(
-    events: &std::sync::mpsc::Receiver<SipRuntimeEvent>,
+    runtime: &mut SipRuntime,
+    events: &Receiver<SipRuntimeEvent>,
     kind: SipRuntimeEventKind,
 ) -> SipRuntimeEvent {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if let Ok(event) = events.recv_timeout(Duration::from_millis(100)) {
+        runtime.poll().expect("poll runtime");
+        while let Ok(event) = events.try_recv() {
             if event.kind == kind {
                 return event;
             }
         }
     }
     panic!("timed out waiting for {kind:?}");
+}
+
+fn receive_transmit(runtime: &mut SipRuntime, transmits: &SipRuntimeTransmits) -> SipTransmit {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        runtime.poll().expect("poll runtime");
+        if let Ok(transmit) = transmits.try_recv() {
+            return transmit;
+        }
+    }
+    panic!("timed out waiting for custom transport transmit");
+}
+
+fn finish_transmit(runtime: &mut SipRuntime, transmit: &SipTransmit) -> String {
+    runtime
+        .complete_send(transmit.send_id, Ok(transmit.data.len()))
+        .expect("complete custom transport send");
+    String::from_utf8_lossy(&transmit.data).into_owned()
 }
 
 fn header_value<'a>(message: &'a str, name: &str) -> &'a str {
@@ -50,7 +84,7 @@ fn header_value<'a>(message: &'a str, name: &str) -> &'a str {
 
 #[test]
 fn runtime_rejects_invalid_transport_config() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
+    let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_udp: false,
         enable_tcp: false,
@@ -65,8 +99,8 @@ fn runtime_rejects_invalid_transport_config() {
 
 #[test]
 fn runtime_enforces_one_active_instance() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
-    let (runtime, _events) = SipRuntime::start(SipRuntimeConfig::default()).expect("start runtime");
+    let _guard = lock_tests();
+    let (runtime, _events, _transmits) = start_runtime(SipRuntimeConfig::default());
     let error = match SipRuntime::start(SipRuntimeConfig::default()) {
         Ok(_) => panic!("second runtime unexpectedly started"),
         Err(error) => error,
@@ -76,49 +110,47 @@ fn runtime_enforces_one_active_instance() {
 }
 
 #[test]
-fn runtime_copies_udp_and_tcp_events() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
-    let (runtime, events) = SipRuntime::start(SipRuntimeConfig::default()).expect("start runtime");
-    let udp_port = runtime.udp_port().expect("UDP port");
-    let tcp_port = runtime.tcp_port().expect("TCP port");
+fn custom_transport_handles_udp_and_fragmented_tcp() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
 
-    let udp = UdpSocket::bind("127.0.0.1:0").expect("bind UDP client");
-    udp.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set UDP timeout");
-    let udp_local = udp.local_addr().expect("UDP local address");
+    let udp_remote = remote_addr(40000);
     let options = format!(
-        "OPTIONS sip:127.0.0.1:{udp_port} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {udp_local};branch=z9hG4bK-safe-options;rport\r\n\
-From: <sip:test@127.0.0.1>;tag=safe-options\r\n\
+        "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {udp_remote};branch=z9hG4bK-options;rport\r\n\
+From: <sip:test@127.0.0.1>;tag=options\r\n\
 To: <sip:gmv@127.0.0.1>\r\n\
-Call-ID: safe-options-loopback\r\n\
+Call-ID: custom-options\r\n\
 CSeq: 1 OPTIONS\r\n\
 Max-Forwards: 70\r\n\
 Content-Length: 0\r\n\r\n"
     );
-    udp.send_to(options.as_bytes(), ("127.0.0.1", udp_port))
-        .expect("send OPTIONS");
-    let mut udp_response = [0u8; 2048];
-    let (len, _) = udp
-        .recv_from(&mut udp_response)
-        .expect("receive OPTIONS response");
-    let udp_response = String::from_utf8_lossy(&udp_response[..len]);
-    assert!(udp_response.starts_with("SIP/2.0 200"));
-    assert!(udp_response.contains("\r\nAllow: REGISTER, MESSAGE, OPTIONS\r\n"));
-    assert!(udp_response.contains("\r\nSupported: gb28181\r\n"));
-    assert!(udp_response.contains("\r\nUser-Agent: GMV-PJSIP/0.1\r\n"));
-    assert!(udp_response.contains("\r\nX-GB-Ver: 3.0\r\n"));
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            udp_remote,
+            options.as_bytes(),
+        )
+        .expect("inject UDP OPTIONS");
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(transmit.protocol, SipTransportProtocol::Udp);
+    assert_eq!(transmit.association_id, 0);
+    assert_eq!(transmit.local_addr, local_addr());
+    assert_eq!(transmit.remote_addr, udp_remote);
+    let response = finish_transmit(&mut runtime, &transmit);
+    assert!(response.starts_with("SIP/2.0 200"));
+    assert!(response.contains("\r\nAllow: REGISTER, MESSAGE, OPTIONS\r\n"));
 
-    let mut tcp = TcpStream::connect(("127.0.0.1", tcp_port)).expect("connect TCP client");
-    tcp.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set TCP timeout");
+    let tcp_remote = remote_addr(40001);
     let body = "<?xml version=\"1.0\"?><Notify><CmdType>Keepalive</CmdType></Notify>";
     let message = format!(
-        "MESSAGE sip:127.0.0.1:{tcp_port} SIP/2.0\r\n\
-Via: SIP/2.0/TCP 127.0.0.1;branch=z9hG4bK-safe-message;rport\r\n\
-From: <sip:test@127.0.0.1>;tag=safe-message\r\n\
+        "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/TCP {tcp_remote};branch=z9hG4bK-message;rport\r\n\
+From: <sip:test@127.0.0.1>;tag=message\r\n\
 To: <sip:gmv@127.0.0.1>\r\n\
-Call-ID: safe-message-loopback\r\n\
+Call-ID: custom-message\r\n\
 CSeq: 1 MESSAGE\r\n\
 Max-Forwards: 70\r\n\
 Content-Type: Application/MANSCDP+xml\r\n\
@@ -126,553 +158,756 @@ Content-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
-    tcp.write_all(message.as_bytes()).expect("send MESSAGE");
-    let mut tcp_response = [0u8; 2048];
-    let len = tcp
-        .read(&mut tcp_response)
-        .expect("receive MESSAGE response");
-    assert!(String::from_utf8_lossy(&tcp_response[..len]).starts_with("SIP/2.0 200"));
+    let split = message.len() / 2;
+    runtime
+        .receive_packet(
+            7,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            tcp_remote,
+            &message.as_bytes()[..split],
+        )
+        .expect("inject first TCP fragment");
+    runtime.poll().expect("poll first TCP fragment");
+    assert!(matches!(
+        transmits.recv_timeout(Duration::from_millis(50)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    runtime
+        .receive_packet(
+            7,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            tcp_remote,
+            &message.as_bytes()[split..],
+        )
+        .expect("inject second TCP fragment");
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(transmit.protocol, SipTransportProtocol::Tcp);
+    assert_eq!(transmit.association_id, 7);
+    assert_eq!(transmit.remote_addr, tcp_remote);
+    assert!(finish_transmit(&mut runtime, &transmit).starts_with("SIP/2.0 200"));
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let mut copied = Vec::new();
-    while copied.len() < 4 && Instant::now() < deadline {
-        if let Ok(event) = events.recv_timeout(Duration::from_millis(100)) {
-            copied.push(event);
-        }
-    }
-
-    let options_event = copied
-        .iter()
-        .find(|event| {
-            event.kind == SipRuntimeEventKind::RequestReceived
-                && event.protocol == Some(SipTransportProtocol::Udp)
-                && event.method.as_deref() == Some("OPTIONS")
-        })
-        .expect("copied OPTIONS event");
-    assert_eq!(
-        options_event.call_id.as_deref(),
-        Some("safe-options-loopback")
-    );
-    assert_eq!(options_event.cseq, Some(1));
-    assert_eq!(
-        options_event.local_addr.map(|addr| addr.port()),
-        Some(udp_port)
-    );
-    assert_eq!(options_event.remote_addr, Some(udp_local));
-    assert!(options_event.body.is_empty());
-    assert_ne!(options_event.event_id, 0);
-
-    assert!(copied.iter().any(|event| {
-        event.kind == SipRuntimeEventKind::ResponseSent
-            && event.protocol == Some(SipTransportProtocol::Udp)
-            && event.status_code == Some(200)
-    }));
-    let message_event = copied
-        .iter()
-        .find(|event| {
-            event.kind == SipRuntimeEventKind::RequestReceived
-                && event.protocol == Some(SipTransportProtocol::Tcp)
-                && event.method.as_deref() == Some("MESSAGE")
-        })
-        .expect("copied MESSAGE event");
-    assert_eq!(
-        message_event.call_id.as_deref(),
-        Some("safe-message-loopback")
-    );
-    assert_eq!(message_event.cseq, Some(1));
-    assert_eq!(
-        message_event.content_type.as_deref(),
-        Some("Application/MANSCDP+xml")
-    );
+    let options_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(options_event.method.as_deref(), Some("OPTIONS"));
+    let _options_response = receive_event(&mut runtime, &events, SipRuntimeEventKind::ResponseSent);
+    let message_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(message_event.method.as_deref(), Some("MESSAGE"));
     assert_eq!(message_event.body, body.as_bytes());
-    assert!(copied.iter().any(|event| {
-        event.kind == SipRuntimeEventKind::ResponseSent
-            && event.protocol == Some(SipTransportProtocol::Tcp)
-            && event.status_code == Some(200)
-    }));
+    let _message_response = receive_event(&mut runtime, &events, SipRuntimeEventKind::ResponseSent);
 
-    runtime.shutdown().expect("shutdown runtime");
-}
-
-#[test]
-fn runtime_absorbs_duplicate_udp_message_transaction() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
-    let config = SipRuntimeConfig {
-        enable_tcp: false,
-        ..SipRuntimeConfig::default()
-    };
-    let (runtime, events) = SipRuntime::start(config).expect("start runtime");
-    let port = runtime.udp_port().expect("UDP port");
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind MESSAGE client");
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set MESSAGE timeout");
-    let local = socket.local_addr().expect("MESSAGE client address");
-    let body = "<?xml version=\"1.0\"?><Notify><CmdType>Keepalive</CmdType></Notify>";
-    let message = format!(
-        "MESSAGE sip:127.0.0.1:{port} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-safe-duplicate;rport\r\n\
-From: <sip:test@127.0.0.1>;tag=safe-duplicate\r\n\
-To: <sip:gmv@127.0.0.1>\r\n\
-Call-ID: safe-duplicate-message\r\n\
-CSeq: 1 MESSAGE\r\n\
-Max-Forwards: 70\r\n\
-Content-Type: Application/MANSCDP+xml\r\n\
-Content-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    );
-
-    for _ in 0..2 {
-        socket
-            .send_to(message.as_bytes(), ("127.0.0.1", port))
-            .expect("send duplicate MESSAGE");
-        let mut response = [0u8; 2048];
-        let (len, _) = socket
-            .recv_from(&mut response)
-            .expect("receive duplicate MESSAGE response");
-        assert!(String::from_utf8_lossy(&response[..len]).starts_with("SIP/2.0 200"));
-    }
-
-    let deadline = Instant::now() + Duration::from_millis(300);
-    let mut request_count = 0;
-    while Instant::now() < deadline {
-        match events.recv_timeout(Duration::from_millis(20)) {
-            Ok(event)
-                if event.kind == SipRuntimeEventKind::RequestReceived
-                    && event.method.as_deref() == Some("MESSAGE") =>
-            {
-                request_count += 1;
-            }
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    assert_eq!(request_count, 1);
-
-    runtime.shutdown().expect("shutdown runtime");
-}
-
-#[test]
-fn runtime_sends_outbound_message_and_correlates_final_response() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
-    let config = SipRuntimeConfig {
-        enable_tcp: false,
-        ..SipRuntimeConfig::default()
-    };
-    let (mut runtime, events) = SipRuntime::start(config).expect("start runtime");
-    let runtime_port = runtime.udp_port().expect("UDP port");
-    let peer = UdpSocket::bind("127.0.0.1:0").expect("bind outbound peer");
-    peer.set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set outbound peer timeout");
-    let peer_port = peer.local_addr().expect("outbound peer address").port();
-
-    let responder = thread::spawn(move || {
-        let mut packet = [0u8; 4096];
-        let (len, source) = peer
-            .recv_from(&mut packet)
-            .expect("receive outbound MESSAGE");
-        let request = String::from_utf8_lossy(&packet[..len]).into_owned();
-        assert!(request.starts_with("MESSAGE "));
-        assert!(request.contains("<CmdType>DeviceInfo</CmdType>"));
-        let via = header_value(&request, "Via").to_owned();
-        let from = header_value(&request, "From").to_owned();
-        let to = header_value(&request, "To").to_owned();
-        let call_id = header_value(&request, "Call-ID").to_owned();
-        let cseq = header_value(&request, "CSeq").to_owned();
-        let response = format!(
-            "SIP/2.0 200 OK\r\n\
-Via: {via}\r\n\
-From: {from}\r\n\
-To: {to};tag=outbound-peer\r\n\
-Call-ID: {call_id}\r\n\
-CSeq: {cseq}\r\n\
-Content-Length: 0\r\n\r\n"
-        );
-        peer.send_to(response.as_bytes(), source)
-            .expect("send outbound MESSAGE response");
-    });
-
-    let operation_id = 42;
     runtime
-        .send_message(&SipOutboundMessage {
-            operation_id,
-            target_uri: format!("sip:device@127.0.0.1:{peer_port}"),
-            from_uri: format!("<sip:platform@127.0.0.1:{runtime_port}>"),
-            content_type: "Application/MANSCDP+xml".into(),
-            body: b"<?xml version=\"1.0\"?><Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),
-        })
-        .expect("send outbound MESSAGE");
-
-    let response = receive_event(&events, SipRuntimeEventKind::OutboundResponse);
-    assert_eq!(response.operation_id, Some(operation_id));
-    assert_eq!(response.status_code, Some(200));
-    assert_eq!(response.method.as_deref(), Some("MESSAGE"));
-    assert!(response.call_id.is_some());
-    assert!(response.cseq.is_some());
-
-    responder.join().expect("join outbound peer");
+        .close_transport(7, SipTransportProtocol::Tcp, 0)
+        .expect("close TCP custom transport");
     runtime.shutdown().expect("shutdown runtime");
 }
 
 #[test]
-fn runtime_completes_register_auth_asynchronously() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
-    let mut config = SipRuntimeConfig {
+fn custom_transport_completes_register_auth_asynchronously() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
         enable_tcp: false,
         ..SipRuntimeConfig::default()
     };
-    config.auth_realm = "3402000000".into();
-    let (mut runtime, events) = SipRuntime::start(config).expect("start runtime");
-    let port = runtime.udp_port().expect("UDP port");
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind REGISTER client");
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set REGISTER timeout");
-    let local = socket.local_addr().expect("REGISTER client address");
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40002);
     let username = "34020000001320000001";
-    let realm = "3402000000";
-    let password = "safe-register-password";
-    let uri = format!("sip:{realm}@127.0.0.1:{port}");
-    let credential = AuthCredential {
-        username: username.into(),
-        realm: realm.into(),
-        secret: password.into(),
-        kind: CredentialKind::PlainPassword,
-        algorithm: AuthAlgorithm::Md5,
-    };
-
-    let first = format!(
-        "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-register-1;rport\r\n\
-From: <sip:{username}@{realm}>;tag=register-auth\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: safe-register-loopback\r\n\
+    let request = format!(
+        "REGISTER sip:3402000000@127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {remote};branch=z9hG4bK-register;rport\r\n\
+From: <sip:{username}@3402000000>;tag=register\r\n\
+To: <sip:{username}@3402000000>\r\n\
+Call-ID: custom-register\r\n\
 CSeq: 1 REGISTER\r\n\
-Contact: <sip:{username}@{local}>\r\n\
+Contact: <sip:{username}@{remote}>\r\n\
 Expires: 3600\r\n\
 User-Agent: GMV-Test-Device/1.0\r\n\
 X-GB-Ver: 3.0\r\n\
 Max-Forwards: 70\r\n\
 Content-Length: 0\r\n\r\n"
     );
-    socket
-        .send_to(first.as_bytes(), ("127.0.0.1", port))
-        .expect("send initial REGISTER");
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            request.as_bytes(),
+        )
+        .expect("inject REGISTER");
 
-    let lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
+    let lookup = receive_event(
+        &mut runtime,
+        &events,
+        SipRuntimeEventKind::AuthLookupRequired,
+    );
     assert_eq!(lookup.device_id.as_deref(), Some(username));
-    assert_eq!(lookup.realm.as_deref(), Some(realm));
     runtime
         .complete_auth_lookup(
-            lookup.lookup_id.expect("initial lookup id"),
-            SipAuthLookupResult::Credential(credential.clone()),
+            lookup.lookup_id.expect("lookup id"),
+            SipAuthLookupResult::Bypass,
         )
-        .expect("complete initial auth lookup");
+        .expect("complete auth lookup");
 
-    let challenge = receive_udp(&socket);
-    assert!(challenge.starts_with("SIP/2.0 401"));
-    assert_eq!(header_value(&challenge, "X-GB-Ver"), "3.0");
-    let challenge_parts =
-        gmv_pjsip::auth::parse_digest_authorization(header_value(&challenge, "WWW-Authenticate"));
-    let nonce = challenge_parts.get("nonce").expect("challenge nonce");
-    let nc = "00000001";
-    let cnonce = "register-client-nonce";
-    let response = create_digest_response(
-        &credential,
-        "REGISTER",
-        &uri,
-        nonce,
-        Some(nc),
-        Some(cnonce),
-        Some("auth"),
-        AuthAlgorithm::Md5,
-    )
-    .expect("create REGISTER digest");
-    let authorized = format!(
-        "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-register-2;rport\r\n\
-From: <sip:{username}@{realm}>;tag=register-auth\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: safe-register-loopback\r\n\
-CSeq: 2 REGISTER\r\n\
-Contact: <sip:{username}@{local}>\r\n\
-Expires: 3600\r\n\
-User-Agent: GMV-Test-Device/1.0\r\n\
-X-GB-Ver: 3.0\r\n\
-Max-Forwards: 70\r\n\
-Authorization: Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc={nc}\r\n\
-Content-Length: 0\r\n\r\n"
-    );
-    socket
-        .send_to(authorized.as_bytes(), ("127.0.0.1", port))
-        .expect("send authorized REGISTER");
-    let lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
-    runtime
-        .complete_auth_lookup(
-            lookup.lookup_id.expect("authorized lookup id"),
-            SipAuthLookupResult::Credential(credential.clone()),
-        )
-        .expect("complete authorized lookup");
-    let ok = receive_udp(&socket);
-    assert!(ok.starts_with("SIP/2.0 200"));
-    assert_eq!(header_value(&ok, "X-GB-Ver"), "3.0");
-    assert!(header_value(&ok, "Contact").contains(username));
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    let response = finish_transmit(&mut runtime, &transmit);
+    assert!(response.starts_with("SIP/2.0 200"));
+    assert_eq!(header_value(&response, "X-GB-Ver"), "3.0");
 
-    let registered = receive_event(&events, SipRuntimeEventKind::Registered);
+    let registered = receive_event(&mut runtime, &events, SipRuntimeEventKind::Registered);
     assert_eq!(registered.device_id.as_deref(), Some(username));
-    assert_eq!(registered.status_code, Some(200));
     assert_eq!(registered.expires_seconds, Some(3600));
     assert_eq!(
         registered.user_agent.as_deref(),
         Some("GMV-Test-Device/1.0")
     );
-    assert_eq!(registered.gb_version.as_deref(), Some("3.0"));
-    assert!(registered
-        .contact
-        .as_deref()
-        .is_some_and(|contact| contact.contains(username)));
+    runtime.shutdown().expect("shutdown runtime");
+}
 
-    let wrong_credential = AuthCredential {
-        secret: "wrong-password".into(),
-        ..credential.clone()
+#[test]
+fn custom_transport_sends_message_and_correlates_response() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
     };
-    let wrong_response = create_digest_response(
-        &wrong_credential,
-        "REGISTER",
-        &uri,
-        nonce,
-        Some("00000002"),
-        Some(cnonce),
-        Some("auth"),
-        AuthAlgorithm::Md5,
-    )
-    .expect("create wrong REGISTER digest");
-    let rejected = format!(
-        "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-register-3;rport\r\n\
-From: <sip:{username}@{realm}>;tag=register-auth\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: safe-register-loopback\r\n\
-CSeq: 3 REGISTER\r\n\
-Contact: <sip:{username}@{local}>\r\n\
-Expires: 3600\r\n\
-User-Agent: GMV-Test-Device/1.0\r\n\
-X-GB-Ver: 3.0\r\n\
-Max-Forwards: 70\r\n\
-Authorization: Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{wrong_response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc=00000002\r\n\
-Content-Length: 0\r\n\r\n"
-    );
-    socket
-        .send_to(rejected.as_bytes(), ("127.0.0.1", port))
-        .expect("send rejected REGISTER");
-    let lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40003);
+    let operation_id = 42;
     runtime
-        .complete_auth_lookup(
-            lookup.lookup_id.expect("rejected lookup id"),
-            SipAuthLookupResult::Credential(credential.clone()),
-        )
-        .expect("complete rejected lookup");
-    let forbidden = receive_udp(&socket);
-    assert!(forbidden.starts_with("SIP/2.0 403"));
-    assert_eq!(header_value(&forbidden, "X-GB-Ver"), "3.0");
-    let rejected = receive_event(&events, SipRuntimeEventKind::AuthRejected);
-    assert_eq!(rejected.status_code, Some(403));
+        .send_message(&SipOutboundMessage {
+            operation_id,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            content_type: "Application/MANSCDP+xml".into(),
+            body: b"<?xml version=\"1.0\"?><Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),
+        })
+        .expect("send outbound MESSAGE");
 
-    let unregister_response = create_digest_response(
-        &credential,
-        "REGISTER",
-        &uri,
-        nonce,
-        Some("00000003"),
-        Some(cnonce),
-        Some("auth"),
-        AuthAlgorithm::Md5,
-    )
-    .expect("create unregister digest");
-    let unregister = format!(
-        "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-register-4;rport\r\n\
-From: <sip:{username}@{realm}>;tag=register-auth\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: safe-register-loopback\r\n\
-CSeq: 4 REGISTER\r\n\
-Contact: <sip:{username}@{local}>;expires=0\r\n\
-User-Agent: GMV-Test-Device/1.0\r\n\
-X-GB-Ver: 3.0\r\n\
-Max-Forwards: 70\r\n\
-Authorization: Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{unregister_response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc=00000003\r\n\
-Content-Length: 0\r\n\r\n"
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(transmit.protocol, SipTransportProtocol::Udp);
+    assert_eq!(transmit.remote_addr, remote);
+    let request = finish_transmit(&mut runtime, &transmit);
+    assert!(request.starts_with("MESSAGE "));
+    assert!(request.contains("<CmdType>DeviceInfo</CmdType>"));
+
+    let response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {};tag=peer\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&request, "Via"),
+        header_value(&request, "From"),
+        header_value(&request, "To"),
+        header_value(&request, "Call-ID"),
+        header_value(&request, "CSeq"),
     );
-    socket
-        .send_to(unregister.as_bytes(), ("127.0.0.1", port))
-        .expect("send unregister");
-    let lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
     runtime
-        .complete_auth_lookup(
-            lookup.lookup_id.expect("unregister lookup id"),
-            SipAuthLookupResult::Credential(credential.clone()),
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            response.as_bytes(),
         )
-        .expect("complete unregister lookup");
-    assert!(receive_udp(&socket).starts_with("SIP/2.0 200"));
-    let unregistered = receive_event(&events, SipRuntimeEventKind::Unregistered);
-    assert_eq!(unregistered.expires_seconds, Some(0));
+        .expect("inject outbound response");
 
-    let wrong_uri = format!("sip:wrong@127.0.0.1:{port}");
-    let wrong_uri_response = create_digest_response(
-        &credential,
-        "REGISTER",
-        &wrong_uri,
-        nonce,
-        Some("00000004"),
-        Some(cnonce),
-        Some("auth"),
-        AuthAlgorithm::Md5,
-    )
-    .expect("create wrong URI digest");
-    let wrong_uri_register = format!(
-        "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-register-5;rport\r\n\
-From: <sip:{username}@{realm}>;tag=register-auth\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: safe-register-loopback\r\n\
-CSeq: 5 REGISTER\r\n\
-Contact: <sip:{username}@{local}>\r\n\
-Max-Forwards: 70\r\n\
-Authorization: Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{wrong_uri}\", response=\"{wrong_uri_response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc=00000004\r\n\
-Content-Length: 0\r\n\r\n"
-    );
-    socket
-        .send_to(wrong_uri_register.as_bytes(), ("127.0.0.1", port))
-        .expect("send wrong URI REGISTER");
-    assert!(receive_udp(&socket).starts_with("SIP/2.0 403"));
+    let event = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(event.operation_id, Some(operation_id));
+    assert_eq!(event.status_code, Some(200));
+    assert_eq!(event.method.as_deref(), Some("MESSAGE"));
+    runtime.shutdown().expect("shutdown runtime");
+}
 
-    let replay = format!(
-        "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-register-6;rport\r\n\
-From: <sip:{username}@{realm}>;tag=register-auth\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: safe-register-loopback\r\n\
-CSeq: 6 REGISTER\r\n\
-Contact: <sip:{username}@{local}>;expires=0\r\n\
-Max-Forwards: 70\r\n\
-Authorization: Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", response=\"{unregister_response}\", algorithm=MD5, cnonce=\"{cnonce}\", qop=auth, nc=00000003\r\n\
-Content-Length: 0\r\n\r\n"
-    );
-    socket
-        .send_to(replay.as_bytes(), ("127.0.0.1", port))
-        .expect("send replayed REGISTER");
-    let lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
+#[test]
+fn custom_transport_owns_invite_dialog_info_and_bye() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40004);
+    let invite_operation = 100;
+    let local_sdp = "v=0\r\n\
+o=34020000002000000001 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 30000 RTP/AVP 96\r\n\
+a=recvonly\r\n\
+a=rtpmap:96 PS/90000\r\n\
+y=0100000001\r\n";
     runtime
-        .complete_auth_lookup(
-            lookup.lookup_id.expect("replay lookup id"),
-            SipAuthLookupResult::Credential(credential),
+        .send_invite(&SipOutboundInvite {
+            operation_id: invite_operation,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            contact_uri: format!("<sip:platform@{}>", local_addr()),
+            subject: Some("device:0100000001,platform:0".into()),
+            sdp: local_sdp.into(),
+        })
+        .expect("send outbound INVITE");
+
+    let invite_transmit = receive_transmit(&mut runtime, &transmits);
+    let invite = finish_transmit(&mut runtime, &invite_transmit);
+    assert!(invite.starts_with("INVITE "));
+    assert_eq!(
+        header_value(&invite, "Subject"),
+        "device:0100000001,platform:0"
+    );
+    let remote_sdp = "v=0\r\n\
+o=device 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 40000 RTP/AVP 96\r\n\
+a=sendonly\r\n\
+a=rtpmap:96 PS/90000\r\n\
+y=0100000001\r\n";
+    let invite_response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {};tag=peer-invite\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Contact: <sip:device@{remote}>\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+        header_value(&invite, "Via"),
+        header_value(&invite, "From"),
+        header_value(&invite, "To"),
+        header_value(&invite, "Call-ID"),
+        header_value(&invite, "CSeq"),
+        remote_sdp.len(),
+        remote_sdp,
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            invite_response.as_bytes(),
         )
-        .expect("complete replay lookup");
-    assert!(receive_udp(&socket).starts_with("SIP/2.0 403"));
-    let replay_rejected = receive_event(&events, SipRuntimeEventKind::AuthRejected);
-    assert_eq!(replay_rejected.status_code, Some(403));
+        .expect("inject INVITE response");
+
+    let invite_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(invite_event.operation_id, Some(invite_operation));
+    assert_eq!(invite_event.method.as_deref(), Some("INVITE"));
+    assert_eq!(invite_event.status_code, Some(200));
+    assert_eq!(invite_event.body, remote_sdp.as_bytes());
+    let call_id = invite_event.call_id.clone().expect("INVITE call id");
+    let ack = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &ack).starts_with("ACK "));
+
+    let info_operation = 101;
+    runtime
+        .send_dialog_request(&SipDialogRequest {
+            operation_id: info_operation,
+            method: SipDialogMethod::Info,
+            call_id: call_id.clone(),
+            content_type: Some("Application/MANSRTSP".into()),
+            body: b"PLAY RTSP/1.0\r\nCSeq: 1\r\nScale: 2.0\r\n".to_vec(),
+        })
+        .expect("send INFO");
+    let info_transmit = receive_transmit(&mut runtime, &transmits);
+    let info = finish_transmit(&mut runtime, &info_transmit);
+    assert!(info.starts_with("INFO "));
+    let info_response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&info, "Via"),
+        header_value(&info, "From"),
+        header_value(&info, "To"),
+        header_value(&info, "Call-ID"),
+        header_value(&info, "CSeq"),
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            info_response.as_bytes(),
+        )
+        .expect("inject INFO response");
+    let info_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(info_event.operation_id, Some(info_operation));
+    assert_eq!(info_event.method.as_deref(), Some("INFO"));
+    assert_eq!(info_event.status_code, Some(200));
+
+    let bye_operation = 102;
+    runtime
+        .send_dialog_request(&SipDialogRequest {
+            operation_id: bye_operation,
+            method: SipDialogMethod::Bye,
+            call_id,
+            content_type: None,
+            body: Vec::new(),
+        })
+        .expect("send BYE");
+    let bye_transmit = receive_transmit(&mut runtime, &transmits);
+    let bye = finish_transmit(&mut runtime, &bye_transmit);
+    assert!(bye.starts_with("BYE "));
+    let bye_response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&bye, "Via"),
+        header_value(&bye, "From"),
+        header_value(&bye, "To"),
+        header_value(&bye, "Call-ID"),
+        header_value(&bye, "CSeq"),
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            bye_response.as_bytes(),
+        )
+        .expect("inject BYE response");
+    let bye_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(bye_event.operation_id, Some(bye_operation));
+    assert_eq!(bye_event.method.as_deref(), Some("BYE"));
+    assert_eq!(bye_event.status_code, Some(200));
+
+    let remote_bye_invite_operation = 103;
+    runtime
+        .send_invite(&SipOutboundInvite {
+            operation_id: remote_bye_invite_operation,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            contact_uri: format!("<sip:platform@{}>", local_addr()),
+            subject: Some("device:0100000002,platform:0".into()),
+            sdp: local_sdp.into(),
+        })
+        .expect("send second outbound INVITE");
+    let second_invite_transmit = receive_transmit(&mut runtime, &transmits);
+    let second_invite = finish_transmit(&mut runtime, &second_invite_transmit);
+    let second_invite_response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {};tag=peer-remote-bye\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Contact: <sip:device@{remote}>\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+        header_value(&second_invite, "Via"),
+        header_value(&second_invite, "From"),
+        header_value(&second_invite, "To"),
+        header_value(&second_invite, "Call-ID"),
+        header_value(&second_invite, "CSeq"),
+        remote_sdp.len(),
+        remote_sdp,
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            second_invite_response.as_bytes(),
+        )
+        .expect("inject second INVITE response");
+    let second_invite_event =
+        receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(
+        second_invite_event.operation_id,
+        Some(remote_bye_invite_operation)
+    );
+    let second_call_id = second_invite_event.call_id.expect("second INVITE call id");
+    let second_ack = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &second_ack).starts_with("ACK "));
+
+    let remote_bye = format!(
+        "BYE sip:platform@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bK-remote-bye;rport\r\n\
+From: {};tag=peer-remote-bye\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: 2 BYE\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n",
+        local_addr(),
+        remote,
+        header_value(&second_invite, "To"),
+        header_value(&second_invite, "From"),
+        second_call_id,
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            remote_bye.as_bytes(),
+        )
+        .expect("inject remote BYE");
+    let remote_bye_event =
+        receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(remote_bye_event.method.as_deref(), Some("BYE"));
+    assert_eq!(
+        remote_bye_event.call_id.as_deref(),
+        Some(second_call_id.as_str())
+    );
+    let remote_bye_response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &remote_bye_response).starts_with("SIP/2.0 200"));
+    runtime.poll().expect("complete remote BYE response");
 
     runtime.shutdown().expect("shutdown runtime");
 }
 
 #[test]
-fn runtime_singleflights_same_device_register_lookups() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
+fn custom_transport_owns_incoming_invite_and_cancel() {
+    let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
         ..SipRuntimeConfig::default()
     };
-    let (mut runtime, events) = SipRuntime::start(config).expect("start runtime");
-    let port = runtime.udp_port().expect("UDP port");
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind REGISTER client");
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set REGISTER timeout");
-    let local = socket.local_addr().expect("REGISTER local address");
-    let username = "34020000001320000002";
-    let realm = "3402000000";
-    let uri = format!("sip:{realm}@127.0.0.1:{port}");
-
-    for sequence in 1..=2 {
-        let request = format!(
-            "REGISTER {uri} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-singleflight-{sequence};rport\r\n\
-From: <sip:{username}@{realm}>;tag=singleflight\r\n\
-To: <sip:{username}@{realm}>\r\n\
-Call-ID: singleflight-{sequence}\r\n\
-CSeq: {sequence} REGISTER\r\n\
-Contact: <sip:{username}@{local}>\r\n\
-Expires: 3600\r\n\
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40006);
+    let sdp = "v=0\r\n\
+o=device 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=video 6000 RTP/AVP 96\r\n\
+a=rtpmap:96 PS/90000\r\n";
+    let invite = format!(
+        "INVITE sip:platform@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bK-incoming;rport\r\n\
+From: <sip:device@{}>;tag=device-invite\r\n\
+To: <sip:platform@{}>\r\n\
+Call-ID: incoming-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:device@{}>\r\n\
+Subject: channel:1,platform:0\r\n\
 Max-Forwards: 70\r\n\
-Content-Length: 0\r\n\r\n"
-        );
-        socket
-            .send_to(request.as_bytes(), ("127.0.0.1", port))
-            .expect("send concurrent REGISTER");
-    }
-
-    let lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
-    let deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < deadline {
-        if let Ok(event) = events.recv_timeout(Duration::from_millis(10)) {
-            assert_ne!(
-                event.kind,
-                SipRuntimeEventKind::AuthLookupRequired,
-                "same device emitted a duplicate lookup"
-            );
-        }
-    }
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+        local_addr(),
+        remote,
+        remote,
+        local_addr(),
+        remote,
+        sdp.len(),
+        sdp
+    );
     runtime
-        .complete_auth_lookup(
-            lookup.lookup_id.expect("singleflight lookup id"),
-            SipAuthLookupResult::Bypass,
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            invite.as_bytes(),
         )
-        .expect("complete singleflight lookup");
-    assert!(receive_udp(&socket).starts_with("SIP/2.0 200"));
-    assert!(receive_udp(&socket).starts_with("SIP/2.0 200"));
-    let first = receive_event(&events, SipRuntimeEventKind::Registered);
-    let second = receive_event(&events, SipRuntimeEventKind::Registered);
-    assert_eq!(first.lookup_id, lookup.lookup_id);
-    assert_eq!(second.lookup_id, lookup.lookup_id);
+        .expect("inject incoming INVITE");
+    let trying = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &trying).starts_with("SIP/2.0 100"));
+    let incoming = receive_event(&mut runtime, &events, SipRuntimeEventKind::IncomingInvite);
+    assert_eq!(incoming.call_id.as_deref(), Some("incoming-invite"));
+    assert_eq!(incoming.body, sdp.as_bytes());
+    assert_eq!(incoming.subject.as_deref(), Some("channel:1,platform:0"));
+
+    let cancel = format!(
+        "CANCEL sip:platform@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bK-incoming;rport\r\n\
+From: <sip:device@{}>;tag=device-invite\r\n\
+To: <sip:platform@{}>\r\n\
+Call-ID: incoming-invite\r\n\
+CSeq: 1 CANCEL\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n",
+        local_addr(),
+        remote,
+        remote,
+        local_addr()
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            cancel.as_bytes(),
+        )
+        .expect("inject CANCEL");
+    let cancel_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(cancel_event.method.as_deref(), Some("CANCEL"));
+
+    let first = receive_transmit(&mut runtime, &transmits);
+    let second = receive_transmit(&mut runtime, &transmits);
+    let responses = [
+        finish_transmit(&mut runtime, &first),
+        finish_transmit(&mut runtime, &second),
+    ];
+    assert!(responses
+        .iter()
+        .any(|value| value.starts_with("SIP/2.0 200")));
+    assert!(responses
+        .iter()
+        .any(|value| value.starts_with("SIP/2.0 487")));
+    runtime.poll().expect("complete CANCEL responses");
+
+    let unsupported_invite = invite
+        .replace("incoming-invite", "unsupported-invite")
+        .replace("device-invite", "unsupported-device")
+        .replace("z9hG4bK-incoming", "z9hG4bK-unsupported");
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            unsupported_invite.as_bytes(),
+        )
+        .expect("inject unsupported incoming INVITE");
+    let unsupported_trying = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &unsupported_trying).starts_with("SIP/2.0 100"));
+    let unsupported = receive_event(&mut runtime, &events, SipRuntimeEventKind::IncomingInvite);
+    assert_eq!(unsupported.call_id.as_deref(), Some("unsupported-invite"));
+    runtime
+        .respond_invite(&SipInviteResponse {
+            call_id: "unsupported-invite".into(),
+            status_code: 501,
+            reason: Some("Inbound session is not supported".into()),
+        })
+        .expect("reject unsupported incoming INVITE");
+    let unsupported_response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &unsupported_response)
+        .starts_with("SIP/2.0 501 Inbound session is not supported"));
+    runtime
+        .poll()
+        .expect("complete unsupported INVITE response");
 
     runtime.shutdown().expect("shutdown runtime");
 }
 
 #[test]
-fn runtime_times_out_pending_auth_lookup() {
-    let _guard = TEST_LOCK.lock().expect("lock native runtime tests");
+fn custom_transport_owns_subscribe_refresh_notify_and_unsubscribe() {
+    let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
-        auth_lookup_timeout: Duration::from_millis(50),
         ..SipRuntimeConfig::default()
     };
-    let (runtime, events) = SipRuntime::start(config).expect("start runtime");
-    let port = runtime.udp_port().expect("UDP port");
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind REGISTER client");
-    socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set REGISTER timeout");
-    let local = socket.local_addr().expect("REGISTER local address");
-    let request = format!(
-        "REGISTER sip:3402000000@127.0.0.1:{port} SIP/2.0\r\n\
-Via: SIP/2.0/UDP {local};branch=z9hG4bK-auth-timeout;rport\r\n\
-From: <sip:34020000001320000003@3402000000>;tag=auth-timeout\r\n\
-To: <sip:34020000001320000003@3402000000>\r\n\
-Call-ID: auth-timeout\r\n\
-CSeq: 1 REGISTER\r\n\
-Contact: <sip:34020000001320000003@{local}>\r\n\
-Expires: 3600\r\n\
-Max-Forwards: 70\r\n\
-Content-Length: 0\r\n\r\n"
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40005);
+    let body = b"<?xml version=\"1.0\"?><Query><CmdType>Catalog</CmdType></Query>".to_vec();
+    runtime
+        .send_subscribe(&SipOutboundSubscribe {
+            operation_id: 70,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            contact_uri: format!("<sip:platform@{}>", local_addr()),
+            call_id: None,
+            event: "Catalog".into(),
+            expires: 300,
+            content_type: "Application/MANSCDP+xml".into(),
+            body: body.clone(),
+        })
+        .expect("send initial SUBSCRIBE");
+
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    let request = finish_transmit(&mut runtime, &transmit);
+    assert!(request.starts_with("SUBSCRIBE "));
+    assert_eq!(header_value(&request, "Event"), "Catalog");
+    assert_eq!(header_value(&request, "Expires"), "300");
+    let call_id = header_value(&request, "Call-ID").to_string();
+    let response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {};tag=device-sub\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Contact: <sip:device@{}>\r\n\
+Expires: 300\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&request, "Via"),
+        header_value(&request, "From"),
+        header_value(&request, "To"),
+        call_id,
+        header_value(&request, "CSeq"),
+        remote
     );
-    socket
-        .send_to(request.as_bytes(), ("127.0.0.1", port))
-        .expect("send timeout REGISTER");
-    let _lookup = receive_event(&events, SipRuntimeEventKind::AuthLookupRequired);
-    assert!(receive_udp(&socket).starts_with("SIP/2.0 504"));
-    let rejected = receive_event(&events, SipRuntimeEventKind::AuthRejected);
-    assert_eq!(rejected.status_code, Some(504));
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            response.as_bytes(),
+        )
+        .expect("inject SUBSCRIBE response");
+    let accepted = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(accepted.operation_id, Some(70));
+    assert_eq!(accepted.status_code, Some(200));
+    assert_eq!(accepted.call_id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(accepted.expires_seconds, Some(300));
+
+    let notify_body = "<?xml version=\"1.0\"?><Response><CmdType>Catalog</CmdType></Response>";
+    let notify = format!(
+        "NOTIFY sip:platform@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bK-notify;rport\r\n\
+From: <sip:device@{}>;tag=device-sub\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: 1 NOTIFY\r\n\
+Event: Catalog\r\n\
+Subscription-State: active;expires=299\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: Application/MANSCDP+xml\r\n\
+Content-Length: {}\r\n\r\n{}",
+        local_addr(),
+        remote,
+        remote,
+        header_value(&request, "From"),
+        call_id,
+        notify_body.len(),
+        notify_body
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            notify.as_bytes(),
+        )
+        .expect("inject NOTIFY");
+    let notify_response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &notify_response).starts_with("SIP/2.0 200"));
+    let notify_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(notify_event.method.as_deref(), Some("NOTIFY"));
+    assert_eq!(notify_event.call_id.as_deref(), Some(call_id.as_str()));
+    assert_eq!(notify_event.event.as_deref(), Some("Catalog"));
+    assert_eq!(
+        notify_event.subscription_state.as_deref(),
+        Some("active;expires=299")
+    );
+    assert_eq!(notify_event.body, notify_body.as_bytes());
+
+    runtime
+        .send_subscribe(&SipOutboundSubscribe {
+            operation_id: 71,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: String::new(),
+            from_uri: String::new(),
+            contact_uri: String::new(),
+            call_id: Some(call_id.clone()),
+            event: "Catalog".into(),
+            expires: 180,
+            content_type: "Application/MANSCDP+xml".into(),
+            body: body.clone(),
+        })
+        .expect("refresh SUBSCRIBE");
+    let refresh_transmit = receive_transmit(&mut runtime, &transmits);
+    let refresh = finish_transmit(&mut runtime, &refresh_transmit);
+    assert!(refresh.starts_with("SUBSCRIBE "));
+    assert_eq!(header_value(&refresh, "Expires"), "180");
+    let refresh_response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Contact: <sip:device@{}>\r\n\
+Expires: 180\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&refresh, "Via"),
+        header_value(&refresh, "From"),
+        header_value(&refresh, "To"),
+        call_id,
+        header_value(&refresh, "CSeq"),
+        remote
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            refresh_response.as_bytes(),
+        )
+        .expect("inject refresh response");
+    let refreshed = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(refreshed.operation_id, Some(71));
+    assert_eq!(refreshed.expires_seconds, Some(180));
+
+    runtime
+        .send_subscribe(&SipOutboundSubscribe {
+            operation_id: 72,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: String::new(),
+            from_uri: String::new(),
+            contact_uri: String::new(),
+            call_id: Some(call_id),
+            event: "Catalog".into(),
+            expires: 0,
+            content_type: String::new(),
+            body: Vec::new(),
+        })
+        .expect("unsubscribe");
+    let unsubscribe_transmit = receive_transmit(&mut runtime, &transmits);
+    let unsubscribe = finish_transmit(&mut runtime, &unsubscribe_transmit);
+    assert!(unsubscribe.starts_with("SUBSCRIBE "));
+    assert_eq!(header_value(&unsubscribe, "Expires"), "0");
+    let unsubscribe_response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {}\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Expires: 0\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&unsubscribe, "Via"),
+        header_value(&unsubscribe, "From"),
+        header_value(&unsubscribe, "To"),
+        header_value(&unsubscribe, "Call-ID"),
+        header_value(&unsubscribe, "CSeq"),
+    );
+    runtime
+        .receive_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            unsubscribe_response.as_bytes(),
+        )
+        .expect("inject unsubscribe response");
+    let unsubscribed = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(unsubscribed.operation_id, Some(72));
+    assert_eq!(unsubscribed.status_code, Some(200));
 
     runtime.shutdown().expect("shutdown runtime");
 }

@@ -5,7 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::slice;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
@@ -16,20 +16,28 @@ use gmv_pjsip_sys::{
     gmv_sip_auth_lookup_result_GMV_SIP_AUTH_BYPASS as AUTH_BYPASS,
     gmv_sip_auth_lookup_result_GMV_SIP_AUTH_CREDENTIAL as AUTH_CREDENTIAL,
     gmv_sip_auth_lookup_result_GMV_SIP_AUTH_NOT_FOUND as AUTH_NOT_FOUND,
-    gmv_sip_auth_lookup_result_GMV_SIP_AUTH_REJECT as AUTH_REJECT, gmv_sip_error_message,
-    gmv_sip_event_t,
+    gmv_sip_auth_lookup_result_GMV_SIP_AUTH_REJECT as AUTH_REJECT,
+    gmv_sip_dialog_method_GMV_SIP_DIALOG_BYE as DIALOG_BYE,
+    gmv_sip_dialog_method_GMV_SIP_DIALOG_INFO as DIALOG_INFO, gmv_sip_dialog_request_t,
+    gmv_sip_error_message, gmv_sip_event_t,
     gmv_sip_event_type_GMV_SIP_EVENT_AUTH_LOOKUP_REQUIRED as EVENT_AUTH_LOOKUP_REQUIRED,
     gmv_sip_event_type_GMV_SIP_EVENT_AUTH_REJECTED as EVENT_AUTH_REJECTED,
+    gmv_sip_event_type_GMV_SIP_EVENT_INCOMING_INVITE as EVENT_INCOMING_INVITE,
     gmv_sip_event_type_GMV_SIP_EVENT_OUTBOUND_RESPONSE as EVENT_OUTBOUND_RESPONSE,
     gmv_sip_event_type_GMV_SIP_EVENT_REGISTERED as EVENT_REGISTERED,
     gmv_sip_event_type_GMV_SIP_EVENT_REQUEST_RECEIVED as EVENT_REQUEST_RECEIVED,
     gmv_sip_event_type_GMV_SIP_EVENT_RESPONSE_SENT as EVENT_RESPONSE_SENT,
     gmv_sip_event_type_GMV_SIP_EVENT_RUNTIME_FAULT as EVENT_RUNTIME_FAULT,
-    gmv_sip_event_type_GMV_SIP_EVENT_UNREGISTERED as EVENT_UNREGISTERED,
-    gmv_sip_outbound_message_t, gmv_sip_runtime_complete_auth_lookup, gmv_sip_runtime_config_init,
-    gmv_sip_runtime_config_t, gmv_sip_runtime_create, gmv_sip_runtime_destroy,
-    gmv_sip_runtime_send_message, gmv_sip_runtime_start, gmv_sip_runtime_stop, gmv_sip_runtime_t,
-    gmv_sip_runtime_tcp_port, gmv_sip_runtime_udp_port, gmv_sip_string_view_t,
+    gmv_sip_event_type_GMV_SIP_EVENT_UNREGISTERED as EVENT_UNREGISTERED, gmv_sip_invite_response_t,
+    gmv_sip_outbound_invite_t, gmv_sip_outbound_message_t, gmv_sip_outbound_subscribe_t,
+    gmv_sip_received_packet_t, gmv_sip_runtime_close_transport,
+    gmv_sip_runtime_complete_auth_lookup, gmv_sip_runtime_complete_send,
+    gmv_sip_runtime_config_init, gmv_sip_runtime_config_t, gmv_sip_runtime_create,
+    gmv_sip_runtime_destroy, gmv_sip_runtime_poll, gmv_sip_runtime_receive_packet,
+    gmv_sip_runtime_respond_invite, gmv_sip_runtime_send_dialog_request,
+    gmv_sip_runtime_send_invite, gmv_sip_runtime_send_message, gmv_sip_runtime_send_subscribe,
+    gmv_sip_runtime_start, gmv_sip_runtime_stop, gmv_sip_runtime_t, gmv_sip_send_completion_t,
+    gmv_sip_send_packet_t, gmv_sip_string_view_t,
     gmv_sip_transport_GMV_SIP_TRANSPORT_TCP as TRANSPORT_TCP,
     gmv_sip_transport_GMV_SIP_TRANSPORT_UDP as TRANSPORT_UDP, GMV_SIP_ABI_VERSION,
 };
@@ -39,6 +47,7 @@ use crate::error::{Result, SipError};
 use crate::transport::SipTransportProtocol;
 
 static RUNTIME_LOCK: Mutex<()> = Mutex::new(());
+const DEFAULT_IO_QUEUE_CAPACITY: usize = 32_768;
 
 #[derive(Clone, Debug)]
 pub struct SipRuntimeConfig {
@@ -52,6 +61,7 @@ pub struct SipRuntimeConfig {
     pub auth_algorithm: AuthAlgorithm,
     pub max_pending_auth: u32,
     pub auth_lookup_timeout: Duration,
+    pub io_queue_capacity: usize,
 }
 
 impl Default for SipRuntimeConfig {
@@ -67,6 +77,7 @@ impl Default for SipRuntimeConfig {
             auth_algorithm: AuthAlgorithm::Md5,
             max_pending_auth: 20_000,
             auth_lookup_timeout: Duration::from_secs(3),
+            io_queue_capacity: DEFAULT_IO_QUEUE_CAPACITY,
         }
     }
 }
@@ -93,6 +104,11 @@ impl SipRuntimeConfig {
                 "max_pending_auth must be greater than zero".into(),
             ));
         }
+        if self.io_queue_capacity == 0 {
+            return Err(SipError::InvalidConfig(
+                "io_queue_capacity must be greater than zero".into(),
+            ));
+        }
 
         Ok((
             duration_millis("poll_timeout", self.poll_timeout)?,
@@ -111,6 +127,7 @@ pub enum SipRuntimeEventKind {
     Unregistered,
     AuthRejected,
     OutboundResponse,
+    IncomingInvite,
     Unknown(i32),
 }
 
@@ -136,9 +153,27 @@ pub struct SipRuntimeEvent {
     pub user_agent: Option<String>,
     pub gb_version: Option<String>,
     pub operation_id: Option<u64>,
+    pub association_id: Option<u64>,
+    pub from_header: Option<String>,
+    pub to_header: Option<String>,
+    pub subject: Option<String>,
+    pub event: Option<String>,
+    pub subscription_state: Option<String>,
 }
 
 pub type SipRuntimeEvents = Receiver<SipRuntimeEvent>;
+pub type SipRuntimeTransmits = Receiver<SipTransmit>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SipTransmit {
+    pub send_id: u64,
+    pub transport_id: u64,
+    pub association_id: u64,
+    pub protocol: SipTransportProtocol,
+    pub data: Vec<u8>,
+    pub local_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
+}
 
 #[derive(Clone, Debug)]
 pub enum SipAuthLookupResult {
@@ -151,20 +186,77 @@ pub enum SipAuthLookupResult {
 #[derive(Clone, Debug)]
 pub struct SipOutboundMessage {
     pub operation_id: u64,
+    pub association_id: u64,
+    pub protocol: SipTransportProtocol,
     pub target_uri: String,
     pub from_uri: String,
     pub content_type: String,
     pub body: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SipOutboundInvite {
+    pub operation_id: u64,
+    pub association_id: u64,
+    pub protocol: SipTransportProtocol,
+    pub target_uri: String,
+    pub from_uri: String,
+    pub contact_uri: String,
+    pub subject: Option<String>,
+    pub sdp: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct SipOutboundSubscribe {
+    pub operation_id: u64,
+    pub association_id: u64,
+    pub protocol: SipTransportProtocol,
+    pub target_uri: String,
+    pub from_uri: String,
+    pub contact_uri: String,
+    pub call_id: Option<String>,
+    pub event: String,
+    pub expires: u32,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SipDialogMethod {
+    Bye,
+    Info,
+}
+
+#[derive(Clone, Debug)]
+pub struct SipDialogRequest {
+    pub operation_id: u64,
+    pub method: SipDialogMethod,
+    pub call_id: String,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SipInviteResponse {
+    pub call_id: String,
+    pub status_code: u16,
+    pub reason: Option<String>,
+}
+
 struct EventState {
     sender: Sender<SipRuntimeEvent>,
+}
+
+struct TransmitState {
+    sender: SyncSender<SipTransmit>,
 }
 
 pub struct SipRuntime {
     raw: NonNull<gmv_sip_runtime_t>,
     stopped: bool,
     _event_state: Box<EventState>,
+    _transmit_state: Box<TransmitState>,
+    transmits: Option<SipRuntimeTransmits>,
     _runtime_guard: MutexGuard<'static, ()>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
@@ -182,6 +274,10 @@ impl SipRuntime {
         let auth_realm = config.auth_realm.as_bytes();
         let (sender, events) = mpsc::channel();
         let mut event_state = Box::new(EventState { sender });
+        let (transmit_sender, transmits) = mpsc::sync_channel(config.io_queue_capacity);
+        let mut transmit_state = Box::new(TransmitState {
+            sender: transmit_sender,
+        });
 
         let mut ffi_config = MaybeUninit::<gmv_sip_runtime_config_t>::uninit();
         // SAFETY: The C initializer writes the complete config structure.
@@ -206,6 +302,8 @@ impl SipRuntime {
         ffi_config.auth_algorithm_type = auth_algorithm_id(config.auth_algorithm);
         ffi_config.max_pending_auth = config.max_pending_auth;
         ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
+        ffi_config.send_callback = Some(runtime_send_callback);
+        ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
 
         let mut raw = ptr::null_mut();
         // SAFETY: The config, callback state, and output pointer remain valid
@@ -232,6 +330,8 @@ impl SipRuntime {
                 raw,
                 stopped: false,
                 _event_state: event_state,
+                _transmit_state: transmit_state,
+                transmits: Some(transmits),
                 _runtime_guard: runtime_guard,
                 _not_send_or_sync: PhantomData,
             },
@@ -239,22 +339,10 @@ impl SipRuntime {
         ))
     }
 
-    pub fn udp_port(&self) -> Option<u16> {
-        if self.stopped {
-            return None;
-        }
-        // SAFETY: The runtime handle is valid while `self` is alive.
-        let port = unsafe { gmv_sip_runtime_udp_port(self.raw.as_ptr()) };
-        (port != 0).then_some(port)
-    }
-
-    pub fn tcp_port(&self) -> Option<u16> {
-        if self.stopped {
-            return None;
-        }
-        // SAFETY: The runtime handle is valid while `self` is alive.
-        let port = unsafe { gmv_sip_runtime_tcp_port(self.raw.as_ptr()) };
-        (port != 0).then_some(port)
+    pub fn take_transmits(&mut self) -> Result<SipRuntimeTransmits> {
+        self.transmits.take().ok_or_else(|| {
+            SipError::InvalidConfig("runtime transmit receiver was already taken".into())
+        })
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -268,6 +356,21 @@ impl SipRuntime {
             return Err(pjsip_error("runtime_stop", status));
         }
         self.stopped = true;
+        Ok(())
+    }
+
+    pub fn poll(&mut self) -> Result<()> {
+        if self.stopped {
+            return Err(SipError::InvalidConfig(
+                "cannot poll after runtime stop".into(),
+            ));
+        }
+        // SAFETY: The runtime handle is valid and this non-Send wrapper keeps
+        // all PJSIP calls on the thread that created the runtime.
+        let status = unsafe { gmv_sip_runtime_poll(self.raw.as_ptr()) };
+        if status != 0 {
+            return Err(pjsip_error("runtime_poll", status));
+        }
         Ok(())
     }
 
@@ -333,6 +436,113 @@ impl SipRuntime {
         Ok(())
     }
 
+    pub fn receive_packet(
+        &mut self,
+        association_id: u64,
+        protocol: SipTransportProtocol,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        data: &[u8],
+    ) -> Result<()> {
+        if self.stopped {
+            return Err(SipError::InvalidConfig(
+                "cannot receive packet after runtime stop".into(),
+            ));
+        }
+        if data.is_empty() {
+            return Err(SipError::InvalidConfig(
+                "received SIP packet must not be empty".into(),
+            ));
+        }
+        if protocol == SipTransportProtocol::Tls || !local_addr.is_ipv4() || !remote_addr.is_ipv4()
+        {
+            return Err(SipError::InvalidConfig(
+                "custom transport prototype supports IPv4 UDP/TCP only".into(),
+            ));
+        }
+        if protocol == SipTransportProtocol::Tcp && association_id == 0 {
+            return Err(SipError::InvalidConfig(
+                "TCP association_id must be non-zero".into(),
+            ));
+        }
+
+        let local_ip = local_addr.ip().to_string();
+        let remote_ip = remote_addr.ip().to_string();
+        let packet = gmv_sip_received_packet_t {
+            size: mem::size_of::<gmv_sip_received_packet_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            association_id,
+            transport: transport_id(protocol),
+            data: bytes_view(data),
+            local_address: string_view(&local_ip),
+            local_port: local_addr.port(),
+            remote_address: string_view(&remote_ip),
+            remote_port: remote_addr.port(),
+        };
+        // SAFETY: The runtime is valid and the shim copies every borrowed view
+        // before this synchronous call returns.
+        let status = unsafe { gmv_sip_runtime_receive_packet(self.raw.as_ptr(), &packet) };
+        if status != 0 {
+            return Err(pjsip_error("receive_packet", status));
+        }
+        Ok(())
+    }
+
+    pub fn complete_send(
+        &mut self,
+        send_id: u64,
+        result: std::result::Result<usize, i32>,
+    ) -> Result<()> {
+        if self.stopped || send_id == 0 {
+            return Err(SipError::InvalidConfig(
+                "cannot complete an invalid or stopped send".into(),
+            ));
+        }
+        let sent_bytes = match result {
+            Ok(bytes) => i64::try_from(bytes)
+                .map_err(|_| SipError::InvalidConfig("sent byte count exceeds i64".into()))?,
+            Err(status) => -i64::from(status.abs().max(1)),
+        };
+        let completion = gmv_sip_send_completion_t {
+            size: mem::size_of::<gmv_sip_send_completion_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            send_id,
+            sent_bytes,
+        };
+        // SAFETY: The runtime is valid and the shim copies the completion.
+        let status = unsafe { gmv_sip_runtime_complete_send(self.raw.as_ptr(), &completion) };
+        if status != 0 {
+            return Err(pjsip_error("complete_send", status));
+        }
+        Ok(())
+    }
+
+    pub fn close_transport(
+        &mut self,
+        association_id: u64,
+        protocol: SipTransportProtocol,
+        status: i32,
+    ) -> Result<()> {
+        if self.stopped || association_id == 0 || protocol != SipTransportProtocol::Tcp {
+            return Err(SipError::InvalidConfig(
+                "only an active TCP association can be closed".into(),
+            ));
+        }
+        // SAFETY: The runtime is valid and the shim copies scalar command data.
+        let result = unsafe {
+            gmv_sip_runtime_close_transport(
+                self.raw.as_ptr(),
+                association_id,
+                transport_id(protocol),
+                status,
+            )
+        };
+        if result != 0 {
+            return Err(pjsip_error("close_transport", result));
+        }
+        Ok(())
+    }
+
     pub fn send_message(&mut self, message: &SipOutboundMessage) -> Result<()> {
         if self.stopped {
             return Err(SipError::InvalidConfig(
@@ -342,6 +552,13 @@ impl SipRuntime {
         if message.operation_id == 0 {
             return Err(SipError::InvalidConfig(
                 "operation_id must be non-zero".into(),
+            ));
+        }
+        if message.protocol == SipTransportProtocol::Tls
+            || (message.protocol == SipTransportProtocol::Tcp && message.association_id == 0)
+        {
+            return Err(SipError::InvalidConfig(
+                "outbound MESSAGE requires a valid UDP/TCP association".into(),
             ));
         }
         if message.target_uri.is_empty()
@@ -360,6 +577,8 @@ impl SipRuntime {
             size: mem::size_of::<gmv_sip_outbound_message_t>() as u32,
             version: GMV_SIP_ABI_VERSION,
             operation_id: message.operation_id,
+            association_id: message.association_id,
+            transport: transport_id(message.protocol),
             target_uri: string_view(&message.target_uri),
             from_uri: string_view(&message.from_uri),
             content_type: string_view(&message.content_type),
@@ -370,6 +589,249 @@ impl SipRuntime {
         let status = unsafe { gmv_sip_runtime_send_message(self.raw.as_ptr(), &request) };
         if status != 0 {
             return Err(pjsip_error("send_message", status));
+        }
+        Ok(())
+    }
+
+    pub fn send_invite(&mut self, invite: &SipOutboundInvite) -> Result<()> {
+        if self.stopped {
+            return Err(SipError::InvalidConfig(
+                "cannot send INVITE after runtime stop".into(),
+            ));
+        }
+        if invite.operation_id == 0 {
+            return Err(SipError::InvalidConfig(
+                "operation_id must be non-zero".into(),
+            ));
+        }
+        if invite.protocol == SipTransportProtocol::Tls
+            || (invite.protocol == SipTransportProtocol::Tcp && invite.association_id == 0)
+        {
+            return Err(SipError::InvalidConfig(
+                "outbound INVITE requires a valid UDP/TCP association".into(),
+            ));
+        }
+        if invite.target_uri.is_empty()
+            || invite.from_uri.is_empty()
+            || invite.contact_uri.is_empty()
+            || invite.sdp.is_empty()
+            || invite.target_uri.as_bytes().contains(&0)
+            || invite.from_uri.as_bytes().contains(&0)
+            || invite.contact_uri.as_bytes().contains(&0)
+            || invite.sdp.as_bytes().contains(&0)
+            || invite
+                .subject
+                .as_deref()
+                .is_some_and(|subject| subject.as_bytes().contains(&0))
+        {
+            return Err(SipError::InvalidConfig(
+                "target_uri, from_uri, contact_uri, and SDP are required".into(),
+            ));
+        }
+
+        let request = gmv_sip_outbound_invite_t {
+            size: mem::size_of::<gmv_sip_outbound_invite_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            operation_id: invite.operation_id,
+            association_id: invite.association_id,
+            transport: transport_id(invite.protocol),
+            target_uri: string_view(&invite.target_uri),
+            from_uri: string_view(&invite.from_uri),
+            contact_uri: string_view(&invite.contact_uri),
+            subject: invite
+                .subject
+                .as_deref()
+                .map(string_view)
+                .unwrap_or_else(empty_view),
+            sdp: string_view(&invite.sdp),
+        };
+        // SAFETY: The runtime handle is valid and the shim copies all views
+        // before this synchronous call returns.
+        let status = unsafe { gmv_sip_runtime_send_invite(self.raw.as_ptr(), &request) };
+        if status != 0 {
+            return Err(pjsip_error("send_invite", status));
+        }
+        Ok(())
+    }
+
+    pub fn send_dialog_request(&mut self, request: &SipDialogRequest) -> Result<()> {
+        if self.stopped {
+            return Err(SipError::InvalidConfig(
+                "cannot send dialog request after runtime stop".into(),
+            ));
+        }
+        if request.operation_id == 0 || request.call_id.is_empty() {
+            return Err(SipError::InvalidConfig(
+                "operation_id and call_id are required".into(),
+            ));
+        }
+        if request.call_id.as_bytes().contains(&0)
+            || request
+                .content_type
+                .as_deref()
+                .is_some_and(|value| value.as_bytes().contains(&0))
+        {
+            return Err(SipError::InvalidConfig(
+                "dialog request strings must contain no NUL byte".into(),
+            ));
+        }
+        if request.method == SipDialogMethod::Info
+            && (request.body.is_empty()
+                || !request
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|value| value.contains('/')))
+        {
+            return Err(SipError::InvalidConfig(
+                "INFO requires content_type and body".into(),
+            ));
+        }
+
+        let ffi_request = gmv_sip_dialog_request_t {
+            size: mem::size_of::<gmv_sip_dialog_request_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            operation_id: request.operation_id,
+            method: match request.method {
+                SipDialogMethod::Bye => DIALOG_BYE as i32,
+                SipDialogMethod::Info => DIALOG_INFO as i32,
+            },
+            call_id: string_view(&request.call_id),
+            content_type: request
+                .content_type
+                .as_deref()
+                .map(string_view)
+                .unwrap_or_else(empty_view),
+            body: bytes_view(&request.body),
+        };
+        // SAFETY: The runtime handle is valid and the shim copies all views
+        // before this synchronous call returns.
+        let status =
+            unsafe { gmv_sip_runtime_send_dialog_request(self.raw.as_ptr(), &ffi_request) };
+        if status != 0 {
+            return Err(pjsip_error("send_dialog_request", status));
+        }
+        Ok(())
+    }
+
+    pub fn respond_invite(&mut self, response: &SipInviteResponse) -> Result<()> {
+        if self.stopped {
+            return Err(SipError::InvalidConfig(
+                "cannot respond to INVITE after runtime stop".into(),
+            ));
+        }
+        if response.call_id.is_empty() || !(300..=699).contains(&response.status_code) {
+            return Err(SipError::InvalidConfig(
+                "INVITE rejection requires call_id and status 300..699".into(),
+            ));
+        }
+        if response.call_id.as_bytes().contains(&0)
+            || response
+                .reason
+                .as_deref()
+                .is_some_and(|value| value.as_bytes().contains(&0))
+        {
+            return Err(SipError::InvalidConfig(
+                "INVITE response strings must contain no NUL byte".into(),
+            ));
+        }
+
+        let ffi_response = gmv_sip_invite_response_t {
+            size: mem::size_of::<gmv_sip_invite_response_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            status_code: response.status_code,
+            call_id: string_view(&response.call_id),
+            reason: response
+                .reason
+                .as_deref()
+                .map(string_view)
+                .unwrap_or_else(empty_view),
+        };
+        // SAFETY: The runtime handle is valid and the shim copies all views
+        // before this synchronous call returns.
+        let status = unsafe { gmv_sip_runtime_respond_invite(self.raw.as_ptr(), &ffi_response) };
+        if status != 0 {
+            return Err(pjsip_error("respond_invite", status));
+        }
+        Ok(())
+    }
+
+    pub fn send_subscribe(&mut self, subscribe: &SipOutboundSubscribe) -> Result<()> {
+        if self.stopped {
+            return Err(SipError::InvalidConfig(
+                "cannot send SUBSCRIBE after runtime stop".into(),
+            ));
+        }
+        if subscribe.operation_id == 0 || subscribe.event.is_empty() {
+            return Err(SipError::InvalidConfig(
+                "operation_id and event are required".into(),
+            ));
+        }
+        if subscribe.protocol == SipTransportProtocol::Tls
+            || (subscribe.protocol == SipTransportProtocol::Tcp && subscribe.association_id == 0)
+        {
+            return Err(SipError::InvalidConfig(
+                "outbound SUBSCRIBE requires a valid UDP/TCP association".into(),
+            ));
+        }
+        let initial = subscribe.call_id.is_none();
+        if initial
+            && (subscribe.target_uri.is_empty()
+                || subscribe.from_uri.is_empty()
+                || subscribe.contact_uri.is_empty()
+                || subscribe.expires == 0)
+        {
+            return Err(SipError::InvalidConfig(
+                "initial SUBSCRIBE requires target_uri, from_uri, contact_uri, and expires".into(),
+            ));
+        }
+        if !subscribe.body.is_empty() && !subscribe.content_type.contains('/') {
+            return Err(SipError::InvalidConfig(
+                "SUBSCRIBE body requires content_type".into(),
+            ));
+        }
+        let contains_nul = [
+            subscribe.target_uri.as_str(),
+            subscribe.from_uri.as_str(),
+            subscribe.contact_uri.as_str(),
+            subscribe.event.as_str(),
+            subscribe.content_type.as_str(),
+        ]
+        .into_iter()
+        .any(|value| value.as_bytes().contains(&0))
+            || subscribe
+                .call_id
+                .as_deref()
+                .is_some_and(|value| value.is_empty() || value.as_bytes().contains(&0));
+        if contains_nul {
+            return Err(SipError::InvalidConfig(
+                "SUBSCRIBE strings must contain no NUL byte".into(),
+            ));
+        }
+
+        let request = gmv_sip_outbound_subscribe_t {
+            size: mem::size_of::<gmv_sip_outbound_subscribe_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            operation_id: subscribe.operation_id,
+            association_id: subscribe.association_id,
+            transport: transport_id(subscribe.protocol),
+            target_uri: string_view(&subscribe.target_uri),
+            from_uri: string_view(&subscribe.from_uri),
+            contact_uri: string_view(&subscribe.contact_uri),
+            call_id: subscribe
+                .call_id
+                .as_deref()
+                .map(string_view)
+                .unwrap_or_else(empty_view),
+            event: string_view(&subscribe.event),
+            expires: subscribe.expires,
+            content_type: string_view(&subscribe.content_type),
+            body: bytes_view(&subscribe.body),
+        };
+        // SAFETY: The runtime handle is valid and the shim copies all views
+        // before this synchronous call returns.
+        let status = unsafe { gmv_sip_runtime_send_subscribe(self.raw.as_ptr(), &request) };
+        if status != 0 {
+            return Err(pjsip_error("send_subscribe", status));
         }
         Ok(())
     }
@@ -408,6 +870,46 @@ unsafe extern "C" fn runtime_event_callback(event: *const gmv_sip_event_t, user_
     let _ = state.sender.send(copy_event(event));
 }
 
+unsafe extern "C" fn runtime_send_callback(
+    packet: *const gmv_sip_send_packet_t,
+    user_data: *mut c_void,
+) -> i32 {
+    if packet.is_null() || user_data.is_null() {
+        return -1;
+    }
+    // SAFETY: The shim provides a valid packet for this callback invocation.
+    let packet = unsafe { &*packet };
+    if packet.version != GMV_SIP_ABI_VERSION
+        || (packet.size as usize) < mem::size_of::<gmv_sip_send_packet_t>()
+    {
+        return -1;
+    }
+    // SAFETY: SipRuntime keeps TransmitState alive until after runtime stop.
+    let state = unsafe { &*(user_data.cast::<TransmitState>()) };
+    let Some(protocol) = copy_transport(packet.transport) else {
+        return -1;
+    };
+    let Some(local_addr) = copy_socket_addr(packet.local_address, packet.local_port) else {
+        return -1;
+    };
+    let Some(remote_addr) = copy_socket_addr(packet.remote_address, packet.remote_port) else {
+        return -1;
+    };
+    let transmit = SipTransmit {
+        send_id: packet.send_id,
+        transport_id: packet.transport_id,
+        association_id: packet.association_id,
+        protocol,
+        data: copy_bytes_view(packet.data),
+        local_addr,
+        remote_addr,
+    };
+    match state.sender.try_send(transmit) {
+        Ok(()) => 0,
+        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => -1,
+    }
+}
+
 fn copy_event(event: &gmv_sip_event_t) -> SipRuntimeEvent {
     SipRuntimeEvent {
         event_id: event.event_id,
@@ -424,6 +926,7 @@ fn copy_event(event: &gmv_sip_event_t) -> SipRuntimeEvent {
             value if value == EVENT_OUTBOUND_RESPONSE as i32 => {
                 SipRuntimeEventKind::OutboundResponse
             }
+            value if value == EVENT_INCOMING_INVITE as i32 => SipRuntimeEventKind::IncomingInvite,
             value => SipRuntimeEventKind::Unknown(value),
         },
         protocol: match event.transport {
@@ -450,7 +953,26 @@ fn copy_event(event: &gmv_sip_event_t) -> SipRuntimeEvent {
         user_agent: copy_string_view(event.user_agent),
         gb_version: copy_string_view(event.gb_version),
         operation_id: (event.operation_id != 0).then_some(event.operation_id),
+        association_id: (event.association_id != 0).then_some(event.association_id),
+        from_header: copy_string_view(event.from_header),
+        to_header: copy_string_view(event.to_header),
+        subject: copy_string_view(event.subject),
+        event: copy_string_view(event.event),
+        subscription_state: copy_string_view(event.subscription_state),
     }
+}
+
+fn copy_transport(value: i32) -> Option<SipTransportProtocol> {
+    match value {
+        value if value == TRANSPORT_UDP as i32 => Some(SipTransportProtocol::Udp),
+        value if value == TRANSPORT_TCP as i32 => Some(SipTransportProtocol::Tcp),
+        _ => None,
+    }
+}
+
+fn copy_socket_addr(view: gmv_sip_string_view_t, port: u16) -> Option<SocketAddr> {
+    let ip = copy_string_view(view)?.parse().ok()?;
+    Some(SocketAddr::new(ip, port))
 }
 
 fn duration_millis(name: &str, duration: Duration) -> Result<u32> {
@@ -482,6 +1004,14 @@ fn bytes_view(value: &[u8]) -> gmv_sip_string_view_t {
     gmv_sip_string_view_t {
         ptr: value.as_ptr().cast(),
         len: value.len(),
+    }
+}
+
+fn transport_id(protocol: SipTransportProtocol) -> i32 {
+    match protocol {
+        SipTransportProtocol::Udp => TRANSPORT_UDP as i32,
+        SipTransportProtocol::Tcp => TRANSPORT_TCP as i32,
+        SipTransportProtocol::Tls => 0,
     }
 }
 

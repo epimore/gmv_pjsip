@@ -1,7 +1,7 @@
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
 use crate::error::{Result, SipError};
 
-#[allow(dead_code)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn create_digest_response(
     credential: &AuthCredential,
     method: &str,
@@ -29,7 +29,7 @@ pub fn create_digest_response(
         ),
         CredentialKind::DigestHa1 => credential.secret.clone(),
     };
-    let ha2 = format!("{:x}", md5::compute(format!("{}:{}", method, uri)));
+    let ha2 = format!("{:x}", md5::compute(format!("{method}:{uri}")));
 
     if let Some(qop) = qop.filter(|q| !q.is_empty()) {
         let nc = nc.ok_or_else(|| SipError::AuthFailed("qop auth requires nc".into()))?;
@@ -37,15 +37,12 @@ pub fn create_digest_response(
             cnonce.ok_or_else(|| SipError::AuthFailed("qop auth requires cnonce".into()))?;
         Ok(format!(
             "{:x}",
-            md5::compute(format!(
-                "{}:{}:{}:{}:{}:{}",
-                ha1, nonce, nc, cnonce, qop, ha2
-            ))
+            md5::compute(format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}"))
         ))
     } else {
         Ok(format!(
             "{:x}",
-            md5::compute(format!("{}:{}:{}", ha1, nonce, ha2))
+            md5::compute(format!("{ha1}:{nonce}:{ha2}"))
         ))
     }
 }

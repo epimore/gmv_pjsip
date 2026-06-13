@@ -70,10 +70,7 @@ pub fn build_mansrtsp_speed_body(
     range_start_second: Option<f64>,
     rtsp_cseq: u32,
 ) -> String {
-    let mut body = format!(
-        "PLAY RTSP/1.0\r\nCSeq: {}\r\nScale: {:.3}\r\n",
-        rtsp_cseq, scale
-    );
+    let mut body = format!("PLAY RTSP/1.0\r\nCSeq: {rtsp_cseq}\r\nScale: {scale:.3}\r\n");
     if let Some(start) = range_start_second {
         body.push_str(&format!("Range: npt={:.3}-\r\n", start.max(0.0)));
     }

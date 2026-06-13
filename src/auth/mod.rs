@@ -179,7 +179,7 @@ impl AuthAlgorithm {
     pub fn is_supported(self) -> bool {
         #[cfg(feature = "pjsip-sys")]
         {
-            return pjsip_digest::is_algorithm_supported(self);
+            pjsip_digest::is_algorithm_supported(self)
         }
         #[cfg(not(feature = "pjsip-sys"))]
         {
@@ -329,6 +329,7 @@ pub fn verify_digest_response(req: VerifyDigestRequest<'_>) -> Result<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_digest_response(
     credential: &AuthCredential,
     method: &str,
@@ -341,9 +342,9 @@ pub fn create_digest_response(
 ) -> Result<String> {
     #[cfg(feature = "pjsip-sys")]
     {
-        return pjsip_digest::create_digest_response(
+        pjsip_digest::create_digest_response(
             credential, method, uri, nonce, nc, cnonce, qop, algorithm,
-        );
+        )
     }
     #[cfg(not(feature = "pjsip-sys"))]
     {
