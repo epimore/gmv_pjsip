@@ -2,7 +2,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use gmv_pjsip::{
@@ -10,9 +10,43 @@ use gmv_pjsip::{
     SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig,
     SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
+use log::{LevelFilter, Log, Metadata, Record};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
+static TEST_LOG_INIT: Once = Once::new();
+static TEST_LOGGER: TestLogger = TestLogger {
+    messages: Mutex::new(Vec::new()),
+};
 const LOCAL_PORT: u16 = 5060;
+const TEST_LOG_TARGET: &str = "gmv_pjsip::test";
+
+struct TestLogger {
+    messages: Mutex<Vec<String>>,
+}
+
+impl Log for TestLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.target() == TEST_LOG_TARGET
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if self.enabled(record.metadata()) {
+            self.messages
+                .lock()
+                .expect("lock test log messages")
+                .push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_test_logger() {
+    TEST_LOG_INIT.call_once(|| {
+        log::set_logger(&TEST_LOGGER).expect("install test logger");
+        log::set_max_level(LevelFilter::Debug);
+    });
+}
 
 fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
     TEST_LOCK
@@ -95,6 +129,42 @@ fn runtime_rejects_invalid_transport_config() {
         Err(error) => error,
     };
     assert!(matches!(error, SipError::InvalidConfig(_)));
+}
+
+#[test]
+fn runtime_rejects_empty_log_target() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        log_target: String::new(),
+        ..SipRuntimeConfig::default()
+    };
+    let error = match SipRuntime::start(config) {
+        Ok(_) => panic!("runtime unexpectedly accepted empty log target"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, SipError::InvalidConfig(_)));
+}
+
+#[test]
+fn pjsip_logs_are_bridged_to_the_rust_log_facade() {
+    let _guard = lock_tests();
+    init_test_logger();
+    TEST_LOGGER
+        .messages
+        .lock()
+        .expect("lock test log messages")
+        .clear();
+    let config = SipRuntimeConfig {
+        log_target: TEST_LOG_TARGET.into(),
+        ..SipRuntimeConfig::default()
+    };
+    let (runtime, _events, _transmits) = start_runtime(config);
+    runtime.shutdown().expect("shutdown runtime");
+    assert!(!TEST_LOGGER
+        .messages
+        .lock()
+        .expect("lock test log messages")
+        .is_empty());
 }
 
 #[test]

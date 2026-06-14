@@ -15,6 +15,7 @@ dashmap = "6"
 md5 = "0.7"
 rand = "0.8"
 thiserror = "2"
+log = "0.4"
 
 # Optional at Cargo level, enabled by default through the `pjsip-sys` feature.
 gmv_pjsip_sys = { path = "gmv_pjsip_sys", optional = true }

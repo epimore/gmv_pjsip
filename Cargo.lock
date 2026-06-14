@@ -135,6 +135,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "gmv_pjsip_sys",
+ "log",
  "md5",
  "rand",
  "thiserror",

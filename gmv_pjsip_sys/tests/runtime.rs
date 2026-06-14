@@ -134,6 +134,19 @@ fn abi_rejects_wrong_version() {
 }
 
 #[test]
+fn abi_rejects_invalid_log_level() {
+    let _guard = TEST_LOCK.lock().expect("lock runtime tests");
+    let state = CallbackState::new();
+    let mut config = config(&state);
+    config.log_level = 6;
+    let mut runtime = ptr::null_mut();
+    // SAFETY: Pointers are valid; the invalid log level is the behavior under test.
+    let status = unsafe { gmv_sip_runtime_create(&config, &mut runtime) };
+    assert_ne!(status, 0);
+    assert!(runtime.is_null());
+}
+
+#[test]
 fn runtime_injects_udp_and_completes_async_send() {
     let _guard = TEST_LOCK.lock().expect("lock runtime tests");
     let state = CallbackState::new();

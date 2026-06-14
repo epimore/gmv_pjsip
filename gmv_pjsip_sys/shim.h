@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define GMV_SIP_ABI_VERSION 4u
+#define GMV_SIP_ABI_VERSION 5u
 
 typedef struct gmv_sip_runtime gmv_sip_runtime_t;
 
@@ -99,6 +99,11 @@ typedef int32_t (*gmv_sip_send_callback)(
     const gmv_sip_send_packet_t *packet,
     void *user_data);
 
+typedef void (*gmv_sip_log_callback)(
+    int32_t level,
+    gmv_sip_string_view_t message,
+    void *user_data);
+
 typedef struct gmv_sip_runtime_config {
     uint32_t size;
     uint32_t version;
@@ -116,6 +121,9 @@ typedef struct gmv_sip_runtime_config {
     uint32_t auth_lookup_timeout_ms;
     gmv_sip_send_callback send_callback;
     void *send_user_data;
+    uint32_t log_level;
+    gmv_sip_log_callback log_callback;
+    void *log_user_data;
 } gmv_sip_runtime_config_t;
 
 typedef struct gmv_sip_received_packet {

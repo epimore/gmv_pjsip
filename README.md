@@ -52,6 +52,11 @@ Prototype capacity defaults are:
 - maximum SIP packet: 65,535 bytes;
 - maximum PJSIP transports: 32,768.
 
+PJSIP internal logs are bridged into Rust's standard `log` facade. The
+application chooses `SipRuntimeConfig::log_target`; the active logger's maximum
+level is mapped to PJSIP levels `0..=5`, so target filters and output routing
+remain owned by the application logger.
+
 ## Safe API
 
 The safe layer exports:

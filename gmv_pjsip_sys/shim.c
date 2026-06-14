@@ -232,10 +232,16 @@ struct gmv_sip_runtime {
     int32_t auth_algorithm_type;
     uint32_t max_pending_auth;
     uint32_t auth_lookup_timeout_ms;
+    uint32_t log_level;
     gmv_sip_event_callback event_callback;
     void *event_user_data;
     gmv_sip_send_callback send_callback;
     void *send_user_data;
+    gmv_sip_log_callback log_callback;
+    void *log_user_data;
+    pj_log_func *previous_log_func;
+    int previous_log_level;
+    int log_configured;
 
     pj_caching_pool caching_pool;
     pjsip_endpoint *endpoint;
@@ -285,6 +291,18 @@ struct gmv_sip_runtime {
 };
 
 static gmv_sip_runtime_t *g_active_runtime;
+static gmv_sip_runtime_t *g_log_runtime;
+
+static void gmv_pjsip_log_writer(int level, const char *data, int len) {
+    gmv_sip_runtime_t *runtime = g_log_runtime;
+    if (!runtime || !runtime->log_callback || !data || len <= 0) {
+        return;
+    }
+    gmv_sip_string_view_t message;
+    message.ptr = data;
+    message.len = (size_t)len;
+    runtime->log_callback(level, message, runtime->log_user_data);
+}
 
 static pj_status_t gmv_send_message_on_owner(
     gmv_sip_runtime_t *runtime,
@@ -3080,6 +3098,14 @@ static void gmv_runtime_release(gmv_sip_runtime_t *runtime) {
         pj_shutdown();
         runtime->pj_initialized = 0;
     }
+    if (runtime->log_configured) {
+        pj_log_set_log_func(runtime->previous_log_func);
+        pj_log_set_level(runtime->previous_log_level);
+        if (g_log_runtime == runtime) {
+            g_log_runtime = NULL;
+        }
+        runtime->log_configured = 0;
+    }
 
     if (g_active_runtime == runtime) {
         g_active_runtime = NULL;
@@ -3113,6 +3139,7 @@ void gmv_sip_runtime_config_init(gmv_sip_runtime_config_t *config) {
     config->max_pending_auth = GMV_SIP_DEFAULT_MAX_PENDING_AUTH;
     config->auth_lookup_timeout_ms =
         GMV_SIP_DEFAULT_AUTH_LOOKUP_TIMEOUT_MS;
+    config->log_level = 0;
 }
 
 int32_t gmv_sip_runtime_create(
@@ -3127,8 +3154,9 @@ int32_t gmv_sip_runtime_create(
         config->size < offsetof(gmv_sip_runtime_config_t, auth_realm) ||
         config->version != GMV_SIP_ABI_VERSION ||
         (!config->enable_udp && !config->enable_tcp) ||
-        !GMV_SIP_CONFIG_HAS(config, send_user_data) ||
+        !GMV_SIP_CONFIG_HAS(config, log_user_data) ||
         !config->send_callback ||
+        config->log_level > PJ_LOG_MAX_LEVEL ||
         (config->bind_address.len > 0 && !config->bind_address.ptr) ||
         config->bind_address.len >= GMV_SIP_BIND_ADDRESS_CAPACITY) {
         return PJ_EINVAL;
@@ -3160,6 +3188,9 @@ int32_t gmv_sip_runtime_create(
     runtime->event_user_data = config->event_user_data;
     runtime->send_callback = config->send_callback;
     runtime->send_user_data = config->send_user_data;
+    runtime->log_level = config->log_level;
+    runtime->log_callback = config->log_callback;
+    runtime->log_user_data = config->log_user_data;
 
     const char *auth_realm = GMV_SIP_DEFAULT_AUTH_REALM;
     size_t auth_realm_len = strlen(auth_realm);
@@ -3211,9 +3242,17 @@ int32_t gmv_sip_runtime_start(gmv_sip_runtime_t *runtime) {
         return PJ_EBUSY;
     }
 
+    runtime->previous_log_func = pj_log_get_log_func();
+    runtime->previous_log_level = pj_log_get_level();
+    g_log_runtime = runtime;
+    pj_log_set_log_func(&gmv_pjsip_log_writer);
+    pj_log_set_level((int)runtime->log_level);
+    runtime->log_configured = 1;
+
     pj_status_t status = pj_init();
     if (status != PJ_SUCCESS) {
         runtime->last_status = status;
+        gmv_runtime_release(runtime);
         return status;
     }
     runtime->pj_initialized = 1;

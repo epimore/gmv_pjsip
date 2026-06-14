@@ -41,6 +41,7 @@ use gmv_pjsip_sys::{
     gmv_sip_transport_GMV_SIP_TRANSPORT_TCP as TRANSPORT_TCP,
     gmv_sip_transport_GMV_SIP_TRANSPORT_UDP as TRANSPORT_UDP, GMV_SIP_ABI_VERSION,
 };
+use log::{Level, LevelFilter};
 
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
 use crate::error::{Result, SipError};
@@ -62,6 +63,7 @@ pub struct SipRuntimeConfig {
     pub max_pending_auth: u32,
     pub auth_lookup_timeout: Duration,
     pub io_queue_capacity: usize,
+    pub log_target: String,
 }
 
 impl Default for SipRuntimeConfig {
@@ -78,6 +80,7 @@ impl Default for SipRuntimeConfig {
             max_pending_auth: 20_000,
             auth_lookup_timeout: Duration::from_secs(3),
             io_queue_capacity: DEFAULT_IO_QUEUE_CAPACITY,
+            log_target: "gmv_pjsip::runtime".into(),
         }
     }
 }
@@ -107,6 +110,11 @@ impl SipRuntimeConfig {
         if self.io_queue_capacity == 0 {
             return Err(SipError::InvalidConfig(
                 "io_queue_capacity must be greater than zero".into(),
+            ));
+        }
+        if self.log_target.is_empty() {
+            return Err(SipError::InvalidConfig(
+                "log_target must be non-empty".into(),
             ));
         }
 
@@ -251,11 +259,16 @@ struct TransmitState {
     sender: SyncSender<SipTransmit>,
 }
 
+struct LogState {
+    target: String,
+}
+
 pub struct SipRuntime {
     raw: NonNull<gmv_sip_runtime_t>,
     stopped: bool,
     _event_state: Box<EventState>,
     _transmit_state: Box<TransmitState>,
+    _log_state: Box<LogState>,
     transmits: Option<SipRuntimeTransmits>,
     _runtime_guard: MutexGuard<'static, ()>,
     _not_send_or_sync: PhantomData<Rc<()>>,
@@ -277,6 +290,9 @@ impl SipRuntime {
         let (transmit_sender, transmits) = mpsc::sync_channel(config.io_queue_capacity);
         let mut transmit_state = Box::new(TransmitState {
             sender: transmit_sender,
+        });
+        let mut log_state = Box::new(LogState {
+            target: config.log_target.clone(),
         });
 
         let mut ffi_config = MaybeUninit::<gmv_sip_runtime_config_t>::uninit();
@@ -304,6 +320,9 @@ impl SipRuntime {
         ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
         ffi_config.send_callback = Some(runtime_send_callback);
         ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
+        ffi_config.log_level = pjsip_log_level(log::max_level());
+        ffi_config.log_callback = Some(runtime_log_callback);
+        ffi_config.log_user_data = ptr::from_mut(log_state.as_mut()).cast();
 
         let mut raw = ptr::null_mut();
         // SAFETY: The config, callback state, and output pointer remain valid
@@ -331,6 +350,7 @@ impl SipRuntime {
                 stopped: false,
                 _event_state: event_state,
                 _transmit_state: transmit_state,
+                _log_state: log_state,
                 transmits: Some(transmits),
                 _runtime_guard: runtime_guard,
                 _not_send_or_sync: PhantomData,
@@ -910,6 +930,51 @@ unsafe extern "C" fn runtime_send_callback(
     }
 }
 
+unsafe extern "C" fn runtime_log_callback(
+    level: i32,
+    message: gmv_sip_string_view_t,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() || message.ptr.is_null() || message.len == 0 {
+        return;
+    }
+    let Some(level) = rust_log_level(level) else {
+        return;
+    };
+    // SAFETY: The shim keeps LogState alive and the message view valid for this callback.
+    let state = unsafe { &*(user_data.cast::<LogState>()) };
+    if !log::log_enabled!(target: &state.target, level) {
+        return;
+    }
+    // SAFETY: PJSIP supplies a readable message buffer for the callback duration.
+    let bytes = unsafe { slice::from_raw_parts(message.ptr.cast::<u8>(), message.len) };
+    let message = String::from_utf8_lossy(bytes);
+    let message = message.trim_end_matches(['\r', '\n', '\0']);
+    log::log!(target: &state.target, level, "{message}");
+}
+
+fn pjsip_log_level(level: LevelFilter) -> u32 {
+    match level {
+        LevelFilter::Off => 0,
+        LevelFilter::Error => 1,
+        LevelFilter::Warn => 2,
+        LevelFilter::Info => 3,
+        LevelFilter::Debug => 4,
+        LevelFilter::Trace => 5,
+    }
+}
+
+fn rust_log_level(level: i32) -> Option<Level> {
+    match level {
+        i32::MIN..=0 => None,
+        1 => Some(Level::Error),
+        2 => Some(Level::Warn),
+        3 => Some(Level::Info),
+        4 => Some(Level::Debug),
+        _ => Some(Level::Trace),
+    }
+}
+
 fn copy_event(event: &gmv_sip_event_t) -> SipRuntimeEvent {
     SipRuntimeEvent {
         event_id: event.event_id,
@@ -1072,5 +1137,32 @@ fn pjsip_error(operation: &'static str, status: i32) -> SipError {
         operation,
         status,
         message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use log::{Level, LevelFilter};
+
+    use super::{pjsip_log_level, rust_log_level};
+
+    #[test]
+    fn maps_rust_log_filters_to_pjsip_levels() {
+        assert_eq!(pjsip_log_level(LevelFilter::Off), 0);
+        assert_eq!(pjsip_log_level(LevelFilter::Error), 1);
+        assert_eq!(pjsip_log_level(LevelFilter::Warn), 2);
+        assert_eq!(pjsip_log_level(LevelFilter::Info), 3);
+        assert_eq!(pjsip_log_level(LevelFilter::Debug), 4);
+        assert_eq!(pjsip_log_level(LevelFilter::Trace), 5);
+    }
+
+    #[test]
+    fn maps_pjsip_levels_to_rust_log_levels() {
+        assert_eq!(rust_log_level(0), None);
+        assert_eq!(rust_log_level(1), Some(Level::Error));
+        assert_eq!(rust_log_level(2), Some(Level::Warn));
+        assert_eq!(rust_log_level(3), Some(Level::Info));
+        assert_eq!(rust_log_level(4), Some(Level::Debug));
+        assert_eq!(rust_log_level(5), Some(Level::Trace));
     }
 }
