@@ -649,6 +649,8 @@ impl SipRuntime {
             ));
         }
 
+        let to_uri = format!("<{}>", invite.target_uri);
+
         let request = gmv_sip_outbound_invite_t {
             size: mem::size_of::<gmv_sip_outbound_invite_t>() as u32,
             version: GMV_SIP_ABI_VERSION,
@@ -656,6 +658,7 @@ impl SipRuntime {
             association_id: invite.association_id,
             transport: transport_id(invite.protocol),
             target_uri: string_view(&invite.target_uri),
+            to_uri: string_view(&to_uri),
             from_uri: string_view(&invite.from_uri),
             contact_uri: string_view(&invite.contact_uri),
             subject: invite

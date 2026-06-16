@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define GMV_SIP_ABI_VERSION 5u
+#define GMV_SIP_ABI_VERSION 6u
 
 typedef struct gmv_sip_runtime gmv_sip_runtime_t;
 
@@ -176,6 +176,7 @@ typedef struct gmv_sip_outbound_invite {
     uint64_t association_id;
     int32_t transport;
     gmv_sip_string_view_t target_uri;
+    gmv_sip_string_view_t to_uri;
     gmv_sip_string_view_t from_uri;
     gmv_sip_string_view_t contact_uri;
     gmv_sip_string_view_t subject;

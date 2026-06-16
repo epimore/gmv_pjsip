@@ -128,6 +128,7 @@ typedef struct gmv_invite_command {
     uint64_t association_id;
     int32_t transport;
     char target_uri[1024];
+    char to_uri[1024];
     char from_uri[1024];
     char contact_uri[1024];
     char subject[GMV_SIP_SUBJECT_CAPACITY];
@@ -1489,8 +1490,14 @@ static pj_status_t gmv_set_subscription_body(
             content_type_len -
             (size_t)(slash - content_type) - 1u)
     };
+    unsigned char *body_copy =
+        (unsigned char *)pj_pool_alloc(tdata->pool, body_len);
+    if (!body_copy) {
+        return PJ_ENOMEM;
+    }
+    memcpy(body_copy, body, body_len);
     pj_str_t value = {
-        (char *)body,
+        (char *)body_copy,
         (pj_ssize_t)body_len
     };
     tdata->msg->body = pjsip_msg_body_create(
@@ -3525,30 +3532,8 @@ static pj_status_t gmv_send_message_on_owner(
         return PJ_EINVAL;
     }
 
-    const char *slash = strchr(message->content_type, '/');
-    size_t content_type_len = strlen(message->content_type);
-    if (!slash || slash == message->content_type ||
-        slash == message->content_type + content_type_len - 1) {
-        return PJ_EINVAL;
-    }
-
     pj_str_t target = pj_str((char *)message->target_uri);
     pj_str_t from = pj_str((char *)message->from_uri);
-    pj_str_t type = {
-        (char *)message->content_type,
-        (pj_ssize_t)(slash - message->content_type)
-    };
-    pj_str_t subtype = {
-        (char *)(slash + 1),
-        (pj_ssize_t)(
-            content_type_len -
-            (size_t)(slash - message->content_type) - 1u)
-    };
-    pj_str_t body = {
-        (char *)message->body,
-        (pj_ssize_t)message->body_len
-    };
-
     pjsip_tx_data *tdata = NULL;
     pjsip_method method;
     pj_str_t method_name = pj_str("MESSAGE");
@@ -3567,14 +3552,14 @@ static pj_status_t gmv_send_message_on_owner(
     if (status != PJ_SUCCESS) {
         return status;
     }
-    tdata->msg->body = pjsip_msg_body_create(
-        tdata->pool,
-        &type,
-        &subtype,
-        &body);
-    if (!tdata->msg->body) {
+    status = gmv_set_subscription_body(
+        tdata,
+        message->content_type,
+        message->body,
+        message->body_len);
+    if (status != PJ_SUCCESS) {
         pjsip_tx_data_dec_ref(tdata);
-        return PJ_ENOMEM;
+        return status;
     }
 
     gmv_custom_transport_t *transport =
@@ -3632,6 +3617,7 @@ static pj_status_t gmv_send_invite_on_owner(
     if (!runtime || !command ||
         command->operation_id == 0 ||
         !command->target_uri[0] ||
+        !command->to_uri[0] ||
         !command->from_uri[0] ||
         !command->contact_uri[0] ||
         !command->sdp ||
@@ -3650,6 +3636,7 @@ static pj_status_t gmv_send_invite_on_owner(
     }
 
     pj_str_t target = pj_str((char *)command->target_uri);
+    pj_str_t to = pj_str((char *)command->to_uri);
     pj_str_t from = pj_str((char *)command->from_uri);
     pj_str_t contact = pj_str((char *)command->contact_uri);
     pjsip_dialog *dialog = NULL;
@@ -3657,7 +3644,7 @@ static pj_status_t gmv_send_invite_on_owner(
         pjsip_ua_instance(),
         &from,
         &contact,
-        &target,
+        &to,
         &target,
         &dialog);
     if (status != PJ_SUCCESS) {
@@ -4165,6 +4152,7 @@ int32_t gmv_sip_runtime_send_invite(
         (invite->transport == GMV_SIP_TRANSPORT_TCP &&
          invite->association_id == 0) ||
         !invite->target_uri.ptr || invite->target_uri.len == 0 ||
+        !invite->to_uri.ptr || invite->to_uri.len == 0 ||
         !invite->from_uri.ptr || invite->from_uri.len == 0 ||
         !invite->contact_uri.ptr || invite->contact_uri.len == 0 ||
         !invite->sdp.ptr || invite->sdp.len == 0 ||
@@ -4185,6 +4173,10 @@ int32_t gmv_sip_runtime_send_invite(
             command->target_uri,
             sizeof(command->target_uri),
             invite->target_uri) ||
+        !gmv_copy_view(
+            command->to_uri,
+            sizeof(command->to_uri),
+            invite->to_uri) ||
         !gmv_copy_view(
             command->from_uri,
             sizeof(command->from_uri),
