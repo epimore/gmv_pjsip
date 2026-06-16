@@ -649,7 +649,7 @@ impl SipRuntime {
             ));
         }
 
-        let to_uri = format!("<{}>", invite.target_uri);
+        let to_uri = invite_to_uri(&invite.target_uri, invite.subject.as_deref());
 
         let request = gmv_sip_outbound_invite_t {
             size: mem::size_of::<gmv_sip_outbound_invite_t>() as u32,
@@ -1073,6 +1073,20 @@ fn bytes_view(value: &[u8]) -> gmv_sip_string_view_t {
         ptr: value.as_ptr().cast(),
         len: value.len(),
     }
+}
+
+fn invite_to_uri(target_uri: &str, subject: Option<&str>) -> String {
+    let Some((_, host)) = target_uri.strip_prefix("sip:").and_then(|value| value.split_once('@'))
+    else {
+        return format!("<{target_uri}>");
+    };
+    let Some((channel_id, _)) = subject.and_then(|value| value.split_once(':')) else {
+        return format!("<{target_uri}>");
+    };
+    if channel_id.is_empty() || !channel_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return format!("<{target_uri}>");
+    }
+    format!("<sip:{channel_id}@{host}>")
 }
 
 fn transport_id(protocol: SipTransportProtocol) -> i32 {

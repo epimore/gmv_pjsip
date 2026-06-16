@@ -204,6 +204,8 @@ struct gmv_invite_call {
     char call_id[GMV_SIP_CALL_ID_CAPACITY];
     pjsip_inv_session *invite;
     int invite_final_emitted;
+    int has_dialog_route;
+    pj_sockaddr dialog_route_addr;
     struct gmv_invite_call *next;
 };
 
@@ -323,6 +325,12 @@ static pj_status_t gmv_send_subscribe_on_owner(
 static pj_bool_t gmv_handle_incoming_invite(
     gmv_sip_runtime_t *runtime,
     pjsip_rx_data *rdata);
+static gmv_invite_call_t *gmv_find_invite_call(
+    gmv_sip_runtime_t *runtime,
+    const char *call_id);
+static void gmv_invite_call_save_dialog_route(
+    gmv_invite_call_t *call,
+    const pjsip_rx_data *rdata);
 
 /*
  * PJSIP_AUTH_ALGORITHM_SHA256 and PJSIP_AUTH_ALGORITHM_SHA512_256 are
@@ -553,6 +561,164 @@ static void gmv_remove_pending_send(
     }
 }
 
+static int gmv_sockaddr_is_private_or_unusable_ipv4(
+    const pj_sockaddr *address) {
+    if (!address || address->addr.sa_family != pj_AF_INET()) {
+        return 0;
+    }
+    pj_uint32_t ip = pj_ntohl(address->ipv4.sin_addr.s_addr);
+    unsigned a = (ip >> 24) & 0xffu;
+    unsigned b = (ip >> 16) & 0xffu;
+    if (a == 0 || a == 10 || a == 127) {
+        return 1;
+    }
+    if (a == 100 && b >= 64 && b <= 127) {
+        return 1;
+    }
+    if (a == 169 && b == 254) {
+        return 1;
+    }
+    if (a == 172 && b >= 16 && b <= 31) {
+        return 1;
+    }
+    if (a == 192 && b == 168) {
+        return 1;
+    }
+    return 0;
+}
+
+static gmv_invite_call_t *gmv_invite_call_from_tx_data(
+    gmv_sip_runtime_t *runtime,
+    const pjsip_tx_data *tdata) {
+    if (!runtime || !tdata || !tdata->msg) {
+        return NULL;
+    }
+    pjsip_cid_hdr *call_id =
+        (pjsip_cid_hdr *)pjsip_msg_find_hdr(
+            tdata->msg,
+            PJSIP_H_CALL_ID,
+            NULL);
+    if (!call_id || call_id->id.slen <= 0) {
+        return NULL;
+    }
+    char call_id_value[GMV_SIP_CALL_ID_CAPACITY];
+    if (!gmv_copy_view(
+            call_id_value,
+            sizeof(call_id_value),
+            gmv_string_view(&call_id->id))) {
+        return NULL;
+    }
+    return gmv_find_invite_call(runtime, call_id_value);
+}
+
+static const pj_sockaddr_t *gmv_dialog_route_destination(
+    gmv_sip_runtime_t *runtime,
+    const pjsip_tx_data *tdata,
+    const pj_sockaddr_t *destination) {
+    gmv_invite_call_t *call =
+        gmv_invite_call_from_tx_data(runtime, tdata);
+    if (!call || !call->has_dialog_route ||
+        !pj_sockaddr_has_addr(&call->dialog_route_addr)) {
+        return destination;
+    }
+    if (!destination || !pj_sockaddr_has_addr(destination) ||
+        gmv_sockaddr_is_private_or_unusable_ipv4(
+            (const pj_sockaddr *)destination)) {
+        return &call->dialog_route_addr;
+    }
+    return destination;
+}
+
+static int gmv_packet_header_copy(
+    const char *packet,
+    size_t packet_len,
+    const char *name,
+    char *out,
+    size_t out_len) {
+    if (!packet || packet_len == 0 || !name || !out || out_len == 0) {
+        return 0;
+    }
+    size_t name_len = strlen(name);
+    const char *cursor = packet;
+    const char *end = packet + packet_len;
+    while (cursor < end) {
+        const char *line_end = memchr(cursor, '\n', (size_t)(end - cursor));
+        if (!line_end) {
+            line_end = end;
+        }
+        size_t line_len = (size_t)(line_end - cursor);
+        if (line_len > 0 && cursor[line_len - 1] == '\r') {
+            line_len--;
+        }
+        if (line_len > name_len && cursor[name_len] == ':' &&
+            pj_ansi_strnicmp(cursor, name, name_len) == 0) {
+            const char *value = cursor + name_len + 1;
+            size_t value_len = line_len - name_len - 1;
+            while (value_len > 0 &&
+                   (*value == ' ' || *value == '\t')) {
+                value++;
+                value_len--;
+            }
+            while (value_len > 0 &&
+                   (value[value_len - 1] == ' ' ||
+                    value[value_len - 1] == '\t')) {
+                value_len--;
+            }
+            if (value_len >= out_len) {
+                return 0;
+            }
+            memcpy(out, value, value_len);
+            out[value_len] = '\0';
+            return 1;
+        }
+        cursor = line_end == end ? end : line_end + 1;
+    }
+    return 0;
+}
+
+static int gmv_packet_is_2xx_invite_response(
+    const char *packet,
+    size_t packet_len) {
+    if (!packet || packet_len < 9 ||
+        memcmp(packet, "SIP/2.0 ", 8) != 0 ||
+        packet[8] != '2') {
+        return 0;
+    }
+    char cseq[128];
+    if (!gmv_packet_header_copy(
+            packet,
+            packet_len,
+            "CSeq",
+            cseq,
+            sizeof(cseq))) {
+        return 0;
+    }
+    return strstr(cseq, "INVITE") != NULL;
+}
+
+static void gmv_capture_invite_dialog_route_from_packet(
+    gmv_sip_runtime_t *runtime,
+    const pjsip_rx_data *rdata) {
+    if (!runtime || !rdata ||
+        !gmv_packet_is_2xx_invite_response(
+            rdata->pkt_info.packet,
+            (size_t)rdata->pkt_info.len)) {
+        return;
+    }
+    char call_id[GMV_SIP_CALL_ID_CAPACITY];
+    if (!gmv_packet_header_copy(
+            rdata->pkt_info.packet,
+            (size_t)rdata->pkt_info.len,
+            "Call-ID",
+            call_id,
+            sizeof(call_id))) {
+        return;
+    }
+    gmv_invite_call_save_dialog_route(
+        gmv_find_invite_call(runtime, call_id),
+        rdata);
+}
+
 static pj_status_t gmv_custom_transport_send(
     pjsip_transport *base,
     pjsip_tx_data *tdata,
@@ -597,7 +763,8 @@ static pj_status_t gmv_custom_transport_send(
     memset(local, 0, sizeof(local));
     memset(remote, 0, sizeof(remote));
     pj_sockaddr_print(&base->local_addr, local, sizeof(local), 0);
-    const pj_sockaddr_t *destination = remote_address;
+    const pj_sockaddr_t *destination =
+        gmv_dialog_route_destination(runtime, tdata, remote_address);
     if (!destination || !pj_sockaddr_has_addr(destination)) {
         destination = &base->key.rem_addr;
     }
@@ -865,6 +1032,7 @@ static pj_status_t gmv_deliver_receive_buffer(
     rdata->pkt_info.src_port = remote_port;
     rdata->pkt_info.len = (pj_ssize_t)data_len;
     rdata->pkt_info.zero = 0;
+    gmv_capture_invite_dialog_route_from_packet(runtime, rdata);
 
     pj_ssize_t processed = pjsip_tpmgr_receive_packet(
         transport->base.tpmgr,
@@ -1287,6 +1455,20 @@ static pjsip_rx_data *gmv_event_rdata(pjsip_event *event) {
     return event->body.tsx_state.src.rdata;
 }
 
+static void gmv_invite_call_save_dialog_route(
+    gmv_invite_call_t *call,
+    const pjsip_rx_data *rdata) {
+    if (!call || !rdata ||
+        !pj_sockaddr_has_addr(&rdata->pkt_info.src_addr)) {
+        return;
+    }
+    memcpy(
+        &call->dialog_route_addr,
+        &rdata->pkt_info.src_addr,
+        sizeof(call->dialog_route_addr));
+    call->has_dialog_route = 1;
+}
+
 static void gmv_emit_transaction_event(
     gmv_sip_runtime_t *runtime,
     pjsip_transaction *transaction,
@@ -1397,6 +1579,11 @@ static void gmv_invite_on_tsx_state_changed(
         return;
     }
     if (transaction->method.id == PJSIP_INVITE_METHOD) {
+        pjsip_rx_data *rdata = gmv_event_rdata(event);
+        if (transaction->status_code >= 200 &&
+            transaction->status_code < 300) {
+            gmv_invite_call_save_dialog_route(call, rdata);
+        }
         if (transaction->status_code >= 200 &&
             call->invite_final_emitted) {
             return;
