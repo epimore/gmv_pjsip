@@ -59,7 +59,7 @@ pub fn build_snapshot_control_xml(
 
 pub fn build_mansrtsp_seek_body(seek_second: f64, rtsp_cseq: u32) -> String {
     format!(
-        "PLAY RTSP/1.0\r\nCSeq: {}\r\nRange: npt={:.3}-\r\n\r\n",
+        "PLAY RTSP/1.0\r\nCSeq: {}\r\nRange: npt={:.0}-\r\n\r\n",
         rtsp_cseq,
         seek_second.max(0.0)
     )
@@ -76,4 +76,17 @@ pub fn build_mansrtsp_speed_body(
     }
     body.push_str("\r\n");
     body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_mansrtsp_seek_body;
+
+    #[test]
+    fn mansrtsp_seek_uses_integer_npt_range() {
+        assert_eq!(
+            build_mansrtsp_seek_body(30.0, 1),
+            "PLAY RTSP/1.0\r\nCSeq: 1\r\nRange: npt=30-\r\n\r\n"
+        );
+    }
 }

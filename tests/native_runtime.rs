@@ -180,7 +180,17 @@ fn runtime_enforces_one_active_instance() {
 #[test]
 fn custom_transport_handles_udp_and_fragmented_tcp() {
     let _guard = lock_tests();
-    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    init_test_logger();
+    TEST_LOGGER
+        .messages
+        .lock()
+        .expect("lock test log messages")
+        .clear();
+    let config = SipRuntimeConfig {
+        log_target: TEST_LOG_TARGET.into(),
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
 
     let udp_remote = remote_addr(40000);
     let options = format!(
@@ -263,6 +273,73 @@ Content-Length: {}\r\n\r\n{}",
     assert_eq!(message_event.method.as_deref(), Some("MESSAGE"));
     assert_eq!(message_event.body, body.as_bytes());
     let _message_response = receive_event(&mut runtime, &events, SipRuntimeEventKind::ResponseSent);
+
+    let sticky_message = |call_id: &str, cseq: u32| {
+        format!(
+            "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/TCP {tcp_remote};branch=z9hG4bK-{call_id};rport\r\n\
+From: <sip:test@127.0.0.1>;tag={call_id}\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: {call_id}\r\n\
+CSeq: {cseq} MESSAGE\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n"
+        )
+    };
+    let sticky_first = sticky_message("tcp-sticky-1", 2);
+    let sticky_second = sticky_message("tcp-sticky-2", 3);
+    let sticky_third = sticky_message("tcp-sticky-3", 4);
+    let third_split = sticky_third.len() - 7;
+    let sticky_head = [
+        sticky_first.as_bytes(),
+        sticky_second.as_bytes(),
+        &sticky_third.as_bytes()[..third_split],
+    ]
+    .concat();
+    runtime
+        .receive_packet(
+            7,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            tcp_remote,
+            &sticky_head,
+        )
+        .expect("inject sticky TCP head");
+    let first_transmit = receive_transmit(&mut runtime, &transmits);
+    let first_response = finish_transmit(&mut runtime, &first_transmit);
+    assert!(first_response.contains("\r\nCSeq: 2 MESSAGE\r\n"));
+    let second_transmit = receive_transmit(&mut runtime, &transmits);
+    let second_response = finish_transmit(&mut runtime, &second_transmit);
+    assert!(second_response.contains("\r\nCSeq: 3 MESSAGE\r\n"));
+    let logs = TEST_LOGGER
+        .messages
+        .lock()
+        .expect("lock test log messages")
+        .clone();
+    assert!(logs
+        .iter()
+        .any(|message| message.contains("complete SIP packet")
+            && message.contains("\\r\\nCSeq: 2 MESSAGE\\r\\n")
+            && !message.contains("\\r\\nCSeq: 3 MESSAGE\\r\\n")
+            && !message.contains("\r\nCSeq:")));
+    assert!(logs
+        .iter()
+        .any(|message| message.contains("complete SIP packet")
+            && message.contains("\\r\\nCSeq: 3 MESSAGE\\r\\n")
+            && !message.contains("\\r\\nCSeq: 2 MESSAGE\\r\\n")
+            && !message.contains("\r\nCSeq:")));
+    runtime
+        .receive_packet(
+            7,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            tcp_remote,
+            &sticky_third.as_bytes()[third_split..],
+        )
+        .expect("inject sticky TCP tail");
+    let third_transmit = receive_transmit(&mut runtime, &transmits);
+    let third_response = finish_transmit(&mut runtime, &third_transmit);
+    assert!(third_response.contains("\r\nCSeq: 4 MESSAGE\r\n"));
 
     runtime
         .close_transport(7, SipTransportProtocol::Tcp, 0)

@@ -1006,6 +1006,155 @@ static pj_status_t gmv_save_remainder(
     return PJ_SUCCESS;
 }
 
+static size_t gmv_sip_header_end(
+    const char *packet,
+    size_t packet_len,
+    size_t *delimiter_len) {
+    if (!packet || packet_len == 0 || !delimiter_len) {
+        return 0;
+    }
+    for (size_t i = 0; i + 3 < packet_len; ++i) {
+        if (packet[i] == '\r' && packet[i + 1] == '\n' &&
+            packet[i + 2] == '\r' && packet[i + 3] == '\n') {
+            *delimiter_len = 4;
+            return i;
+        }
+    }
+    for (size_t i = 0; i + 1 < packet_len; ++i) {
+        if (packet[i] == '\n' && packet[i + 1] == '\n') {
+            *delimiter_len = 2;
+            return i;
+        }
+    }
+    return 0;
+}
+
+static size_t gmv_sip_content_length(
+    const char *headers,
+    size_t headers_len) {
+    char value[32];
+    if (!gmv_packet_header_copy(
+            headers,
+            headers_len,
+            "Content-Length",
+            value,
+            sizeof(value))) {
+        return 0;
+    }
+    char *end = NULL;
+    unsigned long length = strtoul(value, &end, 10);
+    if (end == value) {
+        return 0;
+    }
+    return (size_t)length;
+}
+
+static size_t gmv_complete_sip_message_len(
+    const char *packet,
+    size_t packet_len) {
+    size_t delimiter_len = 0;
+    size_t headers_len =
+        gmv_sip_header_end(packet, packet_len, &delimiter_len);
+    if (headers_len == 0 && delimiter_len == 0) {
+        return 0;
+    }
+    size_t body_len = gmv_sip_content_length(packet, headers_len);
+    size_t message_len = headers_len + delimiter_len + body_len;
+    return message_len <= packet_len ? message_len : 0;
+}
+
+static void gmv_log_complete_sip_packet_payload(
+    gmv_sip_runtime_t *runtime,
+    const gmv_custom_transport_t *transport,
+    const pjsip_rx_data *rdata,
+    const char *packet,
+    size_t packet_len) {
+    if (!runtime || !transport || !rdata || !packet || packet_len == 0 ||
+        !runtime->log_callback || runtime->log_level < 4) {
+        return;
+    }
+    char local[GMV_SIP_ADDRESS_CAPACITY];
+    char remote[GMV_SIP_ADDRESS_CAPACITY];
+    memset(local, 0, sizeof(local));
+    memset(remote, 0, sizeof(remote));
+    pj_sockaddr_print(&transport->base.local_addr, local, sizeof(local), 1);
+    pj_sockaddr_print(&rdata->pkt_info.src_addr, remote, sizeof(remote), 1);
+
+    char prefix[256];
+    int prefix_len = pj_ansi_snprintf(
+        prefix,
+        sizeof(prefix),
+        "complete SIP packet: protocol=%s association=%llu local=%s remote=%s bytes=%zu payload=",
+        transport->protocol == GMV_SIP_TRANSPORT_TCP ? "TCP" : "UDP",
+        (unsigned long long)transport->association_id,
+        local,
+        remote,
+        packet_len);
+    if (prefix_len <= 0) {
+        return;
+    }
+    if ((size_t)prefix_len >= sizeof(prefix)) {
+        prefix_len = (int)sizeof(prefix) - 1;
+    }
+
+    size_t escaped_len = 0;
+    for (size_t i = 0; i < packet_len; ++i) {
+        escaped_len +=
+            packet[i] == '\r' || packet[i] == '\n' ? 2u : 1u;
+    }
+
+    size_t message_len = (size_t)prefix_len + escaped_len;
+    char *message = (char *)malloc(message_len);
+    if (!message) {
+        return;
+    }
+    memcpy(message, prefix, (size_t)prefix_len);
+    size_t cursor = (size_t)prefix_len;
+    for (size_t i = 0; i < packet_len; ++i) {
+        if (packet[i] == '\r') {
+            message[cursor++] = '\\';
+            message[cursor++] = 'r';
+        } else if (packet[i] == '\n') {
+            message[cursor++] = '\\';
+            message[cursor++] = 'n';
+        } else {
+            message[cursor++] = packet[i];
+        }
+    }
+
+    gmv_sip_string_view_t view;
+    view.ptr = message;
+    view.len = message_len;
+    runtime->log_callback(4, view, runtime->log_user_data);
+    free(message);
+}
+
+static void gmv_log_complete_sip_packets(
+    gmv_sip_runtime_t *runtime,
+    const gmv_custom_transport_t *transport,
+    const pjsip_rx_data *rdata,
+    size_t data_len) {
+    if (!rdata || data_len == 0) {
+        return;
+    }
+    const char *packet = rdata->pkt_info.packet;
+    size_t offset = 0;
+    while (offset < data_len) {
+        size_t message_len =
+            gmv_complete_sip_message_len(packet + offset, data_len - offset);
+        if (message_len == 0) {
+            break;
+        }
+        gmv_log_complete_sip_packet_payload(
+            runtime,
+            transport,
+            rdata,
+            packet + offset,
+            message_len);
+        offset += message_len;
+    }
+}
+
 static pj_status_t gmv_deliver_receive_buffer(
     gmv_sip_runtime_t *runtime,
     gmv_custom_transport_t *transport,
@@ -1041,6 +1190,7 @@ static pj_status_t gmv_deliver_receive_buffer(
         status = PJ_EINVALIDOP;
     } else {
         *consumed = (size_t)processed;
+        gmv_log_complete_sip_packets(runtime, transport, rdata, *consumed);
         status = PJ_SUCCESS;
     }
     pj_pool_reset(runtime->receive_pool);
@@ -1078,7 +1228,7 @@ static pj_status_t gmv_receive_on_transport(
     }
 
     size_t offset = 0;
-    do {
+    for (;;) {
         size_t prefix_len = transport->remainder_len;
         if (prefix_len > PJSIP_MAX_PKT_LEN) {
             return PJSIP_ERXOVERFLOW;
@@ -1089,7 +1239,7 @@ static pj_status_t gmv_receive_on_transport(
                 transport->remainder,
                 prefix_len);
         }
-        size_t copy_len = data_len - offset;
+        size_t copy_len = offset < data_len ? data_len - offset : 0;
         size_t available = PJSIP_MAX_PKT_LEN - prefix_len;
         if (copy_len > available) {
             copy_len = available;
@@ -1125,7 +1275,11 @@ static pj_status_t gmv_receive_on_transport(
             offset < data_len) {
             return PJSIP_ERXOVERFLOW;
         }
-    } while (offset < data_len);
+        if (offset >= data_len &&
+            (consumed == 0 || transport->remainder_len == 0)) {
+            break;
+        }
+    }
 
     return PJ_SUCCESS;
 }
