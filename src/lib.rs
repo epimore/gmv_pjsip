@@ -9,7 +9,6 @@ pub mod auth;
 pub mod error;
 pub mod gb28181;
 pub mod message;
-#[cfg(feature = "pjsip-sys")]
 pub mod runtime;
 pub mod transport;
 
@@ -22,7 +21,6 @@ pub use auth::{
 pub use error::{Result, SipError};
 pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
 pub use message::SipMethod;
-#[cfg(feature = "pjsip-sys")]
 pub use runtime::{
     SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipInviteResponse, SipOutboundInvite,
     SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,

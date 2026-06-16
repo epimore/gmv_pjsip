@@ -1,5 +1,3 @@
-#![cfg(feature = "pjsip-sys")]
-
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Mutex, Once};
@@ -421,7 +419,7 @@ y=0100000001\r\n";
             target_uri: format!("sip:device@{remote}"),
             from_uri: format!("<sip:platform@{}>", local_addr()),
             contact_uri: format!("<sip:platform@{}>", local_addr()),
-            subject: Some("device:0100000001,platform:0".into()),
+            subject: Some("device:0100000001,platform:0100000001".into()),
             sdp: local_sdp.into(),
         })
         .expect("send outbound INVITE");
@@ -431,7 +429,7 @@ y=0100000001\r\n";
     assert!(invite.starts_with("INVITE "));
     assert_eq!(
         header_value(&invite, "Subject"),
-        "device:0100000001,platform:0"
+        "device:0100000001,platform:0100000001"
     );
     let remote_sdp = "v=0\r\n\
 o=device 0 0 IN IP4 127.0.0.1\r\n\
@@ -570,7 +568,7 @@ Content-Length: 0\r\n\r\n",
             target_uri: format!("sip:device@{remote}"),
             from_uri: format!("<sip:platform@{}>", local_addr()),
             contact_uri: format!("<sip:platform@{}>", local_addr()),
-            subject: Some("device:0100000002,platform:0".into()),
+            subject: Some("device:0100000002,platform:0100000002".into()),
             sdp: local_sdp.into(),
         })
         .expect("send second outbound INVITE");
@@ -675,7 +673,7 @@ To: <sip:platform@{}>\r\n\
 Call-ID: incoming-invite\r\n\
 CSeq: 1 INVITE\r\n\
 Contact: <sip:device@{}>\r\n\
-Subject: channel:1,platform:0\r\n\
+Subject: channel:0100000001,platform:0100000001\r\n\
 Max-Forwards: 70\r\n\
 Content-Type: application/sdp\r\n\
 Content-Length: {}\r\n\r\n{}",
@@ -701,7 +699,10 @@ Content-Length: {}\r\n\r\n{}",
     let incoming = receive_event(&mut runtime, &events, SipRuntimeEventKind::IncomingInvite);
     assert_eq!(incoming.call_id.as_deref(), Some("incoming-invite"));
     assert_eq!(incoming.body, sdp.as_bytes());
-    assert_eq!(incoming.subject.as_deref(), Some("channel:1,platform:0"));
+    assert_eq!(
+        incoming.subject.as_deref(),
+        Some("channel:0100000001,platform:0100000001")
+    );
 
     let cancel = format!(
         "CANCEL sip:platform@{} SIP/2.0\r\n\

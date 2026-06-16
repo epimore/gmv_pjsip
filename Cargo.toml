@@ -3,19 +3,11 @@ name = "gmv_pjsip"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = ["pjsip-sys"]
-# Enabled by default for GMV production: use PJPROJECT/PJSIP digest helpers.
-# Disable default features only for pure-Rust unit tests without PJPROJECT.
-pjsip-sys = ["dep:gmv_pjsip_sys"]
-
 [dependencies]
 bytes = "1"
 dashmap = "6"
-md5 = "0.7"
 rand = "0.8"
 thiserror = "2"
 log = "0.4"
 
-# Optional at Cargo level, enabled by default through the `pjsip-sys` feature.
-gmv_pjsip_sys = { path = "gmv_pjsip_sys", optional = true }
+gmv_pjsip_sys = { path = "gmv_pjsip_sys" }

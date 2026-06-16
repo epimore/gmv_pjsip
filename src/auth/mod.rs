@@ -1,11 +1,5 @@
 //! SIP Digest authentication integration.
 //!
-//! Main path:
-//! - With feature `pjsip-sys`, digest calculation and algorithm support checks
-//!   are delegated to PJPROJECT/PJSIP through `gmv_pjsip_sys` shim functions.
-//! - Without `pjsip-sys`, a small MD5-only fallback remains for unit tests and
-//!   local skeleton builds; production GB28181 auth should enable `pjsip-sys`.
-//!
 //! Full `pjsip_auth_srv_verify()` requires a live `pjsip_rx_data` produced by
 //! the PJSIP parser/transport pipeline. The current GMV adapter still parses
 //! packets into Rust `SipMessage`, so this module uses PJSIP's
@@ -22,10 +16,7 @@ use rand::{distributions::Alphanumeric, Rng};
 
 use crate::error::{Result, SipError};
 
-mod fallback;
-#[cfg(feature = "pjsip-sys")]
 mod pjsip_digest;
-#[cfg(feature = "pjsip-sys")]
 pub mod pjsip_server;
 
 pub trait PasswordProvider: Send + Sync + 'static {
@@ -177,14 +168,7 @@ impl AuthAlgorithm {
     }
 
     pub fn is_supported(self) -> bool {
-        #[cfg(feature = "pjsip-sys")]
-        {
-            pjsip_digest::is_algorithm_supported(self)
-        }
-        #[cfg(not(feature = "pjsip-sys"))]
-        {
-            matches!(self, Self::Md5)
-        }
+        pjsip_digest::is_algorithm_supported(self)
     }
 }
 
@@ -340,14 +324,5 @@ pub fn create_digest_response(
     qop: Option<&str>,
     algorithm: AuthAlgorithm,
 ) -> Result<String> {
-    #[cfg(feature = "pjsip-sys")]
-    {
-        pjsip_digest::create_digest_response(
-            credential, method, uri, nonce, nc, cnonce, qop, algorithm,
-        )
-    }
-    #[cfg(not(feature = "pjsip-sys"))]
-    {
-        fallback::create_digest_response(credential, method, uri, nonce, nc, cnonce, qop, algorithm)
-    }
+    pjsip_digest::create_digest_response(credential, method, uri, nonce, nc, cnonce, qop, algorithm)
 }

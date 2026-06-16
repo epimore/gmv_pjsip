@@ -3748,6 +3748,13 @@ static pj_status_t gmv_send_invite_on_owner(
 
     pjsip_tx_data *tdata = NULL;
     status = pjsip_inv_invite(invite, &tdata);
+    if (status == PJ_SUCCESS) {
+        status = gmv_set_subscription_body(
+            tdata,
+            "application/sdp",
+            (const unsigned char *)command->sdp,
+            command->sdp_len);
+    }
     if (status == PJ_SUCCESS && command->subject[0]) {
         gmv_add_string_header(
             tdata,

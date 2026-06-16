@@ -43,10 +43,15 @@ pub struct PlaySdpOptions {
     pub payload_type: u8,
 }
 
+fn format_ssrc(ssrc: u32) -> String {
+    format!("{ssrc:010}")
+}
+
 pub fn build_play_sdp(opts: PlaySdpOptions) -> String {
+    let ssrc = format_ssrc(opts.ssrc);
     format!(
         "v=0\r\no={} 0 0 IN IP4 {}\r\ns=Play\r\nc=IN IP4 {}\r\nt=0 0\r\nm=video {} RTP/AVP {}\r\na=recvonly\r\na=rtpmap:{} PS/90000\r\ny={}\r\n",
-        opts.ssrc, opts.ip, opts.ip, opts.port, opts.payload_type, opts.payload_type, opts.ssrc
+        ssrc, opts.ip, opts.ip, opts.port, opts.payload_type, opts.payload_type, ssrc
     )
 }
 
@@ -98,15 +103,16 @@ pub struct TalkSdpOptions {
 }
 
 pub fn build_talk_sdp(opts: TalkSdpOptions) -> String {
+    let ssrc = format_ssrc(opts.ssrc);
     format!(
         "v=0\r\no={} 0 0 IN IP4 {}\r\ns=Talk\r\nc=IN IP4 {}\r\nt=0 0\r\nm=audio {} RTP/AVP {}\r\na={}\r\na=rtpmap:{}\r\ny={}\r\n",
-        opts.ssrc,
+        ssrc,
         opts.ip,
         opts.ip,
         opts.port,
         opts.payload_type,
         opts.mode.as_sdp_attr(),
         opts.codec.rtpmap(opts.payload_type),
-        opts.ssrc
+        ssrc
     )
 }
