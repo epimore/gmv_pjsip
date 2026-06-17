@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use gmv_pjsip::{
     SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipError, SipInviteResponse,
     SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig,
-    SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
+    SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit,
+    SipTransportProtocol,
 };
 use log::{LevelFilter, Log, Metadata, Record};
 
@@ -64,9 +65,7 @@ fn start_runtime(
     mut config: SipRuntimeConfig,
 ) -> (SipRuntime, Receiver<SipRuntimeEvent>, SipRuntimeTransmits) {
     config.port = LOCAL_PORT;
-    let (mut runtime, events) = SipRuntime::start(config).expect("start runtime");
-    let transmits = runtime.take_transmits().expect("take transmit receiver");
-    (runtime, events, transmits)
+    SipRuntime::start_for_test(config).expect("start runtime")
 }
 
 fn receive_event(
@@ -99,7 +98,7 @@ fn receive_transmit(runtime: &mut SipRuntime, transmits: &SipRuntimeTransmits) -
 
 fn finish_transmit(runtime: &mut SipRuntime, transmit: &SipTransmit) -> String {
     runtime
-        .complete_send(transmit.send_id, Ok(transmit.data.len()))
+        .complete_test_send(transmit.send_id, Ok(transmit.data.len()))
         .expect("complete custom transport send");
     String::from_utf8_lossy(&transmit.data).into_owned()
 }
@@ -122,7 +121,7 @@ fn runtime_rejects_invalid_transport_config() {
         enable_tcp: false,
         ..SipRuntimeConfig::default()
     };
-    let error = match SipRuntime::start(config) {
+    let error = match SipRuntime::start_for_test(config) {
         Ok(_) => panic!("runtime unexpectedly accepted invalid config"),
         Err(error) => error,
     };
@@ -136,7 +135,7 @@ fn runtime_rejects_empty_log_target() {
         log_target: String::new(),
         ..SipRuntimeConfig::default()
     };
-    let error = match SipRuntime::start(config) {
+    let error = match SipRuntime::start_for_test(config) {
         Ok(_) => panic!("runtime unexpectedly accepted empty log target"),
         Err(error) => error,
     };
@@ -169,7 +168,7 @@ fn pjsip_logs_are_bridged_to_the_rust_log_facade() {
 fn runtime_enforces_one_active_instance() {
     let _guard = lock_tests();
     let (runtime, _events, _transmits) = start_runtime(SipRuntimeConfig::default());
-    let error = match SipRuntime::start(SipRuntimeConfig::default()) {
+    let error = match SipRuntime::start_for_test(SipRuntimeConfig::default()) {
         Ok(_) => panic!("second runtime unexpectedly started"),
         Err(error) => error,
     };
@@ -178,7 +177,64 @@ fn runtime_enforces_one_active_instance() {
 }
 
 #[test]
-fn custom_transport_handles_udp_and_fragmented_tcp() {
+fn runtime_owns_inherited_udp_socket() {
+    let _guard = lock_tests();
+    let runtime_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind runtime UDP");
+    let runtime_addr = runtime_socket.local_addr().expect("runtime UDP address");
+    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind peer UDP");
+    peer.set_nonblocking(true).expect("set peer nonblocking");
+    let peer_addr = peer.local_addr().expect("peer UDP address");
+    let config = SipRuntimeConfig {
+        bind_address: Ipv4Addr::LOCALHOST,
+        port: runtime_addr.port(),
+        enable_tcp: false,
+        log_target: TEST_LOG_TARGET.into(),
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, _events) = SipRuntime::start(
+        config,
+        SipRuntimeSockets {
+            udp: Some(runtime_socket),
+            tcp: None,
+            tls: None,
+        },
+    )
+    .expect("start socket-owned runtime");
+    let request = format!(
+        "OPTIONS sip:{runtime_addr} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {peer_addr};branch=z9hG4bK-owned-udp;rport\r\n\
+From: <sip:test@127.0.0.1>;tag=owned-udp\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: owned-udp-loopback\r\n\
+CSeq: 1 OPTIONS\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n"
+    );
+    peer.send_to(request.as_bytes(), runtime_addr)
+        .expect("send OPTIONS to runtime");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buffer = [0; 4096];
+    while Instant::now() < deadline {
+        runtime.poll().expect("poll runtime");
+        match peer.recv_from(&mut buffer) {
+            Ok((len, _)) => {
+                let response = String::from_utf8_lossy(&buffer[..len]);
+                assert!(response.starts_with("SIP/2.0 200"), "{response}");
+                runtime.shutdown().expect("shutdown runtime");
+                return;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("receive OPTIONS response: {err}"),
+        }
+    }
+    panic!("timed out waiting for UDP response");
+}
+
+#[test]
+fn runtime_adapter_handles_udp_and_fragmented_tcp() {
     let _guard = lock_tests();
     init_test_logger();
     TEST_LOGGER
@@ -204,7 +260,7 @@ Max-Forwards: 70\r\n\
 Content-Length: 0\r\n\r\n"
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -238,7 +294,7 @@ Content-Length: {}\r\n\r\n{}",
     );
     let split = message.len() / 2;
     runtime
-        .receive_packet(
+        .inject_test_packet(
             7,
             SipTransportProtocol::Tcp,
             local_addr(),
@@ -252,7 +308,7 @@ Content-Length: {}\r\n\r\n{}",
         Err(RecvTimeoutError::Timeout)
     ));
     runtime
-        .receive_packet(
+        .inject_test_packet(
             7,
             SipTransportProtocol::Tcp,
             local_addr(),
@@ -297,7 +353,7 @@ Content-Length: 0\r\n\r\n"
     ]
     .concat();
     runtime
-        .receive_packet(
+        .inject_test_packet(
             7,
             SipTransportProtocol::Tcp,
             local_addr(),
@@ -329,7 +385,7 @@ Content-Length: 0\r\n\r\n"
             && !message.contains("\\r\\nCSeq: 2 MESSAGE\\r\\n")
             && !message.contains("\r\nCSeq:")));
     runtime
-        .receive_packet(
+        .inject_test_packet(
             7,
             SipTransportProtocol::Tcp,
             local_addr(),
@@ -348,7 +404,7 @@ Content-Length: 0\r\n\r\n"
 }
 
 #[test]
-fn custom_transport_completes_register_auth_asynchronously() {
+fn runtime_adapter_completes_register_auth_asynchronously() {
     let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
@@ -372,7 +428,7 @@ Max-Forwards: 70\r\n\
 Content-Length: 0\r\n\r\n"
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -410,7 +466,7 @@ Content-Length: 0\r\n\r\n"
 }
 
 #[test]
-fn custom_transport_sends_message_and_correlates_response() {
+fn runtime_adapter_sends_message_and_correlates_response() {
     let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
@@ -453,7 +509,7 @@ Content-Length: 0\r\n\r\n",
         header_value(&request, "CSeq"),
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -470,7 +526,7 @@ Content-Length: 0\r\n\r\n",
 }
 
 #[test]
-fn custom_transport_owns_invite_dialog_info_and_bye() {
+fn runtime_adapter_owns_invite_dialog_info_and_bye() {
     let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
@@ -536,7 +592,7 @@ Content-Length: {}\r\n\r\n{}",
         remote_sdp,
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -582,7 +638,7 @@ Content-Length: 0\r\n\r\n",
         header_value(&info, "CSeq"),
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -623,7 +679,7 @@ Content-Length: 0\r\n\r\n",
         header_value(&bye, "CSeq"),
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -670,7 +726,7 @@ Content-Length: {}\r\n\r\n{}",
         remote_sdp,
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -704,7 +760,7 @@ Content-Length: 0\r\n\r\n",
         second_call_id,
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -727,7 +783,7 @@ Content-Length: 0\r\n\r\n",
 }
 
 #[test]
-fn custom_transport_owns_incoming_invite_and_cancel() {
+fn runtime_adapter_owns_incoming_invite_and_cancel() {
     let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
@@ -763,7 +819,7 @@ Content-Length: {}\r\n\r\n{}",
         sdp
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -796,7 +852,7 @@ Content-Length: 0\r\n\r\n",
         local_addr()
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -826,7 +882,7 @@ Content-Length: 0\r\n\r\n",
         .replace("device-invite", "unsupported-device")
         .replace("z9hG4bK-incoming", "z9hG4bK-unsupported");
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -856,7 +912,7 @@ Content-Length: 0\r\n\r\n",
 }
 
 #[test]
-fn custom_transport_owns_subscribe_refresh_notify_and_unsubscribe() {
+fn runtime_adapter_owns_subscribe_refresh_notify_and_unsubscribe() {
     let _guard = lock_tests();
     let config = SipRuntimeConfig {
         enable_tcp: false,
@@ -905,7 +961,7 @@ Content-Length: 0\r\n\r\n",
         remote
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -941,7 +997,7 @@ Content-Length: {}\r\n\r\n{}",
         notify_body
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -998,7 +1054,7 @@ Content-Length: 0\r\n\r\n",
         remote
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),
@@ -1045,7 +1101,7 @@ Content-Length: 0\r\n\r\n",
         header_value(&unsubscribe, "CSeq"),
     );
     runtime
-        .receive_packet(
+        .inject_test_packet(
             0,
             SipTransportProtocol::Udp,
             local_addr(),

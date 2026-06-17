@@ -41,9 +41,7 @@ pub fn start_runtime() -> (SipRuntime, SipRuntimeEvents, SipRuntimeTransmits) {
         enable_tcp: false,
         ..SipRuntimeConfig::default()
     };
-    let (mut runtime, events) = SipRuntime::start(config).expect("start PJSIP runtime");
-    let transmits = runtime.take_transmits().expect("take transmit receiver");
-    (runtime, events, transmits)
+    SipRuntime::start_for_test(config).expect("start PJSIP runtime")
 }
 
 pub fn receive_transmit(runtime: &mut SipRuntime, transmits: &SipRuntimeTransmits) -> SipTransmit {
@@ -67,7 +65,7 @@ pub fn receive_transmit_for(
 
 pub fn finish_transmit(runtime: &mut SipRuntime, transmit: &SipTransmit) -> String {
     runtime
-        .complete_send(transmit.send_id, Ok(transmit.data.len()))
+        .complete_test_send(transmit.send_id, Ok(transmit.data.len()))
         .expect("complete custom transport send");
     String::from_utf8_lossy(&transmit.data).into_owned()
 }
@@ -268,7 +266,7 @@ CSeq: {}\r\n",
 
     fn inject(&self, runtime: &mut SipRuntime, bytes: &[u8]) {
         runtime
-            .receive_packet(
+            .inject_test_packet(
                 0,
                 SipTransportProtocol::Udp,
                 platform_addr(),

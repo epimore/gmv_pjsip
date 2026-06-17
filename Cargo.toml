@@ -3,11 +3,15 @@ name = "gmv_pjsip"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-helpers = []
+
 [dependencies]
 bytes = "1"
 dashmap = "6"
 rand = "0.8"
 thiserror = "2"
 log = "0.4"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 gmv_pjsip_sys = { path = "gmv_pjsip_sys" }

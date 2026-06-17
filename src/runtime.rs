@@ -1,11 +1,14 @@
 use std::ffi::{c_char, c_void, CStr};
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::slice;
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(feature = "test-helpers")]
+use std::sync::mpsc::SyncSender;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
@@ -42,9 +45,11 @@ use gmv_pjsip_sys::{
     gmv_sip_transport_GMV_SIP_TRANSPORT_UDP as TRANSPORT_UDP, GMV_SIP_ABI_VERSION,
 };
 use log::{Level, LevelFilter};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
 use crate::error::{Result, SipError};
+use crate::io::{RuntimeIoCommand, SocketIoRuntime};
 use crate::transport::SipTransportProtocol;
 
 static RUNTIME_LOCK: Mutex<()> = Mutex::new(());
@@ -64,6 +69,22 @@ pub struct SipRuntimeConfig {
     pub auth_lookup_timeout: Duration,
     pub io_queue_capacity: usize,
     pub log_target: String,
+    pub tls: Option<SipTlsConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SipTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub ca_path: Option<PathBuf>,
+    pub require_client_cert: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct SipRuntimeSockets {
+    pub udp: Option<UdpSocket>,
+    pub tcp: Option<TcpListener>,
+    pub tls: Option<TcpListener>,
 }
 
 impl Default for SipRuntimeConfig {
@@ -81,6 +102,7 @@ impl Default for SipRuntimeConfig {
             auth_lookup_timeout: Duration::from_secs(3),
             io_queue_capacity: DEFAULT_IO_QUEUE_CAPACITY,
             log_target: "gmv_pjsip::runtime".into(),
+            tls: None,
         }
     }
 }
@@ -136,6 +158,7 @@ pub enum SipRuntimeEventKind {
     AuthRejected,
     OutboundResponse,
     IncomingInvite,
+    TransportClosed,
     Unknown(i32),
 }
 
@@ -170,6 +193,7 @@ pub struct SipRuntimeEvent {
 }
 
 pub type SipRuntimeEvents = Receiver<SipRuntimeEvent>;
+#[cfg(feature = "test-helpers")]
 pub type SipRuntimeTransmits = Receiver<SipTransmit>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,7 +280,13 @@ struct EventState {
 }
 
 struct TransmitState {
-    sender: SyncSender<SipTransmit>,
+    sender: TransmitSender,
+}
+
+enum TransmitSender {
+    SocketIo(tokio_mpsc::Sender<SipTransmit>),
+    #[cfg(feature = "test-helpers")]
+    Test(SyncSender<SipTransmit>),
 }
 
 struct LogState {
@@ -266,16 +296,124 @@ struct LogState {
 pub struct SipRuntime {
     raw: NonNull<gmv_sip_runtime_t>,
     stopped: bool,
-    _event_state: Box<EventState>,
+    event_state: Box<EventState>,
     _transmit_state: Box<TransmitState>,
     _log_state: Box<LogState>,
-    transmits: Option<SipRuntimeTransmits>,
+    io_commands: Receiver<RuntimeIoCommand>,
+    _socket_io: Option<SocketIoRuntime>,
     _runtime_guard: MutexGuard<'static, ()>,
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl SipRuntime {
-    pub fn start(config: SipRuntimeConfig) -> Result<(Self, SipRuntimeEvents)> {
+    pub fn start(
+        config: SipRuntimeConfig,
+        sockets: SipRuntimeSockets,
+    ) -> Result<(Self, SipRuntimeEvents)> {
+        validate_sockets(&config, &sockets)?;
+        let (poll_timeout_ms, auth_lookup_timeout_ms) = config.validate()?;
+        let runtime_guard = match RUNTIME_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Err(SipError::RuntimeActive),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+
+        let bind_address = config.bind_address.to_string();
+        let auth_realm = config.auth_realm.as_bytes();
+        let (sender, events) = mpsc::channel();
+        let mut event_state = Box::new(EventState { sender });
+        let (transmit_sender, transmits) = tokio_mpsc::channel(config.io_queue_capacity);
+        let (io_command_sender, io_commands) = mpsc::sync_channel(config.io_queue_capacity);
+        let mut transmit_state = Box::new(TransmitState {
+            sender: TransmitSender::SocketIo(transmit_sender),
+        });
+        let mut log_state = Box::new(LogState {
+            target: config.log_target.clone(),
+        });
+
+        let mut ffi_config = MaybeUninit::<gmv_sip_runtime_config_t>::uninit();
+        // SAFETY: The C initializer writes the complete config structure.
+        unsafe { gmv_sip_runtime_config_init(ffi_config.as_mut_ptr()) };
+        // SAFETY: The initializer completed for a valid non-null pointer.
+        let mut ffi_config = unsafe { ffi_config.assume_init() };
+        ffi_config.bind_address = gmv_sip_string_view_t {
+            ptr: bind_address.as_ptr().cast(),
+            len: bind_address.len(),
+        };
+        ffi_config.port = config.port;
+        ffi_config.enable_udp = u8::from(sockets.udp.is_some());
+        ffi_config.enable_tcp = u8::from(sockets.tcp.is_some() || sockets.tls.is_some());
+        ffi_config.async_count = config.async_count;
+        ffi_config.poll_timeout_ms = poll_timeout_ms;
+        ffi_config.event_callback = Some(runtime_event_callback);
+        ffi_config.event_user_data = ptr::from_mut(event_state.as_mut()).cast();
+        ffi_config.auth_realm = gmv_sip_string_view_t {
+            ptr: auth_realm.as_ptr().cast(),
+            len: auth_realm.len(),
+        };
+        ffi_config.auth_algorithm_type = auth_algorithm_id(config.auth_algorithm);
+        ffi_config.max_pending_auth = config.max_pending_auth;
+        ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
+        ffi_config.send_callback = Some(runtime_send_callback);
+        ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
+        ffi_config.log_level = pjsip_log_level(log::max_level());
+        ffi_config.log_callback = Some(runtime_log_callback);
+        ffi_config.log_user_data = ptr::from_mut(log_state.as_mut()).cast();
+
+        let mut raw = ptr::null_mut();
+        // SAFETY: The config, callback state, and output pointer remain valid
+        // for the duration of this call. The C runtime copies config strings.
+        let status = unsafe { gmv_sip_runtime_create(&ffi_config, &mut raw) };
+        if status != 0 {
+            return Err(pjsip_error("runtime_create", status));
+        }
+        let raw = NonNull::new(raw).ok_or_else(|| {
+            SipError::Internal("PJSIP runtime create returned a null handle".into())
+        })?;
+
+        // SAFETY: `raw` is the uniquely owned handle returned by create.
+        let status = unsafe { gmv_sip_runtime_start(raw.as_ptr()) };
+        if status != 0 {
+            // SAFETY: Start failure leaves the allocated runtime valid for
+            // destruction and no Rust owner has been constructed yet.
+            unsafe { gmv_sip_runtime_destroy(raw.as_ptr()) };
+            return Err(pjsip_error("runtime_start", status));
+        }
+        let socket_io = match SocketIoRuntime::start(
+            sockets,
+            transmits,
+            io_command_sender,
+            config.log_target.clone(),
+        ) {
+            Ok(socket_io) => socket_io,
+            Err(err) => {
+                // SAFETY: Start succeeded and the runtime is still uniquely owned here.
+                let _ = unsafe { gmv_sip_runtime_stop(raw.as_ptr()) };
+                unsafe { gmv_sip_runtime_destroy(raw.as_ptr()) };
+                return Err(err);
+            }
+        };
+
+        Ok((
+            Self {
+                raw,
+                stopped: false,
+                event_state,
+                _transmit_state: transmit_state,
+                _log_state: log_state,
+                io_commands,
+                _socket_io: Some(socket_io),
+                _runtime_guard: runtime_guard,
+                _not_send_or_sync: PhantomData,
+            },
+            events,
+        ))
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn start_for_test(
+        config: SipRuntimeConfig,
+    ) -> Result<(Self, SipRuntimeEvents, SipRuntimeTransmits)> {
         let (poll_timeout_ms, auth_lookup_timeout_ms) = config.validate()?;
         let runtime_guard = match RUNTIME_LOCK.try_lock() {
             Ok(guard) => guard,
@@ -288,8 +426,9 @@ impl SipRuntime {
         let (sender, events) = mpsc::channel();
         let mut event_state = Box::new(EventState { sender });
         let (transmit_sender, transmits) = mpsc::sync_channel(config.io_queue_capacity);
+        let (_io_command_sender, io_commands) = mpsc::sync_channel(config.io_queue_capacity);
         let mut transmit_state = Box::new(TransmitState {
-            sender: transmit_sender,
+            sender: TransmitSender::Test(transmit_sender),
         });
         let mut log_state = Box::new(LogState {
             target: config.log_target.clone(),
@@ -348,21 +487,38 @@ impl SipRuntime {
             Self {
                 raw,
                 stopped: false,
-                _event_state: event_state,
+                event_state,
                 _transmit_state: transmit_state,
                 _log_state: log_state,
-                transmits: Some(transmits),
+                io_commands,
+                _socket_io: None,
                 _runtime_guard: runtime_guard,
                 _not_send_or_sync: PhantomData,
             },
             events,
+            transmits,
         ))
     }
 
-    pub fn take_transmits(&mut self) -> Result<SipRuntimeTransmits> {
-        self.transmits.take().ok_or_else(|| {
-            SipError::InvalidConfig("runtime transmit receiver was already taken".into())
-        })
+    #[cfg(feature = "test-helpers")]
+    pub fn inject_test_packet(
+        &mut self,
+        association_id: u64,
+        protocol: SipTransportProtocol,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        data: &[u8],
+    ) -> Result<()> {
+        self.receive_packet(association_id, protocol, local_addr, remote_addr, data)
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn complete_test_send(
+        &mut self,
+        send_id: u64,
+        result: std::result::Result<usize, i32>,
+    ) -> Result<()> {
+        self.complete_send(send_id, result)
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -385,6 +541,7 @@ impl SipRuntime {
                 "cannot poll after runtime stop".into(),
             ));
         }
+        self.drain_io_commands();
         // SAFETY: The runtime handle is valid and this non-Send wrapper keeps
         // all PJSIP calls on the thread that created the runtime.
         let status = unsafe { gmv_sip_runtime_poll(self.raw.as_ptr()) };
@@ -392,6 +549,75 @@ impl SipRuntime {
             return Err(pjsip_error("runtime_poll", status));
         }
         Ok(())
+    }
+
+    fn drain_io_commands(&mut self) {
+        while let Ok(command) = self.io_commands.try_recv() {
+            match command {
+                RuntimeIoCommand::Receive {
+                    association_id,
+                    protocol,
+                    local_addr,
+                    remote_addr,
+                    data,
+                } => {
+                    if let Err(err) =
+                        self.receive_packet(association_id, protocol, local_addr, remote_addr, &data)
+                    {
+                        log::warn!(
+                            "deliver SIP socket packet failed: association_id={}, protocol={protocol:?}, err={err}",
+                            association_id
+                        );
+                    }
+                }
+                RuntimeIoCommand::CompleteSend { send_id, result } => {
+                    if let Err(err) = self.complete_send(send_id, result) {
+                        log::warn!("complete SIP socket send failed: send_id={send_id}, err={err}");
+                    }
+                }
+                RuntimeIoCommand::TransportClosed {
+                    association_id,
+                    protocol,
+                    local_addr,
+                    remote_addr,
+                    status,
+                } => {
+                    if let Err(err) = self.close_transport(association_id, protocol, status) {
+                        log::warn!(
+                            "close SIP transport failed: association_id={association_id}, err={err}"
+                        );
+                    }
+                    let _ = self.event_state.sender.send(SipRuntimeEvent {
+                        event_id: 0,
+                        kind: SipRuntimeEventKind::TransportClosed,
+                        protocol: Some(protocol),
+                        status_code: None,
+                        pj_status: status,
+                        method: None,
+                        call_id: None,
+                        cseq: None,
+                        content_type: None,
+                        body: Vec::new(),
+                        local_addr: Some(local_addr),
+                        remote_addr: Some(remote_addr),
+                        lookup_id: None,
+                        device_id: None,
+                        realm: None,
+                        expires_seconds: None,
+                        contact: None,
+                        user_agent: None,
+                        gb_version: None,
+                        operation_id: None,
+                        association_id: Some(association_id),
+                        from_header: None,
+                        to_header: None,
+                        subject: None,
+                        event: None,
+                        subscription_state: None,
+                    });
+                }
+            }
+        }
     }
 
     pub fn complete_auth_lookup(
@@ -456,7 +682,7 @@ impl SipRuntime {
         Ok(())
     }
 
-    pub fn receive_packet(
+    fn receive_packet(
         &mut self,
         association_id: u64,
         protocol: SipTransportProtocol,
@@ -474,15 +700,16 @@ impl SipRuntime {
                 "received SIP packet must not be empty".into(),
             ));
         }
-        if protocol == SipTransportProtocol::Tls || !local_addr.is_ipv4() || !remote_addr.is_ipv4()
-        {
+        if !local_addr.is_ipv4() || !remote_addr.is_ipv4() {
             return Err(SipError::InvalidConfig(
-                "custom transport prototype supports IPv4 UDP/TCP only".into(),
+                "SIP runtime socket adapter supports IPv4 only".into(),
             ));
         }
-        if protocol == SipTransportProtocol::Tcp && association_id == 0 {
+        if matches!(protocol, SipTransportProtocol::Tcp | SipTransportProtocol::Tls)
+            && association_id == 0
+        {
             return Err(SipError::InvalidConfig(
-                "TCP association_id must be non-zero".into(),
+                "reliable transport association_id must be non-zero".into(),
             ));
         }
 
@@ -508,7 +735,7 @@ impl SipRuntime {
         Ok(())
     }
 
-    pub fn complete_send(
+    fn complete_send(
         &mut self,
         send_id: u64,
         result: std::result::Result<usize, i32>,
@@ -927,9 +1154,10 @@ unsafe extern "C" fn runtime_send_callback(
         local_addr,
         remote_addr,
     };
-    match state.sender.try_send(transmit) {
-        Ok(()) => 0,
-        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => -1,
+    match &state.sender {
+        TransmitSender::SocketIo(sender) => i32::from(sender.try_send(transmit).is_ok()) - 1,
+        #[cfg(feature = "test-helpers")]
+        TransmitSender::Test(sender) => i32::from(sender.try_send(transmit).is_ok()) - 1,
     }
 }
 
@@ -1041,6 +1269,30 @@ fn copy_transport(value: i32) -> Option<SipTransportProtocol> {
 fn copy_socket_addr(view: gmv_sip_string_view_t, port: u16) -> Option<SocketAddr> {
     let ip = copy_string_view(view)?.parse().ok()?;
     Some(SocketAddr::new(ip, port))
+}
+
+fn validate_sockets(config: &SipRuntimeConfig, sockets: &SipRuntimeSockets) -> Result<()> {
+    if sockets.udp.is_none() && sockets.tcp.is_none() && sockets.tls.is_none() {
+        return Err(SipError::InvalidConfig(
+            "at least one SIP UDP, TCP, or TLS socket must be provided".into(),
+        ));
+    }
+    if sockets.udp.is_some() && !config.enable_udp {
+        return Err(SipError::InvalidConfig(
+            "UDP socket was provided while enable_udp is false".into(),
+        ));
+    }
+    if sockets.tcp.is_some() && !config.enable_tcp {
+        return Err(SipError::InvalidConfig(
+            "TCP listener was provided while enable_tcp is false".into(),
+        ));
+    }
+    if sockets.tls.is_some() && config.tls.is_none() {
+        return Err(SipError::InvalidConfig(
+            "TLS listener requires SipTlsConfig".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn duration_millis(name: &str, duration: Duration) -> Result<u32> {

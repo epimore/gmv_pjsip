@@ -8,8 +8,9 @@
 pub mod auth;
 pub mod error;
 pub mod gb28181;
+mod io;
 pub mod message;
-pub mod runtime;
+mod runtime;
 pub mod transport;
 
 pub use bytes::Bytes;
@@ -24,6 +25,8 @@ pub use message::SipMethod;
 pub use runtime::{
     SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipInviteResponse, SipOutboundInvite,
     SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
-    SipRuntimeEventKind, SipRuntimeEvents, SipRuntimeTransmits, SipTransmit,
+    SipRuntimeEventKind, SipRuntimeEvents, SipRuntimeSockets, SipTlsConfig,
 };
+#[cfg(feature = "test-helpers")]
+pub use runtime::{SipRuntimeTransmits, SipTransmit};
 pub use transport::{SipAssociation, SipPacketMeta, SipTransportProtocol};

@@ -147,7 +147,7 @@ fn dialog_round_trip(
 }
 
 #[test]
-fn normal_gb28181_business_dialogues_use_custom_transport() {
+fn normal_gb28181_business_dialogues_use_runtime_adapter() {
     let _guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
