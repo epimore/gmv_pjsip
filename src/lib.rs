@@ -1,7 +1,7 @@
 //! Safe GB28181-oriented native PJSIP runtime.
 //!
 //! Boundary:
-//! - `gmv_pjsip_sys` exposes the versioned C shim and custom transport.
+//! - `gmv_pjsip_sys` exposes the versioned C shim and private PJSIP adapter.
 //! - `gmv_pjsip` owns PJSIP runtime, transaction, dialog, INVITE, and subscription state.
 //! - `session` depends on this crate and never manipulates raw PJSIP pointers.
 

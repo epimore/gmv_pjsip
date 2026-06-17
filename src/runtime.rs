@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::slice;
-use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(feature = "test-helpers")]
 use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
@@ -561,9 +561,13 @@ impl SipRuntime {
                     remote_addr,
                     data,
                 } => {
-                    if let Err(err) =
-                        self.receive_packet(association_id, protocol, local_addr, remote_addr, &data)
-                    {
+                    if let Err(err) = self.receive_packet(
+                        association_id,
+                        protocol,
+                        local_addr,
+                        remote_addr,
+                        &data,
+                    ) {
                         log::warn!(
                             "deliver SIP socket packet failed: association_id={}, protocol={protocol:?}, err={err}",
                             association_id
@@ -705,8 +709,10 @@ impl SipRuntime {
                 "SIP runtime socket adapter supports IPv4 only".into(),
             ));
         }
-        if matches!(protocol, SipTransportProtocol::Tcp | SipTransportProtocol::Tls)
-            && association_id == 0
+        if matches!(
+            protocol,
+            SipTransportProtocol::Tcp | SipTransportProtocol::Tls
+        ) && association_id == 0
         {
             return Err(SipError::InvalidConfig(
                 "reliable transport association_id must be non-zero".into(),
@@ -1328,7 +1334,9 @@ fn bytes_view(value: &[u8]) -> gmv_sip_string_view_t {
 }
 
 fn invite_to_uri(target_uri: &str, subject: Option<&str>) -> String {
-    let Some((_, host)) = target_uri.strip_prefix("sip:").and_then(|value| value.split_once('@'))
+    let Some((_, host)) = target_uri
+        .strip_prefix("sip:")
+        .and_then(|value| value.split_once('@'))
     else {
         return format!("<{target_uri}>");
     };

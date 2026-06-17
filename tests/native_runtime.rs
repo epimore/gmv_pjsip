@@ -93,13 +93,13 @@ fn receive_transmit(runtime: &mut SipRuntime, transmits: &SipRuntimeTransmits) -
             return transmit;
         }
     }
-    panic!("timed out waiting for custom transport transmit");
+    panic!("timed out waiting for runtime adapter transmit");
 }
 
 fn finish_transmit(runtime: &mut SipRuntime, transmit: &SipTransmit) -> String {
     runtime
         .complete_test_send(transmit.send_id, Ok(transmit.data.len()))
-        .expect("complete custom transport send");
+        .expect("complete runtime adapter send");
     String::from_utf8_lossy(&transmit.data).into_owned()
 }
 
@@ -399,7 +399,7 @@ Content-Length: 0\r\n\r\n"
 
     runtime
         .close_transport(7, SipTransportProtocol::Tcp, 0)
-        .expect("close TCP custom transport");
+        .expect("close TCP runtime adapter");
     runtime.shutdown().expect("shutdown runtime");
 }
 

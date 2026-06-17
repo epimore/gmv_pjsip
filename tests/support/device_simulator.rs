@@ -45,7 +45,7 @@ pub fn start_runtime() -> (SipRuntime, SipRuntimeEvents, SipRuntimeTransmits) {
 }
 
 pub fn receive_transmit(runtime: &mut SipRuntime, transmits: &SipRuntimeTransmits) -> SipTransmit {
-    receive_transmit_for(runtime, transmits, "custom transport transmit")
+    receive_transmit_for(runtime, transmits, "runtime adapter transmit")
 }
 
 pub fn receive_transmit_for(
@@ -66,7 +66,7 @@ pub fn receive_transmit_for(
 pub fn finish_transmit(runtime: &mut SipRuntime, transmit: &SipTransmit) -> String {
     runtime
         .complete_test_send(transmit.send_id, Ok(transmit.data.len()))
-        .expect("complete custom transport send");
+        .expect("complete runtime adapter send");
     String::from_utf8_lossy(&transmit.data).into_owned()
 }
 

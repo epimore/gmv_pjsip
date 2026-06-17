@@ -5,7 +5,7 @@
 ```text
 session Rust IO  -> UDP datagrams / TCP chunks
 gmv_pjsip        -> owned commands, events, and send completions
-gmv_pjsip_sys    -> versioned C shim and PJSIP custom transport
+gmv_pjsip_sys    -> versioned C shim and private PJSIP adapter
 PJSIP            -> parser, transaction, dialog, INVITE, auth, and evsub
 ```
 

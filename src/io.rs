@@ -1,6 +1,6 @@
 use std::net::{SocketAddr, TcpListener, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -63,7 +63,13 @@ impl SocketIoRuntime {
                         return;
                     }
                 };
-                runtime.block_on(run_io(sockets, transmits, commands, shutdown_rx, log_target));
+                runtime.block_on(run_io(
+                    sockets,
+                    transmits,
+                    commands,
+                    shutdown_rx,
+                    log_target,
+                ));
             })
             .map_err(|err| SipError::Internal(format!("spawn SIP socket IO task failed: {err}")))?;
         Ok(Self {
@@ -103,7 +109,12 @@ async fn run_io(
         None => None,
     };
     if let Some(socket) = udp.clone() {
-        tokio::spawn(read_udp(socket, commands.clone(), shutdown.clone(), log_target.clone()));
+        tokio::spawn(read_udp(
+            socket,
+            commands.clone(),
+            shutdown.clone(),
+            log_target.clone(),
+        ));
     }
 
     if let Some(listener) = sockets.tcp {
