@@ -396,6 +396,6 @@ fn log_outgoing_sip_packet(transmit: &SipTransmit) {
 fn escape_payload(data: &[u8]) -> String {
     String::from_utf8_lossy(data)
         // .replace('\\', "\\\\")
-        // .replace('\r', "\\r")
+        .replace('\r', "\\r")
         .replace('\n', "\\n")
 }
