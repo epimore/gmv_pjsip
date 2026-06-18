@@ -69,6 +69,7 @@ pub struct SipRuntimeConfig {
     pub max_pending_auth: u32,
     pub auth_lookup_timeout: Duration,
     pub io_queue_capacity: usize,
+    pub user_agent: String,
     pub tls: Option<SipTlsConfig>,
 }
 
@@ -101,6 +102,7 @@ impl Default for SipRuntimeConfig {
             max_pending_auth: 20_000,
             auth_lookup_timeout: Duration::from_secs(3),
             io_queue_capacity: DEFAULT_IO_QUEUE_CAPACITY,
+            user_agent: "GMV-PJSIP/0.1".into(),
             tls: None,
         }
     }
@@ -131,6 +133,17 @@ impl SipRuntimeConfig {
         if self.io_queue_capacity == 0 {
             return Err(invalid_config(
                 "io_queue_capacity must be greater than zero".into(),
+            ));
+        }
+        if self.user_agent.is_empty()
+            || self
+                .user_agent
+                .as_bytes()
+                .iter()
+                .any(|byte| matches!(byte, 0 | b'\r' | b'\n'))
+        {
+            return Err(invalid_config(
+                "user_agent must be non-empty and contain no NUL, CR, or LF byte".into(),
             ));
         }
         Ok((
@@ -358,6 +371,7 @@ impl SipRuntime {
 
         let bind_address = config.bind_address.to_string();
         let auth_realm = config.auth_realm.as_bytes();
+        let user_agent = config.user_agent.as_bytes();
         let (sender, events) = mpsc::channel();
         let mut event_state = Box::new(EventState { sender });
         let (transmit_sender, transmits) = tokio_mpsc::channel(config.io_queue_capacity);
@@ -388,6 +402,10 @@ impl SipRuntime {
         ffi_config.auth_algorithm_type = auth_algorithm_id(config.auth_algorithm);
         ffi_config.max_pending_auth = config.max_pending_auth;
         ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
+        ffi_config.user_agent = gmv_sip_string_view_t {
+            ptr: user_agent.as_ptr().cast(),
+            len: user_agent.len(),
+        };
         ffi_config.send_callback = Some(runtime_send_callback);
         ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
         if base::log::log_enabled!(base::log::Level::Trace) {
@@ -452,6 +470,7 @@ impl SipRuntime {
 
         let bind_address = config.bind_address.to_string();
         let auth_realm = config.auth_realm.as_bytes();
+        let user_agent = config.user_agent.as_bytes();
         let (sender, events) = mpsc::channel();
         let mut event_state = Box::new(EventState { sender });
         let (transmit_sender, transmits) = mpsc::sync_channel(config.io_queue_capacity);
@@ -482,6 +501,10 @@ impl SipRuntime {
         ffi_config.auth_algorithm_type = auth_algorithm_id(config.auth_algorithm);
         ffi_config.max_pending_auth = config.max_pending_auth;
         ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
+        ffi_config.user_agent = gmv_sip_string_view_t {
+            ptr: user_agent.as_ptr().cast(),
+            len: user_agent.len(),
+        };
         ffi_config.send_callback = Some(runtime_send_callback);
         ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
         if base::log::log_enabled!(base::log::Level::Trace) {

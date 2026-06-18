@@ -14,6 +14,7 @@
 
 #define GMV_SIP_DEFAULT_BIND_ADDRESS "127.0.0.1"
 #define GMV_SIP_DEFAULT_AUTH_REALM "3402000000"
+#define GMV_SIP_DEFAULT_USER_AGENT "GMV-PJSIP/0.1"
 #define GMV_SIP_DEFAULT_POLL_TIMEOUT_MS 10u
 #define GMV_SIP_DEFAULT_AUTH_LOOKUP_TIMEOUT_MS 3000u
 #define GMV_SIP_DEFAULT_MAX_PENDING_AUTH 20000u
@@ -23,6 +24,7 @@
 #define GMV_SIP_CONTENT_TYPE_CAPACITY 128u
 #define GMV_SIP_CONTACT_CAPACITY 512u
 #define GMV_SIP_AUTH_REALM_CAPACITY 128u
+#define GMV_SIP_USER_AGENT_CAPACITY 256u
 #define GMV_SIP_DEVICE_ID_CAPACITY 128u
 #define GMV_SIP_AUTH_SECRET_CAPACITY 512u
 #define GMV_SIP_NONCE_CAPACITY 33u
@@ -248,6 +250,7 @@ struct gmv_subscription_call {
 struct gmv_sip_runtime {
     char bind_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
     char auth_realm[GMV_SIP_AUTH_REALM_CAPACITY];
+    char user_agent[GMV_SIP_USER_AGENT_CAPACITY];
     uint16_t requested_port;
     uint8_t enable_udp;
     uint8_t enable_tcp;
@@ -1363,6 +1366,21 @@ static void gmv_add_string_header(
     pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr *)header);
 }
 
+static pj_status_t gmv_set_user_agent(pjsip_tx_data *tdata) {
+    gmv_sip_runtime_t *runtime = g_active_runtime;
+    if (!runtime || !tdata || !tdata->msg) {
+        return PJ_SUCCESS;
+    }
+
+    pj_str_t name = pj_str("User-Agent");
+    pjsip_hdr *header = NULL;
+    while ((header = pjsip_msg_find_hdr_by_name(tdata->msg, &name, NULL)) != NULL) {
+        pj_list_erase(header);
+    }
+    gmv_add_string_header(tdata, "User-Agent", runtime->user_agent);
+    return PJ_SUCCESS;
+}
+
 static int32_t gmv_message_expires(const pjsip_rx_data *rdata) {
     if (!rdata || !rdata->msg_info.msg) {
         return -1;
@@ -2379,7 +2397,6 @@ static void gmv_add_options_response_headers(
         "Allow",
         "REGISTER, MESSAGE, OPTIONS");
     gmv_add_string_header(tdata, "Supported", "gb28181");
-    gmv_add_string_header(tdata, "User-Agent", "GMV-PJSIP/0.1");
 
     pjsip_generic_string_hdr *gb_version =
         gmv_generic_header(rdata, "X-GB-Ver");
@@ -3570,6 +3587,7 @@ uint32_t gmv_sip_abi_version(void) {
 void gmv_sip_runtime_config_init(gmv_sip_runtime_config_t *config) {
     static const char default_address[] = GMV_SIP_DEFAULT_BIND_ADDRESS;
     static const char default_realm[] = GMV_SIP_DEFAULT_AUTH_REALM;
+    static const char default_user_agent[] = GMV_SIP_DEFAULT_USER_AGENT;
     if (!config) {
         return;
     }
@@ -3589,6 +3607,8 @@ void gmv_sip_runtime_config_init(gmv_sip_runtime_config_t *config) {
     config->auth_lookup_timeout_ms =
         GMV_SIP_DEFAULT_AUTH_LOOKUP_TIMEOUT_MS;
     config->log_level = 0;
+    config->user_agent.ptr = default_user_agent;
+    config->user_agent.len = sizeof(default_user_agent) - 1u;
 }
 
 int32_t gmv_sip_runtime_create(
@@ -3604,10 +3624,17 @@ int32_t gmv_sip_runtime_create(
         config->version != GMV_SIP_ABI_VERSION ||
         (!config->enable_udp && !config->enable_tcp) ||
         !GMV_SIP_CONFIG_HAS(config, log_user_data) ||
+        !GMV_SIP_CONFIG_HAS(config, user_agent) ||
         !config->send_callback ||
         config->log_level > PJ_LOG_MAX_LEVEL ||
         (config->bind_address.len > 0 && !config->bind_address.ptr) ||
-        config->bind_address.len >= GMV_SIP_BIND_ADDRESS_CAPACITY) {
+        config->bind_address.len >= GMV_SIP_BIND_ADDRESS_CAPACITY ||
+        !config->user_agent.ptr ||
+        config->user_agent.len == 0 ||
+        config->user_agent.len >= GMV_SIP_USER_AGENT_CAPACITY ||
+        memchr(config->user_agent.ptr, '\0', config->user_agent.len) ||
+        memchr(config->user_agent.ptr, '\r', config->user_agent.len) ||
+        memchr(config->user_agent.ptr, '\n', config->user_agent.len)) {
         return PJ_EINVAL;
     }
 
@@ -3640,6 +3667,11 @@ int32_t gmv_sip_runtime_create(
     runtime->log_level = config->log_level;
     runtime->log_callback = config->log_callback;
     runtime->log_user_data = config->log_user_data;
+    memcpy(
+        runtime->user_agent,
+        config->user_agent.ptr,
+        config->user_agent.len);
+    runtime->user_agent[config->user_agent.len] = '\0';
 
     const char *auth_realm = GMV_SIP_DEFAULT_AUTH_REALM;
     size_t auth_realm_len = strlen(auth_realm);
@@ -3771,6 +3803,8 @@ int32_t gmv_sip_runtime_start(gmv_sip_runtime_t *runtime) {
     runtime->module.priority =
         PJSIP_MOD_PRIORITY_DIALOG_USAGE - 1;
     runtime->module.on_rx_request = &gmv_on_rx_request;
+    runtime->module.on_tx_request = &gmv_set_user_agent;
+    runtime->module.on_tx_response = &gmv_set_user_agent;
     runtime->module.on_tsx_state = &gmv_on_tsx_state;
     status = pjsip_endpt_register_module(runtime->endpoint, &runtime->module);
     if (status != PJ_SUCCESS) {

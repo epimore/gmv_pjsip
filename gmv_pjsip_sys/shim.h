@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define GMV_SIP_ABI_VERSION 8u
+#define GMV_SIP_ABI_VERSION 9u
 
 typedef struct gmv_sip_runtime gmv_sip_runtime_t;
 
@@ -131,6 +131,7 @@ typedef struct gmv_sip_runtime_config {
     uint32_t log_level;
     gmv_sip_log_callback log_callback;
     void *log_user_data;
+    gmv_sip_string_view_t user_agent;
 } gmv_sip_runtime_config_t;
 
 typedef struct gmv_sip_received_packet {

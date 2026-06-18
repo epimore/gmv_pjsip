@@ -17,6 +17,7 @@ static TEST_LOGGER: TestLogger = TestLogger {
     messages: Mutex::new(Vec::new()),
 };
 const LOCAL_PORT: u16 = 5060;
+const TEST_USER_AGENT: &str = "Gmv test-version";
 
 struct TestLogger {
     messages: Mutex<Vec<String>>,
@@ -64,6 +65,7 @@ fn start_runtime(
     mut config: SipRuntimeConfig,
 ) -> (SipRuntime, Receiver<SipRuntimeEvent>, SipRuntimeTransmits) {
     config.port = LOCAL_PORT;
+    config.user_agent = TEST_USER_AGENT.into();
     SipRuntime::start_for_test(config).expect("start runtime")
 }
 
@@ -99,7 +101,18 @@ fn finish_transmit(runtime: &mut SipRuntime, transmit: &SipTransmit) -> String {
     runtime
         .complete_test_send(transmit.send_id, Ok(transmit.data.len()))
         .expect("complete runtime adapter send");
-    String::from_utf8_lossy(&transmit.data).into_owned()
+    let message = String::from_utf8_lossy(&transmit.data).into_owned();
+    let user_agents = message
+        .lines()
+        .filter_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header
+                .eq_ignore_ascii_case("User-Agent")
+                .then_some(value.trim())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(user_agents, [TEST_USER_AGENT]);
+    message
 }
 
 fn header_value<'a>(message: &'a str, name: &str) -> &'a str {
@@ -122,6 +135,22 @@ fn runtime_rejects_invalid_transport_config() {
     };
     let error = match SipRuntime::start_for_test(config) {
         Ok(_) => panic!("runtime unexpectedly accepted invalid config"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("invalid SIP runtime configuration"));
+}
+
+#[test]
+fn runtime_rejects_invalid_user_agent() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        user_agent: "Gmv test\r\nInjected: value".into(),
+        ..SipRuntimeConfig::default()
+    };
+    let error = match SipRuntime::start_for_test(config) {
+        Ok(_) => panic!("runtime unexpectedly accepted invalid User-Agent"),
         Err(error) => error,
     };
     assert!(error
