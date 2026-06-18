@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define GMV_SIP_ABI_VERSION 6u
+#define GMV_SIP_ABI_VERSION 8u
 
 typedef struct gmv_sip_runtime gmv_sip_runtime_t;
 
@@ -75,6 +75,13 @@ typedef struct gmv_sip_event {
     gmv_sip_string_view_t subject;
     gmv_sip_string_view_t event;
     gmv_sip_string_view_t subscription_state;
+    uint32_t dialog_local_cseq;
+    gmv_sip_string_view_t dialog_local_uri;
+    gmv_sip_string_view_t dialog_remote_uri;
+    gmv_sip_string_view_t dialog_local_tag;
+    gmv_sip_string_view_t dialog_remote_tag;
+    gmv_sip_string_view_t dialog_remote_target;
+    gmv_sip_string_view_t dialog_route_set;
 } gmv_sip_event_t;
 
 typedef void (*gmv_sip_event_callback)(
@@ -175,6 +182,9 @@ typedef struct gmv_sip_outbound_invite {
     uint64_t operation_id;
     uint64_t association_id;
     int32_t transport;
+    uint32_t local_cseq;
+    gmv_sip_string_view_t call_id;
+    gmv_sip_string_view_t local_tag;
     gmv_sip_string_view_t target_uri;
     gmv_sip_string_view_t to_uri;
     gmv_sip_string_view_t from_uri;
@@ -192,6 +202,27 @@ typedef struct gmv_sip_dialog_request {
     gmv_sip_string_view_t content_type;
     gmv_sip_string_view_t body;
 } gmv_sip_dialog_request_t;
+
+typedef struct gmv_sip_restored_dialog_request {
+    uint32_t size;
+    uint32_t version;
+    uint64_t operation_id;
+    int32_t method;
+    uint64_t association_id;
+    int32_t transport;
+    uint32_t local_cseq;
+    gmv_sip_string_view_t call_id;
+    gmv_sip_string_view_t local_uri;
+    gmv_sip_string_view_t remote_uri;
+    gmv_sip_string_view_t local_tag;
+    gmv_sip_string_view_t remote_tag;
+    gmv_sip_string_view_t remote_target;
+    gmv_sip_string_view_t route_set;
+    gmv_sip_string_view_t remote_address;
+    uint16_t remote_port;
+    gmv_sip_string_view_t content_type;
+    gmv_sip_string_view_t body;
+} gmv_sip_restored_dialog_request_t;
 
 typedef struct gmv_sip_invite_response {
     uint32_t size;
@@ -237,6 +268,9 @@ int32_t gmv_sip_runtime_send_invite(
 int32_t gmv_sip_runtime_send_dialog_request(
     gmv_sip_runtime_t *runtime,
     const gmv_sip_dialog_request_t *request);
+int32_t gmv_sip_runtime_send_restored_dialog_request(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_restored_dialog_request_t *request);
 int32_t gmv_sip_runtime_respond_invite(
     gmv_sip_runtime_t *runtime,
     const gmv_sip_invite_response_t *response);

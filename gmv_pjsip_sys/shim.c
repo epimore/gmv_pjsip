@@ -29,6 +29,9 @@
 #define GMV_SIP_CALL_ID_CAPACITY 256u
 #define GMV_SIP_REASON_CAPACITY 128u
 #define GMV_SIP_SUBJECT_CAPACITY 512u
+#define GMV_SIP_URI_CAPACITY 1024u
+#define GMV_SIP_TAG_CAPACITY 256u
+#define GMV_SIP_ROUTE_SET_CAPACITY 4096u
 #define GMV_SIP_CONFIG_HAS(config, field) \
     ((config)->size >= \
      offsetof(gmv_sip_runtime_config_t, field) + sizeof((config)->field))
@@ -84,6 +87,9 @@ typedef struct gmv_outbound_operation {
 typedef struct gmv_dialog_operation {
     gmv_sip_runtime_t *runtime;
     uint64_t operation_id;
+    pjsip_dialog *restored_dialog;
+    int restored_session_held;
+    struct gmv_invite_call *restored_call;
 } gmv_dialog_operation_t;
 
 typedef struct gmv_receive_command {
@@ -127,6 +133,9 @@ typedef struct gmv_invite_command {
     uint64_t operation_id;
     uint64_t association_id;
     int32_t transport;
+    uint32_t local_cseq;
+    char call_id[GMV_SIP_CALL_ID_CAPACITY];
+    char local_tag[GMV_SIP_TAG_CAPACITY];
     char target_uri[1024];
     char to_uri[1024];
     char from_uri[1024];
@@ -144,6 +153,18 @@ typedef struct gmv_dialog_command {
     char content_type[GMV_SIP_CONTENT_TYPE_CAPACITY];
     unsigned char *body;
     size_t body_len;
+    int restored;
+    uint64_t association_id;
+    int32_t transport;
+    uint32_t local_cseq;
+    uint16_t remote_port;
+    char local_uri[GMV_SIP_URI_CAPACITY];
+    char remote_uri[GMV_SIP_URI_CAPACITY];
+    char local_tag[GMV_SIP_TAG_CAPACITY];
+    char remote_tag[GMV_SIP_TAG_CAPACITY];
+    char remote_target[GMV_SIP_URI_CAPACITY];
+    char route_set[GMV_SIP_ROUTE_SET_CAPACITY];
+    char remote_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
     struct gmv_dialog_command *next;
 } gmv_dialog_command_t;
 
@@ -1379,7 +1400,8 @@ static void gmv_emit_event_ex(
     uint64_t lookup_id,
     const pj_str_t *device_id,
     const pj_str_t *realm,
-    uint64_t operation_id) {
+    uint64_t operation_id,
+    const pjsip_dialog *dialog) {
     if (!runtime || !runtime->event_callback) {
         return;
     }
@@ -1394,6 +1416,10 @@ static void gmv_emit_event_ex(
     char subject_header[GMV_SIP_SUBJECT_CAPACITY];
     char event_header_value[GMV_SIP_CONTENT_TYPE_CAPACITY];
     char subscription_state_value[GMV_SIP_CONTENT_TYPE_CAPACITY];
+    char dialog_local_uri[GMV_SIP_URI_CAPACITY];
+    char dialog_remote_uri[GMV_SIP_URI_CAPACITY];
+    char dialog_remote_target[GMV_SIP_URI_CAPACITY];
+    char dialog_route_set[GMV_SIP_ROUTE_SET_CAPACITY];
     memset(&event, 0, sizeof(event));
     memset(content_type, 0, sizeof(content_type));
     memset(contact, 0, sizeof(contact));
@@ -1407,6 +1433,10 @@ static void gmv_emit_event_ex(
         subscription_state_value,
         0,
         sizeof(subscription_state_value));
+    memset(dialog_local_uri, 0, sizeof(dialog_local_uri));
+    memset(dialog_remote_uri, 0, sizeof(dialog_remote_uri));
+    memset(dialog_remote_target, 0, sizeof(dialog_remote_target));
+    memset(dialog_route_set, 0, sizeof(dialog_route_set));
     event.size = (uint32_t)sizeof(event);
     event.version = GMV_SIP_ABI_VERSION;
     event.event_type = event_type;
@@ -1420,6 +1450,60 @@ static void gmv_emit_event_ex(
     event.device_id = gmv_string_view(device_id);
     event.realm = gmv_string_view(realm);
     event.operation_id = operation_id;
+
+    if (dialog && dialog->call_id && dialog->local.info &&
+        dialog->remote.info && dialog->target &&
+        dialog->local.cseq > 0 &&
+        dialog->local.info->tag.slen > 0 &&
+        dialog->remote.info->tag.slen > 0) {
+        int local_len = pjsip_uri_print(
+            PJSIP_URI_IN_FROMTO_HDR,
+            dialog->local.info->uri,
+            dialog_local_uri,
+            sizeof(dialog_local_uri));
+        int remote_len = pjsip_uri_print(
+            PJSIP_URI_IN_FROMTO_HDR,
+            dialog->remote.info->uri,
+            dialog_remote_uri,
+            sizeof(dialog_remote_uri));
+        int target_len = pjsip_uri_print(
+            PJSIP_URI_IN_REQ_URI,
+            dialog->target,
+            dialog_remote_target,
+            sizeof(dialog_remote_target));
+        if (local_len > 0 && remote_len > 0 && target_len > 0) {
+            event.dialog_local_cseq = (uint32_t)(dialog->local.cseq - 1);
+            event.dialog_local_uri = gmv_bytes_view(dialog_local_uri, (size_t)local_len);
+            event.dialog_remote_uri = gmv_bytes_view(dialog_remote_uri, (size_t)remote_len);
+            event.dialog_local_tag = gmv_string_view(&dialog->local.info->tag);
+            event.dialog_remote_tag = gmv_string_view(&dialog->remote.info->tag);
+            event.dialog_remote_target =
+                gmv_bytes_view(dialog_remote_target, (size_t)target_len);
+            size_t route_len = 0;
+            const pjsip_route_hdr *route = dialog->route_set.next;
+            while (route != &dialog->route_set) {
+                if (route_len > 0) {
+                    dialog_route_set[route_len++] = '\n';
+                }
+                int written = pjsip_uri_print(
+                    PJSIP_URI_IN_ROUTING_HDR,
+                    route->name_addr.uri,
+                    dialog_route_set + route_len,
+                    sizeof(dialog_route_set) - route_len);
+                if (written <= 0 ||
+                    route_len + (size_t)written >= sizeof(dialog_route_set)) {
+                    route_len = 0;
+                    break;
+                }
+                route_len += (size_t)written;
+                route = route->next;
+            }
+            if (route_len > 0) {
+                event.dialog_route_set =
+                    gmv_bytes_view(dialog_route_set, route_len);
+            }
+        }
+    }
 
     if (rdata) {
         if (rdata->tp_info.transport) {
@@ -1564,7 +1648,8 @@ static void gmv_emit_event(
         0,
         NULL,
         NULL,
-        0);
+        0,
+        NULL);
 }
 
 static void gmv_outbound_callback(void *token, pjsip_event *event) {
@@ -1597,7 +1682,8 @@ static void gmv_outbound_callback(void *token, pjsip_event *event) {
         0,
         NULL,
         NULL,
-        operation->operation_id);
+        operation->operation_id,
+        NULL);
 }
 
 static pjsip_rx_data *gmv_event_rdata(pjsip_event *event) {
@@ -1651,7 +1737,8 @@ static void gmv_emit_transaction_event(
         0,
         NULL,
         NULL,
-        operation_id);
+        operation_id,
+        pjsip_tsx_get_dlg(transaction));
 }
 
 static gmv_invite_call_t *gmv_invite_call_from_session(
@@ -2013,6 +2100,18 @@ static void gmv_on_tsx_state(
         transaction->state == PJSIP_TSX_STATE_TERMINATED ||
         transaction->state == PJSIP_TSX_STATE_DESTROYED) {
         transaction->mod_data[runtime->module.id] = NULL;
+        if (operation->restored_dialog &&
+            operation->restored_session_held) {
+            operation->restored_session_held = 0;
+            pjsip_dlg_dec_session(
+                operation->restored_dialog,
+                &runtime->module);
+            operation->restored_dialog = NULL;
+        }
+        if (operation->restored_call) {
+            gmv_remove_invite_call(runtime, operation->restored_call);
+            operation->restored_call = NULL;
+        }
         free(operation);
     }
 }
@@ -2376,7 +2475,8 @@ static void gmv_emit_auth_event(
         pending->lookup_id,
         &device_id,
         &realm,
-        0);
+        0,
+        NULL);
 }
 
 static pjsip_rx_data *gmv_rebuild_pending_rdata(
@@ -2980,7 +3080,8 @@ static pj_bool_t gmv_handle_incoming_invite(
         0,
         NULL,
         NULL,
-        0);
+        0,
+        dialog);
     pjsip_dlg_dec_lock(dialog);
     runtime->last_status = PJ_SUCCESS;
     return PJ_TRUE;
@@ -3961,6 +4062,10 @@ static pj_status_t gmv_send_invite_on_owner(
         !command->to_uri[0] ||
         !command->from_uri[0] ||
         !command->contact_uri[0] ||
+        !command->call_id[0] ||
+        !command->local_tag[0] ||
+        command->local_cseq == 0 ||
+        command->local_cseq > INT32_MAX ||
         !command->sdp ||
         command->sdp_len == 0 ||
         !runtime->started ||
@@ -3989,6 +4094,27 @@ static pj_status_t gmv_send_invite_on_owner(
         &target,
         &dialog);
     if (status != PJ_SUCCESS) {
+        return status;
+    }
+
+    status = pjsip_ua_unregister_dlg(pjsip_ua_instance(), dialog);
+    if (status != PJ_SUCCESS) {
+        pjsip_dlg_terminate(dialog);
+        return status;
+    }
+    pj_str_t call_id = pj_str((char *)command->call_id);
+    pj_str_t local_tag = pj_str((char *)command->local_tag);
+    pj_strdup(dialog->pool, &dialog->call_id->id, &call_id);
+    pj_strdup(dialog->pool, &dialog->local.info->tag, &local_tag);
+    dialog->local.tag_hval = pj_hash_calc_tolower(
+        0,
+        NULL,
+        &dialog->local.info->tag);
+    dialog->local.first_cseq = (pj_int32_t)command->local_cseq;
+    dialog->local.cseq = dialog->local.first_cseq;
+    status = pjsip_ua_register_dlg(pjsip_ua_instance(), dialog);
+    if (status != PJ_SUCCESS) {
+        pjsip_dlg_terminate(dialog);
         return status;
     }
 
@@ -4113,6 +4239,186 @@ static pj_status_t gmv_send_dialog_on_owner(
         !runtime->started) {
         return PJ_EINVAL;
     }
+    if (command->restored) {
+        gmv_custom_transport_t *transport = gmv_find_transport(
+            runtime,
+            command->transport,
+            command->association_id);
+        if (!transport) {
+            return PJSIP_EUNSUPTRANSPORT;
+        }
+
+        pj_str_t local_uri = pj_str((char *)command->local_uri);
+        pj_str_t remote_uri = pj_str((char *)command->remote_uri);
+        pj_str_t remote_target = pj_str((char *)command->remote_target);
+        pjsip_dialog *dialog = NULL;
+        pj_status_t status = pjsip_dlg_create_uac(
+            pjsip_ua_instance(),
+            &local_uri,
+            &local_uri,
+            &remote_uri,
+            &remote_target,
+            &dialog);
+        if (status != PJ_SUCCESS) {
+            return status;
+        }
+        status = pjsip_dlg_inc_session(dialog, &runtime->module);
+        if (status != PJ_SUCCESS) {
+            pjsip_dlg_terminate(dialog);
+            return status;
+        }
+
+        pjsip_route_hdr route_set;
+        pj_list_init(&route_set);
+        const char *cursor = command->route_set;
+        while (*cursor) {
+            const char *end = strchr(cursor, '\n');
+            size_t len = end ? (size_t)(end - cursor) : strlen(cursor);
+            if (len > 0) {
+                char *route_value = (char *)pj_pool_alloc(dialog->pool, len + 1u);
+                memcpy(route_value, cursor, len);
+                route_value[len] = '\0';
+                pj_str_t route_name = pj_str("Route");
+                pjsip_route_hdr *route = (pjsip_route_hdr *)pjsip_parse_hdr(
+                    dialog->pool,
+                    &route_name,
+                    route_value,
+                    len,
+                    NULL);
+                if (!route) {
+                    pjsip_dlg_dec_session(dialog, &runtime->module);
+                    return PJSIP_EINVALIDURI;
+                }
+                pj_list_push_back(&route_set, route);
+            }
+            if (!end) {
+                break;
+            }
+            cursor = end + 1;
+        }
+        if (!pj_list_empty(&route_set)) {
+            status = pjsip_dlg_set_route_set(dialog, &route_set);
+            if (status != PJ_SUCCESS) {
+                pjsip_dlg_dec_session(dialog, &runtime->module);
+                return status;
+            }
+        }
+
+        status = pjsip_ua_unregister_dlg(pjsip_ua_instance(), dialog);
+        if (status != PJ_SUCCESS) {
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            return status;
+        }
+        pj_str_t call_id = pj_str((char *)command->call_id);
+        pj_str_t local_tag = pj_str((char *)command->local_tag);
+        pj_str_t remote_tag = pj_str((char *)command->remote_tag);
+        pj_strdup(dialog->pool, &dialog->call_id->id, &call_id);
+        pj_strdup(dialog->pool, &dialog->local.info->tag, &local_tag);
+        dialog->local.tag_hval = pj_hash_calc_tolower(
+            0,
+            NULL,
+            &dialog->local.info->tag);
+        pj_strdup(dialog->pool, &dialog->remote.info->tag, &remote_tag);
+        dialog->remote.tag_hval = pj_hash_calc_tolower(
+            0,
+            NULL,
+            &dialog->remote.info->tag);
+        dialog->local.first_cseq = (pj_int32_t)command->local_cseq;
+        dialog->local.cseq = dialog->local.first_cseq;
+        dialog->state = PJSIP_DIALOG_STATE_ESTABLISHED;
+        dialog->uac_has_2xx = PJ_TRUE;
+        status = pjsip_ua_register_dlg(pjsip_ua_instance(), dialog);
+        if (status != PJ_SUCCESS) {
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            return status;
+        }
+
+        status = pjsip_dlg_add_usage(dialog, &runtime->module, NULL);
+        pjsip_tpselector selector;
+        memset(&selector, 0, sizeof(selector));
+        selector.type = PJSIP_TPSELECTOR_TRANSPORT;
+        selector.u.transport = &transport->base;
+        if (status == PJ_SUCCESS) {
+            status = pjsip_dlg_set_transport(dialog, &selector);
+        }
+        if (status != PJ_SUCCESS) {
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            return status;
+        }
+
+        pjsip_method method;
+        pj_str_t method_name = pj_str(
+            command->method == GMV_SIP_DIALOG_BYE ? "BYE" : "INFO");
+        pjsip_method_init_np(&method, &method_name);
+        pjsip_tx_data *tdata = NULL;
+        status = pjsip_dlg_create_request(dialog, &method, -1, &tdata);
+        if (status == PJ_SUCCESS && command->method == GMV_SIP_DIALOG_INFO) {
+            status = gmv_set_subscription_body(
+                tdata,
+                command->content_type,
+                command->body,
+                command->body_len);
+        }
+        if (status != PJ_SUCCESS) {
+            if (tdata) {
+                pjsip_tx_data_dec_ref(tdata);
+            }
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            return status;
+        }
+
+        gmv_dialog_operation_t *operation =
+            (gmv_dialog_operation_t *)calloc(1, sizeof(*operation));
+        if (!operation) {
+            pjsip_tx_data_dec_ref(tdata);
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            return PJ_ENOMEM;
+        }
+        operation->runtime = runtime;
+        operation->operation_id = command->operation_id;
+        operation->restored_dialog = dialog;
+        operation->restored_session_held = 1;
+        gmv_invite_call_t *restored_call =
+            (gmv_invite_call_t *)calloc(1, sizeof(*restored_call));
+        if (!restored_call) {
+            pjsip_tx_data_dec_ref(tdata);
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            free(operation);
+            return PJ_ENOMEM;
+        }
+        restored_call->runtime = runtime;
+        restored_call->transport = command->transport;
+        restored_call->association_id = command->association_id;
+        strcpy(restored_call->call_id, command->call_id);
+        status = gmv_init_address(
+            &restored_call->dialog_route_addr,
+            command->remote_address,
+            command->remote_port);
+        if (status != PJ_SUCCESS) {
+            free(restored_call);
+            pjsip_tx_data_dec_ref(tdata);
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            free(operation);
+            return status;
+        }
+        restored_call->has_dialog_route = 1;
+        restored_call->next = runtime->invite_calls;
+        runtime->invite_calls = restored_call;
+        operation->restored_call = restored_call;
+        status = pjsip_dlg_send_request(
+            dialog,
+            tdata,
+            runtime->module.id,
+            operation);
+        if (status != PJ_SUCCESS) {
+            operation->restored_session_held = 0;
+            pjsip_dlg_dec_session(dialog, &runtime->module);
+            gmv_remove_invite_call(runtime, restored_call);
+            free(operation);
+        }
+        return status;
+    }
+
     gmv_invite_call_t *call =
         gmv_find_invite_call(runtime, command->call_id);
     if (!call || !call->invite) {
@@ -4492,6 +4798,10 @@ int32_t gmv_sip_runtime_send_invite(
          invite->transport != GMV_SIP_TRANSPORT_TCP) ||
         (invite->transport == GMV_SIP_TRANSPORT_TCP &&
          invite->association_id == 0) ||
+        invite->local_cseq == 0 ||
+        invite->local_cseq > INT32_MAX ||
+        !invite->call_id.ptr || invite->call_id.len == 0 ||
+        !invite->local_tag.ptr || invite->local_tag.len == 0 ||
         !invite->target_uri.ptr || invite->target_uri.len == 0 ||
         !invite->to_uri.ptr || invite->to_uri.len == 0 ||
         !invite->from_uri.ptr || invite->from_uri.len == 0 ||
@@ -4510,7 +4820,16 @@ int32_t gmv_sip_runtime_send_invite(
     command->operation_id = invite->operation_id;
     command->association_id = invite->association_id;
     command->transport = invite->transport;
+    command->local_cseq = invite->local_cseq;
     if (!gmv_copy_view(
+            command->call_id,
+            sizeof(command->call_id),
+            invite->call_id) ||
+        !gmv_copy_view(
+            command->local_tag,
+            sizeof(command->local_tag),
+            invite->local_tag) ||
+        !gmv_copy_view(
             command->target_uri,
             sizeof(command->target_uri),
             invite->target_uri) ||
@@ -4602,6 +4921,81 @@ int32_t gmv_sip_runtime_send_dialog_request(
             command->body,
             request->body.ptr,
             request->body.len);
+        command->body_len = request->body.len;
+    }
+
+    pj_mutex_lock(runtime->command_mutex);
+    if (runtime->dialog_tail) {
+        runtime->dialog_tail->next = command;
+    } else {
+        runtime->dialog_head = command;
+    }
+    runtime->dialog_tail = command;
+    pj_mutex_unlock(runtime->command_mutex);
+    return PJ_SUCCESS;
+}
+
+int32_t gmv_sip_runtime_send_restored_dialog_request(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_restored_dialog_request_t *request) {
+    if (!runtime || !request ||
+        request->size < sizeof(*request) ||
+        request->version != GMV_SIP_ABI_VERSION ||
+        request->operation_id == 0 ||
+        (request->method != GMV_SIP_DIALOG_BYE &&
+         request->method != GMV_SIP_DIALOG_INFO) ||
+        request->local_cseq == 0 ||
+        !request->call_id.ptr || request->call_id.len == 0 ||
+        !request->local_uri.ptr || request->local_uri.len == 0 ||
+        !request->remote_uri.ptr || request->remote_uri.len == 0 ||
+        !request->local_tag.ptr || request->local_tag.len == 0 ||
+        !request->remote_tag.ptr || request->remote_tag.len == 0 ||
+        !request->remote_target.ptr || request->remote_target.len == 0 ||
+        !request->remote_address.ptr || request->remote_address.len == 0 ||
+        request->remote_port == 0 ||
+        (request->transport != GMV_SIP_TRANSPORT_UDP &&
+         request->transport != GMV_SIP_TRANSPORT_TCP) ||
+        (request->transport == GMV_SIP_TRANSPORT_TCP &&
+         request->association_id == 0) ||
+        (request->method == GMV_SIP_DIALOG_INFO &&
+         (!request->content_type.ptr || request->content_type.len == 0 ||
+          !request->body.ptr || request->body.len == 0)) ||
+        request->body.len > PJSIP_MAX_PKT_LEN ||
+        !runtime->started || !runtime->command_mutex) {
+        return PJ_EINVAL;
+    }
+
+    gmv_dialog_command_t *command =
+        (gmv_dialog_command_t *)calloc(1, sizeof(*command));
+    if (!command) {
+        return PJ_ENOMEM;
+    }
+    command->restored = 1;
+    command->operation_id = request->operation_id;
+    command->method = request->method;
+    command->association_id = request->association_id;
+    command->transport = request->transport;
+    command->local_cseq = request->local_cseq;
+    command->remote_port = request->remote_port;
+    if (!gmv_copy_view(command->call_id, sizeof(command->call_id), request->call_id) ||
+        !gmv_copy_view(command->local_uri, sizeof(command->local_uri), request->local_uri) ||
+        !gmv_copy_view(command->remote_uri, sizeof(command->remote_uri), request->remote_uri) ||
+        !gmv_copy_view(command->local_tag, sizeof(command->local_tag), request->local_tag) ||
+        !gmv_copy_view(command->remote_tag, sizeof(command->remote_tag), request->remote_tag) ||
+        !gmv_copy_view(command->remote_target, sizeof(command->remote_target), request->remote_target) ||
+        !gmv_copy_view(command->route_set, sizeof(command->route_set), request->route_set) ||
+        !gmv_copy_view(command->remote_address, sizeof(command->remote_address), request->remote_address) ||
+        !gmv_copy_view(command->content_type, sizeof(command->content_type), request->content_type)) {
+        gmv_free_dialog_command(command);
+        return PJ_ETOOSMALL;
+    }
+    if (request->body.len > 0) {
+        command->body = (unsigned char *)malloc(request->body.len);
+        if (!command->body) {
+            gmv_free_dialog_command(command);
+            return PJ_ENOMEM;
+        }
+        memcpy(command->body, request->body.ptr, request->body.len);
         command->body_len = request->body.len;
     }
 

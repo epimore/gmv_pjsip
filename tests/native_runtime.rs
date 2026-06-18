@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use base::log::{LevelFilter, Log, Metadata, Record};
 use gmv_pjsip::{
     SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipInviteResponse, SipOutboundInvite,
-    SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
-    SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
+    SipOutboundMessage, SipOutboundSubscribe, SipRestoredDialogRequest, SipRuntime,
+    SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits,
+    SipTransmit, SipTransportProtocol,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -528,6 +529,7 @@ y=0100000001\r\n";
             operation_id: invite_operation,
             association_id: 0,
             protocol: SipTransportProtocol::Udp,
+            identity: gmv_pjsip::SipInviteIdentity::generate(),
             target_uri: format!("sip:device@{remote}"),
             from_uri: format!("<sip:platform@{}>", local_addr()),
             contact_uri: format!("<sip:platform@{}>", local_addr()),
@@ -677,6 +679,7 @@ Content-Length: 0\r\n\r\n",
             operation_id: remote_bye_invite_operation,
             association_id: 0,
             protocol: SipTransportProtocol::Udp,
+            identity: gmv_pjsip::SipInviteIdentity::generate(),
             target_uri: format!("sip:device@{remote}"),
             from_uri: format!("<sip:platform@{}>", local_addr()),
             contact_uri: format!("<sip:platform@{}>", local_addr()),
@@ -757,6 +760,208 @@ Content-Length: 0\r\n\r\n",
     let remote_bye_response = receive_transmit(&mut runtime, &transmits);
     assert!(finish_transmit(&mut runtime, &remote_bye_response).starts_with("SIP/2.0 200"));
     runtime.poll().expect("complete remote BYE response");
+
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn fresh_runtime_sends_restored_info_info_and_bye() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: true,
+        ..SipRuntimeConfig::default()
+    };
+    let remote = remote_addr(15070);
+    let (mut original_runtime, original_events, original_transmits) = start_runtime(config.clone());
+    let invite_identity = gmv_pjsip::SipInviteIdentity::generate();
+    original_runtime
+        .send_invite(&SipOutboundInvite {
+            operation_id: 200,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            identity: invite_identity.clone(),
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            contact_uri: format!("<sip:platform@{}>", local_addr()),
+            subject: Some("device:0100000001,platform:0100000001".into()),
+            sdp: "v=0\r\no=platform 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 30000 RTP/AVP 96\r\na=recvonly\r\na=rtpmap:96 PS/90000\r\ny=0100000001\r\n".into(),
+        })
+        .expect("send original INVITE");
+    let invite_transmit = receive_transmit(&mut original_runtime, &original_transmits);
+    let invite = finish_transmit(&mut original_runtime, &invite_transmit);
+    assert_eq!(header_value(&invite, "Call-ID"), invite_identity.call_id);
+    assert!(header_value(&invite, "From").contains(&invite_identity.local_tag));
+    assert_eq!(
+        header_value(&invite, "CSeq"),
+        format!("{} INVITE", invite_identity.local_cseq)
+    );
+    let remote_sdp = "v=0\r\no=device 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 40000 RTP/AVP 96\r\na=sendonly\r\na=rtpmap:96 PS/90000\r\ny=0100000001\r\n";
+    let response = format!(
+        "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=persisted-remote-tag\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:device@{remote}>\r\nRecord-Route: <sip:proxy@127.0.0.1:15071;lr>\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+        header_value(&invite, "Via"),
+        header_value(&invite, "From"),
+        header_value(&invite, "To"),
+        header_value(&invite, "Call-ID"),
+        header_value(&invite, "CSeq"),
+        remote_sdp.len(),
+        remote_sdp,
+    );
+    original_runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            response.as_bytes(),
+        )
+        .expect("inject original INVITE response");
+    let invite_event = receive_event(
+        &mut original_runtime,
+        &original_events,
+        SipRuntimeEventKind::OutboundResponse,
+    );
+    let base_snapshot = invite_event
+        .dialog_snapshot
+        .expect("INVITE 2xx exports dialog snapshot");
+    assert_eq!(base_snapshot.call_id, invite_identity.call_id);
+    assert_eq!(base_snapshot.local_tag, invite_identity.local_tag);
+    assert_eq!(base_snapshot.local_cseq, invite_identity.local_cseq);
+    assert_eq!(base_snapshot.remote_tag, "persisted-remote-tag");
+    assert_eq!(base_snapshot.remote_addr, remote);
+    assert_eq!(base_snapshot.route_set.len(), 1);
+    let ack = receive_transmit(&mut original_runtime, &original_transmits);
+    assert!(finish_transmit(&mut original_runtime, &ack).starts_with("ACK "));
+    original_runtime
+        .shutdown()
+        .expect("destroy original runtime");
+
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let first_cseq = base_snapshot.local_cseq + 1;
+    for (operation_id, method, cseq, response_code) in [
+        (201, SipDialogMethod::Info, first_cseq, 200),
+        (202, SipDialogMethod::Info, first_cseq + 1, 408),
+        (203, SipDialogMethod::Bye, first_cseq + 2, 481),
+    ] {
+        let mut snapshot = base_snapshot.clone();
+        snapshot.local_cseq = cseq;
+        runtime
+            .send_restored_dialog_request(&SipRestoredDialogRequest {
+                operation_id,
+                method,
+                snapshot,
+                content_type: (method == SipDialogMethod::Info)
+                    .then(|| "Application/MANSRTSP".into()),
+                body: (method == SipDialogMethod::Info)
+                    .then(|| b"PLAY RTSP/1.0\r\nCSeq: 1\r\nScale: 2.0\r\n".to_vec())
+                    .unwrap_or_default(),
+            })
+            .expect("queue restored dialog request");
+
+        let transmit = receive_transmit(&mut runtime, &transmits);
+        assert_eq!(transmit.remote_addr, remote);
+        let message = finish_transmit(&mut runtime, &transmit);
+        let method_name = if method == SipDialogMethod::Info {
+            "INFO"
+        } else {
+            "BYE"
+        };
+        assert!(message.starts_with(&format!("{method_name} sip:device@{remote} ")));
+        assert_eq!(header_value(&message, "Call-ID"), base_snapshot.call_id);
+        assert!(header_value(&message, "From").contains(&base_snapshot.local_tag));
+        assert!(header_value(&message, "To").contains("tag=persisted-remote-tag"));
+        assert!(header_value(&message, "Route").contains("127.0.0.1:15071"));
+        assert_eq!(
+            header_value(&message, "CSeq"),
+            format!("{cseq} {method_name}")
+        );
+
+        let response_status = match response_code {
+            200 => "200 OK",
+            408 => "408 Request Timeout",
+            481 => "481 Call/Transaction Does Not Exist",
+            _ => unreachable!(),
+        };
+        let response = format!(
+            "SIP/2.0 {response_status}\r\nVia: {}\r\nFrom: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",
+            header_value(&message, "Via"),
+            header_value(&message, "From"),
+            header_value(&message, "To"),
+            header_value(&message, "Call-ID"),
+            header_value(&message, "CSeq"),
+        );
+        runtime
+            .inject_test_packet(
+                0,
+                SipTransportProtocol::Udp,
+                local_addr(),
+                remote,
+                response.as_bytes(),
+            )
+            .expect("inject restored dialog response");
+        let event = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+        assert_eq!(event.operation_id, Some(operation_id));
+        assert_eq!(event.status_code, Some(response_code));
+    }
+
+    let tcp_remote = remote_addr(15072);
+    let tcp_association_id = 77;
+    let bootstrap = format!(
+        "OPTIONS sip:platform@{} SIP/2.0\r\nVia: SIP/2.0/TCP {tcp_remote};branch=z9hG4bK-bootstrap\r\nFrom: <sip:device@{tcp_remote}>;tag=bootstrap\r\nTo: <sip:platform@{}>\r\nCall-ID: bootstrap-tcp\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+        local_addr(),
+        local_addr(),
+    );
+    runtime
+        .inject_test_packet(
+            tcp_association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            tcp_remote,
+            bootstrap.as_bytes(),
+        )
+        .expect("establish current TCP association");
+    let bootstrap_response = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(bootstrap_response.association_id, tcp_association_id);
+    finish_transmit(&mut runtime, &bootstrap_response);
+
+    let mut tcp_snapshot = base_snapshot.clone();
+    tcp_snapshot.protocol = SipTransportProtocol::Tcp;
+    tcp_snapshot.association_id = tcp_association_id;
+    tcp_snapshot.remote_addr = tcp_remote;
+    tcp_snapshot.local_cseq = first_cseq + 3;
+    runtime
+        .send_restored_dialog_request(&SipRestoredDialogRequest {
+            operation_id: 204,
+            method: SipDialogMethod::Info,
+            snapshot: tcp_snapshot,
+            content_type: Some("Application/MANSRTSP".into()),
+            body: b"PLAY RTSP/1.0\r\nCSeq: 2\r\nScale: 1.0\r\n".to_vec(),
+        })
+        .expect("send restored INFO on current TCP association");
+    let tcp_transmit = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(tcp_transmit.protocol, SipTransportProtocol::Tcp);
+    assert_eq!(tcp_transmit.association_id, tcp_association_id);
+    assert_eq!(tcp_transmit.remote_addr, tcp_remote);
+    let tcp_info = finish_transmit(&mut runtime, &tcp_transmit);
+    let tcp_response = format!(
+        "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",
+        header_value(&tcp_info, "Via"),
+        header_value(&tcp_info, "From"),
+        header_value(&tcp_info, "To"),
+        header_value(&tcp_info, "Call-ID"),
+        header_value(&tcp_info, "CSeq"),
+    );
+    runtime
+        .inject_test_packet(
+            tcp_association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            tcp_remote,
+            tcp_response.as_bytes(),
+        )
+        .expect("inject restored TCP INFO response");
+    let tcp_event = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(tcp_event.operation_id, Some(204));
+    assert_eq!(tcp_event.status_code, Some(200));
 
     runtime.shutdown().expect("shutdown runtime");
 }

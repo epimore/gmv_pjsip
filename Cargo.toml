@@ -11,3 +11,4 @@ test-helpers = []
 base = { package = "base", path = "../pigs/base", features = ["net"] }
 
 gmv_pjsip_sys = { path = "gmv_pjsip_sys" }
+uuid = { version = "1.7", features = ["v4"] }

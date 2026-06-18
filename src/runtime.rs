@@ -34,17 +34,19 @@ use gmv_pjsip_sys::{
     gmv_sip_event_type_GMV_SIP_EVENT_RUNTIME_FAULT as EVENT_RUNTIME_FAULT,
     gmv_sip_event_type_GMV_SIP_EVENT_UNREGISTERED as EVENT_UNREGISTERED, gmv_sip_invite_response_t,
     gmv_sip_outbound_invite_t, gmv_sip_outbound_message_t, gmv_sip_outbound_subscribe_t,
-    gmv_sip_received_packet_t, gmv_sip_runtime_close_transport,
+    gmv_sip_received_packet_t, gmv_sip_restored_dialog_request_t, gmv_sip_runtime_close_transport,
     gmv_sip_runtime_complete_auth_lookup, gmv_sip_runtime_complete_send,
     gmv_sip_runtime_config_init, gmv_sip_runtime_config_t, gmv_sip_runtime_create,
     gmv_sip_runtime_destroy, gmv_sip_runtime_poll, gmv_sip_runtime_receive_packet,
     gmv_sip_runtime_respond_invite, gmv_sip_runtime_send_dialog_request,
-    gmv_sip_runtime_send_invite, gmv_sip_runtime_send_message, gmv_sip_runtime_send_subscribe,
+    gmv_sip_runtime_send_invite, gmv_sip_runtime_send_message,
+    gmv_sip_runtime_send_restored_dialog_request, gmv_sip_runtime_send_subscribe,
     gmv_sip_runtime_start, gmv_sip_runtime_stop, gmv_sip_runtime_t, gmv_sip_send_completion_t,
     gmv_sip_send_packet_t, gmv_sip_string_view_t,
     gmv_sip_transport_GMV_SIP_TRANSPORT_TCP as TRANSPORT_TCP,
     gmv_sip_transport_GMV_SIP_TRANSPORT_UDP as TRANSPORT_UDP, GMV_SIP_ABI_VERSION,
 };
+use uuid::Uuid;
 
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
 use crate::error::{internal_error, invalid_config, runtime_active, system_error, Result};
@@ -181,6 +183,7 @@ pub struct SipRuntimeEvent {
     pub subject: Option<String>,
     pub event: Option<String>,
     pub subscription_state: Option<String>,
+    pub dialog_snapshot: Option<SipDialogSnapshot>,
 }
 
 pub type SipRuntimeEvents = Receiver<SipRuntimeEvent>;
@@ -217,11 +220,31 @@ pub struct SipOutboundMessage {
     pub body: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SipInviteIdentity {
+    pub call_id: String,
+    pub local_tag: String,
+    pub local_cseq: u32,
+}
+
+impl SipInviteIdentity {
+    #[must_use]
+    pub fn generate() -> Self {
+        let cseq_seed = Uuid::new_v4().as_u128() as u32;
+        Self {
+            call_id: Uuid::new_v4().simple().to_string(),
+            local_tag: Uuid::new_v4().simple().to_string(),
+            local_cseq: (cseq_seed & i32::MAX as u32).max(1),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SipOutboundInvite {
     pub operation_id: u64,
     pub association_id: u64,
     pub protocol: SipTransportProtocol,
+    pub identity: SipInviteIdentity,
     pub target_uri: String,
     pub from_uri: String,
     pub contact_uri: String,
@@ -255,6 +278,35 @@ pub struct SipDialogRequest {
     pub operation_id: u64,
     pub method: SipDialogMethod,
     pub call_id: String,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// Persistable identity and routing state for an established UAC dialog.
+///
+/// `local_cseq` is the CSeq reserved by the caller for the next request. The
+/// caller must persist that reservation before asking the runtime to send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SipDialogSnapshot {
+    pub call_id: String,
+    pub local_uri: String,
+    pub remote_uri: String,
+    pub local_tag: String,
+    pub remote_tag: String,
+    pub local_cseq: u32,
+    pub remote_target: String,
+    pub route_set: Vec<String>,
+    pub protocol: SipTransportProtocol,
+    pub association_id: u64,
+    pub local_addr: SocketAddr,
+    pub remote_addr: SocketAddr,
+}
+
+#[derive(Clone, Debug)]
+pub struct SipRestoredDialogRequest {
+    pub operation_id: u64,
+    pub method: SipDialogMethod,
+    pub snapshot: SipDialogSnapshot,
     pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
@@ -591,6 +643,7 @@ impl SipRuntime {
                         subject: None,
                         event: None,
                         subscription_state: None,
+                        dialog_snapshot: None,
                     });
                 }
             }
@@ -837,17 +890,31 @@ impl SipRuntime {
             || invite.from_uri.is_empty()
             || invite.contact_uri.is_empty()
             || invite.sdp.is_empty()
+            || invite.identity.call_id.is_empty()
+            || invite.identity.local_tag.is_empty()
+            || invite.identity.local_cseq == 0
+            || invite.identity.local_cseq > i32::MAX as u32
             || invite.target_uri.as_bytes().contains(&0)
             || invite.from_uri.as_bytes().contains(&0)
             || invite.contact_uri.as_bytes().contains(&0)
             || invite.sdp.as_bytes().contains(&0)
+            || invite
+                .identity
+                .call_id
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+            || invite
+                .identity
+                .local_tag
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
             || invite
                 .subject
                 .as_deref()
                 .is_some_and(|subject| subject.as_bytes().contains(&0))
         {
             return Err(invalid_config(
-                "target_uri, from_uri, contact_uri, and SDP are required".into(),
+                "INVITE identity, target_uri, from_uri, contact_uri, and SDP are required".into(),
             ));
         }
 
@@ -859,6 +926,9 @@ impl SipRuntime {
             operation_id: invite.operation_id,
             association_id: invite.association_id,
             transport: transport_id(invite.protocol),
+            local_cseq: invite.identity.local_cseq,
+            call_id: string_view(&invite.identity.call_id),
+            local_tag: string_view(&invite.identity.local_tag),
             target_uri: string_view(&invite.target_uri),
             to_uri: string_view(&to_uri),
             from_uri: string_view(&invite.from_uri),
@@ -932,6 +1002,115 @@ impl SipRuntime {
             unsafe { gmv_sip_runtime_send_dialog_request(self.raw.as_ptr(), &ffi_request) };
         if status != 0 {
             return Err(pjsip_error("send_dialog_request", status));
+        }
+        Ok(())
+    }
+
+    pub fn send_restored_dialog_request(
+        &mut self,
+        request: &SipRestoredDialogRequest,
+    ) -> Result<()> {
+        if self.stopped {
+            return Err(invalid_config(
+                "cannot send restored dialog request after runtime stop".into(),
+            ));
+        }
+        let snapshot = &request.snapshot;
+        if request.operation_id == 0
+            || snapshot.call_id.is_empty()
+            || snapshot.local_uri.is_empty()
+            || snapshot.remote_uri.is_empty()
+            || snapshot.local_tag.is_empty()
+            || snapshot.remote_tag.is_empty()
+            || snapshot.remote_target.is_empty()
+            || snapshot.local_cseq == 0
+            || snapshot.local_cseq > i32::MAX as u32
+        {
+            return Err(invalid_config(
+                "restored dialog identity and reserved local_cseq are required".into(),
+            ));
+        }
+        if snapshot.protocol == SipTransportProtocol::Tls {
+            return Err(invalid_config(
+                "TLS restored dialogs are not supported".into(),
+            ));
+        }
+        if snapshot.protocol == SipTransportProtocol::Tcp && snapshot.association_id == 0 {
+            return Err(invalid_config(
+                "TCP restored dialog requires a current association_id".into(),
+            ));
+        }
+        let strings = [
+            snapshot.call_id.as_str(),
+            snapshot.local_uri.as_str(),
+            snapshot.remote_uri.as_str(),
+            snapshot.local_tag.as_str(),
+            snapshot.remote_tag.as_str(),
+            snapshot.remote_target.as_str(),
+        ];
+        if strings.iter().any(|value| {
+            value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        }) || request.content_type.as_deref().is_some_and(|value| {
+            value
+                .bytes()
+                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        }) || snapshot.route_set.iter().any(|route| {
+            route.is_empty()
+                || route
+                    .bytes()
+                    .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+        }) {
+            return Err(invalid_config(
+                "restored dialog strings and routes must be non-empty and contain no control separator"
+                    .into(),
+            ));
+        }
+        if request.method == SipDialogMethod::Info
+            && (request.body.is_empty()
+                || !request
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|value| value.contains('/')))
+        {
+            return Err(invalid_config("INFO requires content_type and body".into()));
+        }
+        let route_set = snapshot.route_set.join("\n");
+        let remote_address = snapshot.remote_addr.ip().to_string();
+        let ffi_request = gmv_sip_restored_dialog_request_t {
+            size: mem::size_of::<gmv_sip_restored_dialog_request_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            operation_id: request.operation_id,
+            method: match request.method {
+                SipDialogMethod::Bye => DIALOG_BYE as i32,
+                SipDialogMethod::Info => DIALOG_INFO as i32,
+            },
+            association_id: snapshot.association_id,
+            transport: transport_id(snapshot.protocol),
+            local_cseq: snapshot.local_cseq,
+            call_id: string_view(&snapshot.call_id),
+            local_uri: string_view(&snapshot.local_uri),
+            remote_uri: string_view(&snapshot.remote_uri),
+            local_tag: string_view(&snapshot.local_tag),
+            remote_tag: string_view(&snapshot.remote_tag),
+            remote_target: string_view(&snapshot.remote_target),
+            route_set: string_view(&route_set),
+            remote_address: string_view(&remote_address),
+            remote_port: snapshot.remote_addr.port(),
+            content_type: request
+                .content_type
+                .as_deref()
+                .map(string_view)
+                .unwrap_or_else(empty_view),
+            body: bytes_view(&request.body),
+        };
+        // SAFETY: The runtime is valid and the shim synchronously copies all views.
+        let status = unsafe {
+            gmv_sip_runtime_send_restored_dialog_request(self.raw.as_ptr(), &ffi_request)
+        };
+        if status != 0 {
+            return Err(pjsip_error("send_restored_dialog_request", status));
         }
         Ok(())
     }
@@ -1196,7 +1375,31 @@ fn copy_event(event: &gmv_sip_event_t) -> SipRuntimeEvent {
         subject: copy_string_view(event.subject),
         event: copy_string_view(event.event),
         subscription_state: copy_string_view(event.subscription_state),
+        dialog_snapshot: copy_dialog_snapshot(event),
     }
+}
+
+fn copy_dialog_snapshot(event: &gmv_sip_event_t) -> Option<SipDialogSnapshot> {
+    let local_cseq = event.dialog_local_cseq;
+    if local_cseq == 0 {
+        return None;
+    }
+    Some(SipDialogSnapshot {
+        call_id: copy_string_view(event.call_id)?,
+        local_uri: copy_string_view(event.dialog_local_uri)?,
+        remote_uri: copy_string_view(event.dialog_remote_uri)?,
+        local_tag: copy_string_view(event.dialog_local_tag)?,
+        remote_tag: copy_string_view(event.dialog_remote_tag)?,
+        local_cseq,
+        remote_target: copy_string_view(event.dialog_remote_target)?,
+        route_set: copy_string_view(event.dialog_route_set)
+            .map(|routes| routes.lines().map(str::to_owned).collect())
+            .unwrap_or_default(),
+        protocol: copy_transport(event.transport)?,
+        association_id: event.association_id,
+        local_addr: copy_string_view(event.local_address)?.parse().ok()?,
+        remote_addr: copy_string_view(event.remote_address)?.parse().ok()?,
+    })
 }
 
 fn copy_transport(value: i32) -> Option<SipTransportProtocol> {

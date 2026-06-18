@@ -82,6 +82,7 @@ fn invite_round_trip(
             operation_id,
             association_id: 0,
             protocol: SipTransportProtocol::Udp,
+            identity: gmv_pjsip::SipInviteIdentity::generate(),
             target_uri: format!("sip:{DEVICE_ID}@{}", device_addr()),
             from_uri: format!("<sip:{PLATFORM_ID}@3402000000>"),
             contact_uri: format!("<sip:{PLATFORM_ID}@{}>", platform_addr()),
