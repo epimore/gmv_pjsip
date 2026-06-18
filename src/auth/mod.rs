@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
-use rand::{distributions::Alphanumeric, Rng};
+use base::dashmap::DashMap;
+use base::rand::{distributions::Alphanumeric, Rng};
 
-use crate::error::{Result, SipError};
+use crate::error::{auth_failed, Result};
 
 mod pjsip_digest;
 pub mod pjsip_server;
@@ -187,7 +187,7 @@ impl NonceStore {
     }
 
     pub fn issue(&self) -> String {
-        let nonce: String = rand::thread_rng()
+        let nonce: String = base::rand::thread_rng()
             .sample_iter(&Alphanumeric)
             .take(32)
             .map(char::from)
@@ -262,13 +262,13 @@ pub fn verify_digest_response(req: VerifyDigestRequest<'_>) -> Result<String> {
     let parts = parse_digest_authorization(req.authorization);
     let username = parts
         .get("username")
-        .ok_or_else(|| SipError::AuthFailed("missing username".into()))?;
+        .ok_or_else(|| auth_failed("missing username".into()))?;
     let nonce = parts
         .get("nonce")
-        .ok_or_else(|| SipError::AuthFailed("missing nonce".into()))?;
+        .ok_or_else(|| auth_failed("missing nonce".into()))?;
     let response = parts
         .get("response")
-        .ok_or_else(|| SipError::AuthFailed("missing response".into()))?;
+        .ok_or_else(|| auth_failed("missing response".into()))?;
     let req_uri = parts.get("uri").map(String::as_str).unwrap_or(req.uri);
     let algorithm = AuthAlgorithm::from_header(
         parts.get("algorithm").map(String::as_str),
@@ -276,20 +276,20 @@ pub fn verify_digest_response(req: VerifyDigestRequest<'_>) -> Result<String> {
     );
 
     if !algorithm.is_supported() {
-        return Err(SipError::AuthFailed(format!(
+        return Err(auth_failed(format!(
             "digest algorithm {} is not supported",
             algorithm.iana_name()
         )));
     }
 
     if !req.nonce_store.valid(nonce) {
-        return Err(SipError::AuthFailed("nonce expired or unknown".into()));
+        return Err(auth_failed("nonce expired or unknown".into()));
     }
 
     let credential = req
         .provider
         .credential_for(username, req.realm, algorithm)
-        .ok_or_else(|| SipError::AuthFailed("credential not found".into()))?;
+        .ok_or_else(|| auth_failed("credential not found".into()))?;
 
     let nc = parts.get("nc").map(String::as_str);
     let cnonce = parts.get("cnonce").map(String::as_str);
@@ -309,7 +309,7 @@ pub fn verify_digest_response(req: VerifyDigestRequest<'_>) -> Result<String> {
     if expected.eq_ignore_ascii_case(response) {
         Ok(username.clone())
     } else {
-        Err(SipError::AuthFailed("digest response mismatch".into()))
+        Err(auth_failed("digest response mismatch".into()))
     }
 }
 

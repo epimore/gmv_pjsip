@@ -3,13 +3,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
+use base::log::{LevelFilter, Log, Metadata, Record};
 use gmv_pjsip::{
-    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipError, SipInviteResponse,
-    SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig,
-    SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit,
-    SipTransportProtocol,
+    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipInviteResponse, SipOutboundInvite,
+    SipOutboundMessage, SipOutboundSubscribe, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
+    SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
-use log::{LevelFilter, Log, Metadata, Record};
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static TEST_LOG_INIT: Once = Once::new();
@@ -17,15 +16,14 @@ static TEST_LOGGER: TestLogger = TestLogger {
     messages: Mutex::new(Vec::new()),
 };
 const LOCAL_PORT: u16 = 5060;
-const TEST_LOG_TARGET: &str = "gmv_pjsip::test";
 
 struct TestLogger {
     messages: Mutex<Vec<String>>,
 }
 
 impl Log for TestLogger {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.target() == TEST_LOG_TARGET
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -42,8 +40,8 @@ impl Log for TestLogger {
 
 fn init_test_logger() {
     TEST_LOG_INIT.call_once(|| {
-        log::set_logger(&TEST_LOGGER).expect("install test logger");
-        log::set_max_level(LevelFilter::Debug);
+        base::log::set_logger(&TEST_LOGGER).expect("install test logger");
+        base::log::set_max_level(LevelFilter::Trace);
     });
 }
 
@@ -125,21 +123,9 @@ fn runtime_rejects_invalid_transport_config() {
         Ok(_) => panic!("runtime unexpectedly accepted invalid config"),
         Err(error) => error,
     };
-    assert!(matches!(error, SipError::InvalidConfig(_)));
-}
-
-#[test]
-fn runtime_rejects_empty_log_target() {
-    let _guard = lock_tests();
-    let config = SipRuntimeConfig {
-        log_target: String::new(),
-        ..SipRuntimeConfig::default()
-    };
-    let error = match SipRuntime::start_for_test(config) {
-        Ok(_) => panic!("runtime unexpectedly accepted empty log target"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SipError::InvalidConfig(_)));
+    assert!(error
+        .to_string()
+        .contains("invalid SIP runtime configuration"));
 }
 
 #[test]
@@ -151,11 +137,7 @@ fn pjsip_logs_are_bridged_to_the_rust_log_facade() {
         .lock()
         .expect("lock test log messages")
         .clear();
-    let config = SipRuntimeConfig {
-        log_target: TEST_LOG_TARGET.into(),
-        ..SipRuntimeConfig::default()
-    };
-    let (runtime, _events, _transmits) = start_runtime(config);
+    let (runtime, _events, _transmits) = start_runtime(SipRuntimeConfig::default());
     runtime.shutdown().expect("shutdown runtime");
     assert!(!TEST_LOGGER
         .messages
@@ -172,7 +154,9 @@ fn runtime_enforces_one_active_instance() {
         Ok(_) => panic!("second runtime unexpectedly started"),
         Err(error) => error,
     };
-    assert!(matches!(error, SipError::RuntimeActive));
+    assert!(error
+        .to_string()
+        .contains("PJSIP runtime is already active"));
     runtime.shutdown().expect("shutdown runtime");
 }
 
@@ -188,7 +172,6 @@ fn runtime_owns_inherited_udp_socket() {
         bind_address: Ipv4Addr::LOCALHOST,
         port: runtime_addr.port(),
         enable_tcp: false,
-        log_target: TEST_LOG_TARGET.into(),
         ..SipRuntimeConfig::default()
     };
     let (mut runtime, _events) = SipRuntime::start(
@@ -242,11 +225,7 @@ fn runtime_adapter_handles_udp_and_fragmented_tcp() {
         .lock()
         .expect("lock test log messages")
         .clear();
-    let config = SipRuntimeConfig {
-        log_target: TEST_LOG_TARGET.into(),
-        ..SipRuntimeConfig::default()
-    };
-    let (mut runtime, events, transmits) = start_runtime(config);
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
 
     let udp_remote = remote_addr(40000);
     let options = format!(

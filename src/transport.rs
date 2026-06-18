@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use bytes::Bytes;
+use base::bytes::Bytes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SipTransportProtocol {

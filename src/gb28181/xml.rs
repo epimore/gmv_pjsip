@@ -1,10 +1,10 @@
-use rand::{distributions::Alphanumeric, Rng};
+use base::rand::{distributions::Alphanumeric, Rng};
 
 pub const CONTENT_TYPE_MANSCDP_XML: &str = "Application/MANSCDP+xml";
 pub const CONTENT_TYPE_MANSRTSP: &str = "Application/MANSRTSP";
 
 pub fn next_sn() -> String {
-    rand::thread_rng()
+    base::rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(8)
         .map(char::from)

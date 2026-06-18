@@ -12,6 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
+use base::tokio::sync::mpsc as tokio_mpsc;
 use gmv_pjsip_sys::{
     gmv_pjsip_auth_alg_md5, gmv_pjsip_auth_alg_sha256, gmv_pjsip_auth_alg_sha512_256,
     gmv_pjsip_auth_digest_type, gmv_pjsip_auth_plain_password_type,
@@ -44,11 +45,9 @@ use gmv_pjsip_sys::{
     gmv_sip_transport_GMV_SIP_TRANSPORT_TCP as TRANSPORT_TCP,
     gmv_sip_transport_GMV_SIP_TRANSPORT_UDP as TRANSPORT_UDP, GMV_SIP_ABI_VERSION,
 };
-use log::{Level, LevelFilter};
-use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
-use crate::error::{Result, SipError};
+use crate::error::{internal_error, invalid_config, runtime_active, system_error, Result};
 use crate::io::{RuntimeIoCommand, SocketIoRuntime};
 use crate::transport::SipTransportProtocol;
 
@@ -68,7 +67,6 @@ pub struct SipRuntimeConfig {
     pub max_pending_auth: u32,
     pub auth_lookup_timeout: Duration,
     pub io_queue_capacity: usize,
-    pub log_target: String,
     pub tls: Option<SipTlsConfig>,
 }
 
@@ -101,7 +99,6 @@ impl Default for SipRuntimeConfig {
             max_pending_auth: 20_000,
             auth_lookup_timeout: Duration::from_secs(3),
             io_queue_capacity: DEFAULT_IO_QUEUE_CAPACITY,
-            log_target: "gmv_pjsip::runtime".into(),
             tls: None,
         }
     }
@@ -110,36 +107,30 @@ impl Default for SipRuntimeConfig {
 impl SipRuntimeConfig {
     fn validate(&self) -> Result<(u32, u32)> {
         if !self.enable_udp && !self.enable_tcp {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "at least one of UDP or TCP must be enabled".into(),
             ));
         }
         if self.async_count == 0 {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "async_count must be greater than zero".into(),
             ));
         }
         if self.auth_realm.is_empty() || self.auth_realm.as_bytes().contains(&0) {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "auth_realm must be non-empty and contain no NUL byte".into(),
             ));
         }
         if self.max_pending_auth == 0 {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "max_pending_auth must be greater than zero".into(),
             ));
         }
         if self.io_queue_capacity == 0 {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "io_queue_capacity must be greater than zero".into(),
             ));
         }
-        if self.log_target.is_empty() {
-            return Err(SipError::InvalidConfig(
-                "log_target must be non-empty".into(),
-            ));
-        }
-
         Ok((
             duration_millis("poll_timeout", self.poll_timeout)?,
             duration_millis("auth_lookup_timeout", self.auth_lookup_timeout)?,
@@ -289,16 +280,11 @@ enum TransmitSender {
     Test(SyncSender<SipTransmit>),
 }
 
-struct LogState {
-    target: String,
-}
-
 pub struct SipRuntime {
     raw: NonNull<gmv_sip_runtime_t>,
     stopped: bool,
     event_state: Box<EventState>,
     _transmit_state: Box<TransmitState>,
-    _log_state: Box<LogState>,
     io_commands: Receiver<RuntimeIoCommand>,
     _socket_io: Option<SocketIoRuntime>,
     _runtime_guard: MutexGuard<'static, ()>,
@@ -314,7 +300,7 @@ impl SipRuntime {
         let (poll_timeout_ms, auth_lookup_timeout_ms) = config.validate()?;
         let runtime_guard = match RUNTIME_LOCK.try_lock() {
             Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => return Err(SipError::RuntimeActive),
+            Err(TryLockError::WouldBlock) => return Err(runtime_active()),
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
 
@@ -327,10 +313,6 @@ impl SipRuntime {
         let mut transmit_state = Box::new(TransmitState {
             sender: TransmitSender::SocketIo(transmit_sender),
         });
-        let mut log_state = Box::new(LogState {
-            target: config.log_target.clone(),
-        });
-
         let mut ffi_config = MaybeUninit::<gmv_sip_runtime_config_t>::uninit();
         // SAFETY: The C initializer writes the complete config structure.
         unsafe { gmv_sip_runtime_config_init(ffi_config.as_mut_ptr()) };
@@ -356,9 +338,11 @@ impl SipRuntime {
         ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
         ffi_config.send_callback = Some(runtime_send_callback);
         ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
-        ffi_config.log_level = pjsip_log_level(log::max_level());
-        ffi_config.log_callback = Some(runtime_log_callback);
-        ffi_config.log_user_data = ptr::from_mut(log_state.as_mut()).cast();
+        if base::log::log_enabled!(base::log::Level::Trace) {
+            ffi_config.log_level = 5;
+            ffi_config.log_callback = Some(runtime_log_callback);
+            ffi_config.log_user_data = ptr::null_mut();
+        }
 
         let mut raw = ptr::null_mut();
         // SAFETY: The config, callback state, and output pointer remain valid
@@ -367,9 +351,8 @@ impl SipRuntime {
         if status != 0 {
             return Err(pjsip_error("runtime_create", status));
         }
-        let raw = NonNull::new(raw).ok_or_else(|| {
-            SipError::Internal("PJSIP runtime create returned a null handle".into())
-        })?;
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| internal_error("PJSIP runtime create returned a null handle".into()))?;
 
         // SAFETY: `raw` is the uniquely owned handle returned by create.
         let status = unsafe { gmv_sip_runtime_start(raw.as_ptr()) };
@@ -379,12 +362,7 @@ impl SipRuntime {
             unsafe { gmv_sip_runtime_destroy(raw.as_ptr()) };
             return Err(pjsip_error("runtime_start", status));
         }
-        let socket_io = match SocketIoRuntime::start(
-            sockets,
-            transmits,
-            io_command_sender,
-            config.log_target.clone(),
-        ) {
+        let socket_io = match SocketIoRuntime::start(sockets, transmits, io_command_sender) {
             Ok(socket_io) => socket_io,
             Err(err) => {
                 // SAFETY: Start succeeded and the runtime is still uniquely owned here.
@@ -400,7 +378,6 @@ impl SipRuntime {
                 stopped: false,
                 event_state,
                 _transmit_state: transmit_state,
-                _log_state: log_state,
                 io_commands,
                 _socket_io: Some(socket_io),
                 _runtime_guard: runtime_guard,
@@ -417,7 +394,7 @@ impl SipRuntime {
         let (poll_timeout_ms, auth_lookup_timeout_ms) = config.validate()?;
         let runtime_guard = match RUNTIME_LOCK.try_lock() {
             Ok(guard) => guard,
-            Err(TryLockError::WouldBlock) => return Err(SipError::RuntimeActive),
+            Err(TryLockError::WouldBlock) => return Err(runtime_active()),
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
 
@@ -430,10 +407,6 @@ impl SipRuntime {
         let mut transmit_state = Box::new(TransmitState {
             sender: TransmitSender::Test(transmit_sender),
         });
-        let mut log_state = Box::new(LogState {
-            target: config.log_target.clone(),
-        });
-
         let mut ffi_config = MaybeUninit::<gmv_sip_runtime_config_t>::uninit();
         // SAFETY: The C initializer writes the complete config structure.
         unsafe { gmv_sip_runtime_config_init(ffi_config.as_mut_ptr()) };
@@ -459,9 +432,11 @@ impl SipRuntime {
         ffi_config.auth_lookup_timeout_ms = auth_lookup_timeout_ms;
         ffi_config.send_callback = Some(runtime_send_callback);
         ffi_config.send_user_data = ptr::from_mut(transmit_state.as_mut()).cast();
-        ffi_config.log_level = pjsip_log_level(log::max_level());
-        ffi_config.log_callback = Some(runtime_log_callback);
-        ffi_config.log_user_data = ptr::from_mut(log_state.as_mut()).cast();
+        if base::log::log_enabled!(base::log::Level::Trace) {
+            ffi_config.log_level = 5;
+            ffi_config.log_callback = Some(runtime_log_callback);
+            ffi_config.log_user_data = ptr::null_mut();
+        }
 
         let mut raw = ptr::null_mut();
         // SAFETY: The config, callback state, and output pointer remain valid
@@ -470,9 +445,8 @@ impl SipRuntime {
         if status != 0 {
             return Err(pjsip_error("runtime_create", status));
         }
-        let raw = NonNull::new(raw).ok_or_else(|| {
-            SipError::Internal("PJSIP runtime create returned a null handle".into())
-        })?;
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| internal_error("PJSIP runtime create returned a null handle".into()))?;
 
         // SAFETY: `raw` is the uniquely owned handle returned by create.
         let status = unsafe { gmv_sip_runtime_start(raw.as_ptr()) };
@@ -489,7 +463,6 @@ impl SipRuntime {
                 stopped: false,
                 event_state,
                 _transmit_state: transmit_state,
-                _log_state: log_state,
                 io_commands,
                 _socket_io: None,
                 _runtime_guard: runtime_guard,
@@ -537,9 +510,7 @@ impl SipRuntime {
 
     pub fn poll(&mut self) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
-                "cannot poll after runtime stop".into(),
-            ));
+            return Err(invalid_config("cannot poll after runtime stop".into()));
         }
         self.drain_io_commands();
         // SAFETY: The runtime handle is valid and this non-Send wrapper keeps
@@ -568,7 +539,7 @@ impl SipRuntime {
                         remote_addr,
                         &data,
                     ) {
-                        log::warn!(
+                        base::log::trace!(
                             "deliver SIP socket packet failed: association_id={}, protocol={protocol:?}, err={err}",
                             association_id
                         );
@@ -576,7 +547,9 @@ impl SipRuntime {
                 }
                 RuntimeIoCommand::CompleteSend { send_id, result } => {
                     if let Err(err) = self.complete_send(send_id, result) {
-                        log::warn!("complete SIP socket send failed: send_id={send_id}, err={err}");
+                        base::log::trace!(
+                            "complete SIP socket send failed: send_id={send_id}, err={err}"
+                        );
                     }
                 }
                 RuntimeIoCommand::TransportClosed {
@@ -587,7 +560,7 @@ impl SipRuntime {
                     status,
                 } => {
                     if let Err(err) = self.close_transport(association_id, protocol, status) {
-                        log::warn!(
+                        base::log::trace!(
                             "close SIP transport failed: association_id={association_id}, err={err}"
                         );
                     }
@@ -630,12 +603,12 @@ impl SipRuntime {
         result: SipAuthLookupResult,
     ) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot complete auth lookup after runtime stop".into(),
             ));
         }
         if lookup_id == 0 {
-            return Err(SipError::InvalidConfig("lookup_id must be non-zero".into()));
+            return Err(invalid_config("lookup_id must be non-zero".into()));
         }
 
         let mut completion = gmv_sip_auth_lookup_completion_t {
@@ -695,17 +668,17 @@ impl SipRuntime {
         data: &[u8],
     ) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot receive packet after runtime stop".into(),
             ));
         }
         if data.is_empty() {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "received SIP packet must not be empty".into(),
             ));
         }
         if !local_addr.is_ipv4() || !remote_addr.is_ipv4() {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "SIP runtime socket adapter supports IPv4 only".into(),
             ));
         }
@@ -714,7 +687,7 @@ impl SipRuntime {
             SipTransportProtocol::Tcp | SipTransportProtocol::Tls
         ) && association_id == 0
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "reliable transport association_id must be non-zero".into(),
             ));
         }
@@ -747,13 +720,13 @@ impl SipRuntime {
         result: std::result::Result<usize, i32>,
     ) -> Result<()> {
         if self.stopped || send_id == 0 {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot complete an invalid or stopped send".into(),
             ));
         }
         let sent_bytes = match result {
             Ok(bytes) => i64::try_from(bytes)
-                .map_err(|_| SipError::InvalidConfig("sent byte count exceeds i64".into()))?,
+                .map_err(|_| invalid_config("sent byte count exceeds i64".into()))?,
             Err(status) => -i64::from(status.abs().max(1)),
         };
         let completion = gmv_sip_send_completion_t {
@@ -777,7 +750,7 @@ impl SipRuntime {
         status: i32,
     ) -> Result<()> {
         if self.stopped || association_id == 0 || protocol != SipTransportProtocol::Tcp {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "only an active TCP association can be closed".into(),
             ));
         }
@@ -798,19 +771,17 @@ impl SipRuntime {
 
     pub fn send_message(&mut self, message: &SipOutboundMessage) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot send MESSAGE after runtime stop".into(),
             ));
         }
         if message.operation_id == 0 {
-            return Err(SipError::InvalidConfig(
-                "operation_id must be non-zero".into(),
-            ));
+            return Err(invalid_config("operation_id must be non-zero".into()));
         }
         if message.protocol == SipTransportProtocol::Tls
             || (message.protocol == SipTransportProtocol::Tcp && message.association_id == 0)
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "outbound MESSAGE requires a valid UDP/TCP association".into(),
             ));
         }
@@ -821,7 +792,7 @@ impl SipRuntime {
             || message.from_uri.as_bytes().contains(&0)
             || message.content_type.as_bytes().contains(&0)
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "target_uri, from_uri, and content_type are required".into(),
             ));
         }
@@ -848,19 +819,17 @@ impl SipRuntime {
 
     pub fn send_invite(&mut self, invite: &SipOutboundInvite) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot send INVITE after runtime stop".into(),
             ));
         }
         if invite.operation_id == 0 {
-            return Err(SipError::InvalidConfig(
-                "operation_id must be non-zero".into(),
-            ));
+            return Err(invalid_config("operation_id must be non-zero".into()));
         }
         if invite.protocol == SipTransportProtocol::Tls
             || (invite.protocol == SipTransportProtocol::Tcp && invite.association_id == 0)
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "outbound INVITE requires a valid UDP/TCP association".into(),
             ));
         }
@@ -877,7 +846,7 @@ impl SipRuntime {
                 .as_deref()
                 .is_some_and(|subject| subject.as_bytes().contains(&0))
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "target_uri, from_uri, contact_uri, and SDP are required".into(),
             ));
         }
@@ -912,12 +881,12 @@ impl SipRuntime {
 
     pub fn send_dialog_request(&mut self, request: &SipDialogRequest) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot send dialog request after runtime stop".into(),
             ));
         }
         if request.operation_id == 0 || request.call_id.is_empty() {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "operation_id and call_id are required".into(),
             ));
         }
@@ -927,7 +896,7 @@ impl SipRuntime {
                 .as_deref()
                 .is_some_and(|value| value.as_bytes().contains(&0))
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "dialog request strings must contain no NUL byte".into(),
             ));
         }
@@ -938,9 +907,7 @@ impl SipRuntime {
                     .as_deref()
                     .is_some_and(|value| value.contains('/')))
         {
-            return Err(SipError::InvalidConfig(
-                "INFO requires content_type and body".into(),
-            ));
+            return Err(invalid_config("INFO requires content_type and body".into()));
         }
 
         let ffi_request = gmv_sip_dialog_request_t {
@@ -971,12 +938,12 @@ impl SipRuntime {
 
     pub fn respond_invite(&mut self, response: &SipInviteResponse) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot respond to INVITE after runtime stop".into(),
             ));
         }
         if response.call_id.is_empty() || !(300..=699).contains(&response.status_code) {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "INVITE rejection requires call_id and status 300..699".into(),
             ));
         }
@@ -986,7 +953,7 @@ impl SipRuntime {
                 .as_deref()
                 .is_some_and(|value| value.as_bytes().contains(&0))
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "INVITE response strings must contain no NUL byte".into(),
             ));
         }
@@ -1013,19 +980,17 @@ impl SipRuntime {
 
     pub fn send_subscribe(&mut self, subscribe: &SipOutboundSubscribe) -> Result<()> {
         if self.stopped {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "cannot send SUBSCRIBE after runtime stop".into(),
             ));
         }
         if subscribe.operation_id == 0 || subscribe.event.is_empty() {
-            return Err(SipError::InvalidConfig(
-                "operation_id and event are required".into(),
-            ));
+            return Err(invalid_config("operation_id and event are required".into()));
         }
         if subscribe.protocol == SipTransportProtocol::Tls
             || (subscribe.protocol == SipTransportProtocol::Tcp && subscribe.association_id == 0)
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "outbound SUBSCRIBE requires a valid UDP/TCP association".into(),
             ));
         }
@@ -1036,12 +1001,12 @@ impl SipRuntime {
                 || subscribe.contact_uri.is_empty()
                 || subscribe.expires == 0)
         {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "initial SUBSCRIBE requires target_uri, from_uri, contact_uri, and expires".into(),
             ));
         }
         if !subscribe.body.is_empty() && !subscribe.content_type.contains('/') {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "SUBSCRIBE body requires content_type".into(),
             ));
         }
@@ -1059,7 +1024,7 @@ impl SipRuntime {
                 .as_deref()
                 .is_some_and(|value| value.is_empty() || value.as_bytes().contains(&0));
         if contains_nul {
-            return Err(SipError::InvalidConfig(
+            return Err(invalid_config(
                 "SUBSCRIBE strings must contain no NUL byte".into(),
             ));
         }
@@ -1168,48 +1133,18 @@ unsafe extern "C" fn runtime_send_callback(
 }
 
 unsafe extern "C" fn runtime_log_callback(
-    level: i32,
+    _level: i32,
     message: gmv_sip_string_view_t,
-    user_data: *mut c_void,
+    _user_data: *mut c_void,
 ) {
-    if user_data.is_null() || message.ptr.is_null() || message.len == 0 {
-        return;
-    }
-    let Some(level) = rust_log_level(level) else {
-        return;
-    };
-    // SAFETY: The shim keeps LogState alive and the message view valid for this callback.
-    let state = unsafe { &*(user_data.cast::<LogState>()) };
-    if !log::log_enabled!(target: &state.target, level) {
+    if message.ptr.is_null() || message.len == 0 {
         return;
     }
     // SAFETY: PJSIP supplies a readable message buffer for the callback duration.
     let bytes = unsafe { slice::from_raw_parts(message.ptr.cast::<u8>(), message.len) };
     let message = String::from_utf8_lossy(bytes);
     let message = message.trim_end_matches(['\r', '\n', '\0']);
-    log::log!(target: &state.target, level, "{message}");
-}
-
-fn pjsip_log_level(level: LevelFilter) -> u32 {
-    match level {
-        LevelFilter::Off => 0,
-        LevelFilter::Error => 1,
-        LevelFilter::Warn => 2,
-        LevelFilter::Info => 3,
-        LevelFilter::Debug => 4,
-        LevelFilter::Trace => 5,
-    }
-}
-
-fn rust_log_level(level: i32) -> Option<Level> {
-    match level {
-        i32::MIN..=0 => None,
-        1 => Some(Level::Error),
-        2 => Some(Level::Warn),
-        3 => Some(Level::Info),
-        4 => Some(Level::Debug),
-        _ => Some(Level::Trace),
-    }
+    base::log::trace!("{message}");
 }
 
 fn copy_event(event: &gmv_sip_event_t) -> SipRuntimeEvent {
@@ -1279,24 +1214,22 @@ fn copy_socket_addr(view: gmv_sip_string_view_t, port: u16) -> Option<SocketAddr
 
 fn validate_sockets(config: &SipRuntimeConfig, sockets: &SipRuntimeSockets) -> Result<()> {
     if sockets.udp.is_none() && sockets.tcp.is_none() && sockets.tls.is_none() {
-        return Err(SipError::InvalidConfig(
+        return Err(invalid_config(
             "at least one SIP UDP, TCP, or TLS socket must be provided".into(),
         ));
     }
     if sockets.udp.is_some() && !config.enable_udp {
-        return Err(SipError::InvalidConfig(
+        return Err(invalid_config(
             "UDP socket was provided while enable_udp is false".into(),
         ));
     }
     if sockets.tcp.is_some() && !config.enable_tcp {
-        return Err(SipError::InvalidConfig(
+        return Err(invalid_config(
             "TCP listener was provided while enable_tcp is false".into(),
         ));
     }
     if sockets.tls.is_some() && config.tls.is_none() {
-        return Err(SipError::InvalidConfig(
-            "TLS listener requires SipTlsConfig".into(),
-        ));
+        return Err(invalid_config("TLS listener requires SipTlsConfig".into()));
     }
     Ok(())
 }
@@ -1304,12 +1237,11 @@ fn validate_sockets(config: &SipRuntimeConfig, sockets: &SipRuntimeSockets) -> R
 fn duration_millis(name: &str, duration: Duration) -> Result<u32> {
     let millis = duration.as_millis();
     if millis == 0 {
-        return Err(SipError::InvalidConfig(format!(
+        return Err(invalid_config(format!(
             "{name} must be at least one millisecond"
         )));
     }
-    u32::try_from(millis)
-        .map_err(|_| SipError::InvalidConfig(format!("{name} exceeds the C ABI range")))
+    u32::try_from(millis).map_err(|_| invalid_config(format!("{name} exceeds the C ABI range")))
 }
 
 fn empty_view() -> gmv_sip_string_view_t {
@@ -1397,7 +1329,7 @@ fn copy_bytes_view(view: gmv_sip_string_view_t) -> Vec<u8> {
     unsafe { slice::from_raw_parts(view.ptr.cast::<u8>(), view.len) }.to_vec()
 }
 
-fn pjsip_error(operation: &'static str, status: i32) -> SipError {
+fn pjsip_error(operation: &'static str, status: i32) -> base::exception::GlobalError {
     let mut buffer = [0 as c_char; 256];
     // SAFETY: `buffer` is writable and its length matches the supplied size.
     let message_status =
@@ -1410,36 +1342,7 @@ fn pjsip_error(operation: &'static str, status: i32) -> SipError {
     } else {
         "unknown PJPROJECT error".into()
     };
-    SipError::Pjsip {
-        operation,
-        status,
-        message,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use log::{Level, LevelFilter};
-
-    use super::{pjsip_log_level, rust_log_level};
-
-    #[test]
-    fn maps_rust_log_filters_to_pjsip_levels() {
-        assert_eq!(pjsip_log_level(LevelFilter::Off), 0);
-        assert_eq!(pjsip_log_level(LevelFilter::Error), 1);
-        assert_eq!(pjsip_log_level(LevelFilter::Warn), 2);
-        assert_eq!(pjsip_log_level(LevelFilter::Info), 3);
-        assert_eq!(pjsip_log_level(LevelFilter::Debug), 4);
-        assert_eq!(pjsip_log_level(LevelFilter::Trace), 5);
-    }
-
-    #[test]
-    fn maps_pjsip_levels_to_rust_log_levels() {
-        assert_eq!(rust_log_level(0), None);
-        assert_eq!(rust_log_level(1), Some(Level::Error));
-        assert_eq!(rust_log_level(2), Some(Level::Warn));
-        assert_eq!(rust_log_level(3), Some(Level::Info));
-        assert_eq!(rust_log_level(4), Some(Level::Debug));
-        assert_eq!(rust_log_level(5), Some(Level::Trace));
-    }
+    system_error(format!(
+        "PJSIP operation `{operation}` failed: status={status}, message={message}"
+    ))
 }

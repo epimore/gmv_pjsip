@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener as TokioTcpListener, TcpStream, UdpSocket as TokioUdpSocket};
-use tokio::sync::{mpsc, watch};
+use base::dashmap::DashMap;
+use base::tokio::io::{AsyncReadExt, AsyncWriteExt};
+use base::tokio::net::{TcpListener as TokioTcpListener, TcpStream, UdpSocket as TokioUdpSocket};
+use base::tokio::sync::{mpsc, watch};
 
-use crate::error::{Result, SipError};
+use crate::error::{internal_error, Result};
 use crate::runtime::{SipRuntimeSockets, SipTransmit};
 use crate::transport::SipTransportProtocol;
 
@@ -46,32 +46,25 @@ impl SocketIoRuntime {
         sockets: SipRuntimeSockets,
         transmits: mpsc::Receiver<SipTransmit>,
         commands: std::sync::mpsc::SyncSender<RuntimeIoCommand>,
-        log_target: String,
     ) -> Result<Self> {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let thread = thread::Builder::new()
             .name("gmv-pjsip-io".into())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
+                let runtime = match base::tokio::runtime::Builder::new_current_thread()
                     .enable_io()
                     .enable_time()
                     .build()
                 {
                     Ok(runtime) => runtime,
                     Err(err) => {
-                        log::error!(target: &log_target, "start SIP socket runtime failed: {err}");
+                        base::log::error!("start SIP socket runtime failed: {err}");
                         return;
                     }
                 };
-                runtime.block_on(run_io(
-                    sockets,
-                    transmits,
-                    commands,
-                    shutdown_rx,
-                    log_target,
-                ));
+                runtime.block_on(run_io(sockets, transmits, commands, shutdown_rx));
             })
-            .map_err(|err| SipError::Internal(format!("spawn SIP socket IO task failed: {err}")))?;
+            .map_err(|err| internal_error(format!("spawn SIP socket IO task failed: {err}")))?;
         Ok(Self {
             shutdown,
             thread: Some(thread),
@@ -93,7 +86,6 @@ async fn run_io(
     mut transmits: mpsc::Receiver<SipTransmit>,
     commands: std::sync::mpsc::SyncSender<RuntimeIoCommand>,
     mut shutdown: watch::Receiver<bool>,
-    log_target: String,
 ) {
     let writers = Arc::new(DashMap::new());
     let next_association_id = Arc::new(AtomicU64::new(1));
@@ -102,50 +94,43 @@ async fn run_io(
         Some(socket) => match prepare_udp_socket(socket) {
             Ok(socket) => Some(socket),
             Err(err) => {
-                log::warn!(target: &log_target, "prepare SIP UDP socket failed: {err}");
+                base::log::warn!("prepare SIP UDP socket failed: {err}");
                 None
             }
         },
         None => None,
     };
     if let Some(socket) = udp.clone() {
-        tokio::spawn(read_udp(
-            socket,
-            commands.clone(),
-            shutdown.clone(),
-            log_target.clone(),
-        ));
+        base::tokio::spawn(read_udp(socket, commands.clone(), shutdown.clone()));
     }
 
     if let Some(listener) = sockets.tcp {
         match prepare_tcp_listener(listener) {
             Ok(listener) => {
-                tokio::spawn(accept_tcp(
+                base::tokio::spawn(accept_tcp(
                     listener,
                     commands.clone(),
                     writers.clone(),
                     next_association_id.clone(),
                     shutdown.clone(),
-                    log_target.clone(),
                 ));
             }
             Err(err) => {
-                log::warn!(target: &log_target, "prepare SIP TCP listener failed: {err}");
+                base::log::warn!("prepare SIP TCP listener failed: {err}");
             }
         }
     }
 
     if sockets.tls.is_some() {
-        log::warn!(
-            target: &log_target,
+        base::log::warn!(
             "SIP TLS listener was provided, but production certificate loading is not configured"
         );
     }
 
     loop {
-        tokio::select! {
+        base::tokio::select! {
             Some(transmit) = transmits.recv() => {
-                write_transmit(transmit, udp.as_ref(), &writers, &commands, &log_target).await;
+                write_transmit(transmit, udp.as_ref(), &writers, &commands).await;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -159,42 +144,40 @@ async fn run_io(
 fn prepare_udp_socket(socket: UdpSocket) -> Result<Arc<TokioUdpSocket>> {
     socket
         .set_nonblocking(true)
-        .map_err(|err| SipError::Internal(format!("set UDP socket nonblocking failed: {err}")))?;
+        .map_err(|err| internal_error(format!("set UDP socket nonblocking failed: {err}")))?;
     TokioUdpSocket::from_std(socket)
         .map(Arc::new)
-        .map_err(|err| SipError::Internal(format!("adopt UDP socket failed: {err}")))
+        .map_err(|err| internal_error(format!("adopt UDP socket failed: {err}")))
 }
 
 fn prepare_tcp_listener(listener: TcpListener) -> Result<TokioTcpListener> {
     listener
         .set_nonblocking(true)
-        .map_err(|err| SipError::Internal(format!("set TCP listener nonblocking failed: {err}")))?;
+        .map_err(|err| internal_error(format!("set TCP listener nonblocking failed: {err}")))?;
     TokioTcpListener::from_std(listener)
-        .map_err(|err| SipError::Internal(format!("adopt TCP listener failed: {err}")))
+        .map_err(|err| internal_error(format!("adopt TCP listener failed: {err}")))
 }
 
 async fn read_udp(
     socket: Arc<TokioUdpSocket>,
     commands: std::sync::mpsc::SyncSender<RuntimeIoCommand>,
     mut shutdown: watch::Receiver<bool>,
-    log_target: String,
 ) {
     let local_addr = match socket.local_addr() {
         Ok(addr) => addr,
         Err(err) => {
-            log::warn!(target: &log_target, "read SIP UDP local address failed: {err}");
+            base::log::warn!("read SIP UDP local address failed: {err}");
             return;
         }
     };
     let mut buffer = vec![0; UDP_BUFFER_SIZE];
     loop {
-        tokio::select! {
+        base::tokio::select! {
             received = socket.recv_from(&mut buffer) => {
                 match received {
                     Ok((len, remote_addr)) if len > 0 => {
                         let data = buffer[..len].to_vec();
                         log_complete_sip_packet(
-                            &log_target,
                             SipTransportProtocol::Udp,
                             0,
                             local_addr,
@@ -211,8 +194,8 @@ async fn read_udp(
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        log::warn!(target: &log_target, "read SIP UDP packet failed: {err}");
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        base::log::warn!("read SIP UDP packet failed: {err}");
+                        base::tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }
             }
@@ -231,26 +214,24 @@ async fn accept_tcp(
     writers: Arc<DashMap<u64, mpsc::Sender<Vec<u8>>>>,
     next_association_id: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
-    log_target: String,
 ) {
     loop {
-        tokio::select! {
+        base::tokio::select! {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, remote_addr)) => {
                         let association_id = next_association_id.fetch_add(1, Ordering::Relaxed);
-                        tokio::spawn(handle_tcp_stream(
+                        base::tokio::spawn(handle_tcp_stream(
                             association_id,
                             stream,
                             remote_addr,
                             commands.clone(),
                             writers.clone(),
-                            log_target.clone(),
                         ));
                     }
                     Err(err) => {
-                        log::warn!(target: &log_target, "accept SIP TCP connection failed: {err}");
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        base::log::warn!("accept SIP TCP connection failed: {err}");
+                        base::tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 }
             }
@@ -269,12 +250,11 @@ async fn handle_tcp_stream(
     remote_addr: SocketAddr,
     commands: std::sync::mpsc::SyncSender<RuntimeIoCommand>,
     writers: Arc<DashMap<u64, mpsc::Sender<Vec<u8>>>>,
-    log_target: String,
 ) {
     let local_addr = match stream.local_addr() {
         Ok(addr) => addr,
         Err(err) => {
-            log::warn!(target: &log_target, "read SIP TCP local address failed: {err}");
+            base::log::warn!("read SIP TCP local address failed: {err}");
             return;
         }
     };
@@ -283,7 +263,7 @@ async fn handle_tcp_stream(
     writers.insert(association_id, writer_tx);
 
     let writer_commands = commands.clone();
-    tokio::spawn(async move {
+    base::tokio::spawn(async move {
         while let Some(data) = writer_rx.recv().await {
             if writer.write_all(&data).await.is_err() {
                 break;
@@ -300,7 +280,6 @@ async fn handle_tcp_stream(
                 buffer.extend_from_slice(&chunk[..len]);
                 while let Some(message) = next_sip_message(&mut buffer) {
                     log_complete_sip_packet(
-                        &log_target,
                         SipTransportProtocol::Tcp,
                         association_id,
                         local_addr,
@@ -317,8 +296,7 @@ async fn handle_tcp_stream(
                 }
             }
             Err(err) => {
-                log::warn!(
-                    target: &log_target,
+                base::log::warn!(
                     "read SIP TCP connection failed: association_id={association_id}, err={err}"
                 );
                 break;
@@ -340,9 +318,8 @@ async fn write_transmit(
     udp: Option<&Arc<TokioUdpSocket>>,
     writers: &DashMap<u64, mpsc::Sender<Vec<u8>>>,
     commands: &std::sync::mpsc::SyncSender<RuntimeIoCommand>,
-    log_target: &str,
 ) {
-    log_outgoing_sip_packet(log_target, &transmit);
+    log_outgoing_sip_packet(&transmit);
     let result = match transmit.protocol {
         SipTransportProtocol::Udp => match udp {
             Some(socket) => socket
@@ -387,16 +364,14 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 }
 
 fn log_complete_sip_packet(
-    target: &str,
     protocol: SipTransportProtocol,
     association_id: u64,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
     data: &[u8],
 ) {
-    log::debug!(
-        target: target,
-        "complete SIP packet: protocol={} association={} local={} remote={} bytes={} payload={}",
+    base::log::debug!(
+        "\nread : [protocol={} association={} local={} remote={} bytes={}]\n{}",
         protocol.as_sip_token(),
         association_id,
         local_addr,
@@ -406,10 +381,9 @@ fn log_complete_sip_packet(
     );
 }
 
-fn log_outgoing_sip_packet(target: &str, transmit: &SipTransmit) {
-    log::debug!(
-        target: target,
-        "outgoing SIP packet: protocol={} association={} local={} remote={} bytes={} payload={}",
+fn log_outgoing_sip_packet(transmit: &SipTransmit) {
+    base::log::debug!(
+        "\nwrite : [protocol={} association={} local={} remote={} bytes={}]\n{}",
         transmit.protocol.as_sip_token(),
         transmit.association_id,
         transmit.local_addr,
@@ -421,7 +395,7 @@ fn log_outgoing_sip_packet(target: &str, transmit: &SipTransmit) {
 
 fn escape_payload(data: &[u8]) -> String {
     String::from_utf8_lossy(data)
-        .replace('\\', "\\\\")
-        .replace('\r', "\\r")
+        // .replace('\\', "\\\\")
+        // .replace('\r', "\\r")
         .replace('\n', "\\n")
 }

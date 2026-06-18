@@ -13,13 +13,13 @@ pub mod message;
 mod runtime;
 pub mod transport;
 
-pub use bytes::Bytes;
+pub use base::bytes::Bytes;
+pub use base::exception::{GlobalError, GlobalResult};
 
 pub use auth::{
     AuthAlgorithm, AuthConfig, AuthCredential, AuthDecision, AuthRequirement, CredentialKind,
     PasswordProvider, StaticPasswordProvider,
 };
-pub use error::{Result, SipError};
 pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
 pub use message::SipMethod;
 pub use runtime::{

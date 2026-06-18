@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 
 use crate::auth::{AuthAlgorithm, AuthCredential, CredentialKind};
-use crate::error::{Result, SipError};
+use crate::error::{auth_failed, Result};
 
 fn alg_id(algorithm: AuthAlgorithm) -> c_int {
     // SAFETY: These shim functions take no pointers and return stable PJSIP enum values.
@@ -21,7 +21,7 @@ pub fn is_algorithm_supported(algorithm: AuthAlgorithm) -> bool {
 }
 
 fn cstring(name: &str, value: &str) -> Result<CString> {
-    CString::new(value).map_err(|_| SipError::AuthFailed(format!("{name} contains NUL byte")))
+    CString::new(value).map_err(|_| auth_failed(format!("{name} contains NUL byte")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -36,7 +36,7 @@ pub fn create_digest_response(
     algorithm: AuthAlgorithm,
 ) -> Result<String> {
     if !is_algorithm_supported(algorithm) {
-        return Err(SipError::AuthFailed(format!(
+        return Err(auth_failed(format!(
             "PJSIP does not support digest algorithm {}",
             algorithm.iana_name()
         )));
@@ -82,7 +82,7 @@ pub fn create_digest_response(
     };
 
     if status != 0 {
-        return Err(SipError::AuthFailed(format!(
+        return Err(auth_failed(format!(
             "pjsip_auth_create_digest2 failed: pj_status={status}"
         )));
     }

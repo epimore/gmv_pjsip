@@ -15,7 +15,7 @@
 use std::marker::PhantomData;
 
 use crate::auth::AuthAlgorithm;
-use crate::error::{Result, SipError};
+use crate::error::{auth_failed, Result};
 
 pub struct PjRxDataHandle<'a> {
     pub raw: *mut gmv_pjsip_sys::pjsip_rx_data,
@@ -31,7 +31,7 @@ pub struct PjAuthServer;
 
 impl PjAuthServer {
     pub fn verify_rdata(&self, _rdata: PjRxDataHandle<'_>) -> Result<()> {
-        Err(SipError::AuthFailed(
+        Err(auth_failed(
             "PJSIP rdata auth path is reserved; current adapter uses PJSIP digest shim until parser retains pjsip_rx_data".into(),
         ))
     }
@@ -41,7 +41,7 @@ impl PjAuthServer {
         _tdata: PjTxDataHandle<'_>,
         _algorithm: AuthAlgorithm,
     ) -> Result<()> {
-        Err(SipError::AuthFailed(
+        Err(auth_failed(
             "PJSIP tdata challenge path is reserved; current adapter builds textual challenge while digest verification uses PJSIP".into(),
         ))
     }
