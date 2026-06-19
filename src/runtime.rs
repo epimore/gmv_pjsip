@@ -329,6 +329,8 @@ pub struct SipInviteResponse {
     pub call_id: String,
     pub status_code: u16,
     pub reason: Option<String>,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
 }
 
 struct EventState {
@@ -1144,14 +1146,26 @@ impl SipRuntime {
                 "cannot respond to INVITE after runtime stop".into(),
             ));
         }
-        if response.call_id.is_empty() || !(300..=699).contains(&response.status_code) {
+        if response.call_id.is_empty() || !(200..=699).contains(&response.status_code) {
             return Err(invalid_config(
-                "INVITE rejection requires call_id and status 300..699".into(),
+                "INVITE response requires call_id and status 200..699".into(),
+            ));
+        }
+        if response.status_code < 300
+            && (response.content_type.as_deref() != Some("application/sdp")
+                || response.body.is_empty())
+        {
+            return Err(invalid_config(
+                "INVITE 2xx requires application/sdp body".into(),
             ));
         }
         if response.call_id.as_bytes().contains(&0)
             || response
                 .reason
+                .as_deref()
+                .is_some_and(|value| value.as_bytes().contains(&0))
+            || response
+                .content_type
                 .as_deref()
                 .is_some_and(|value| value.as_bytes().contains(&0))
         {
@@ -1170,6 +1184,12 @@ impl SipRuntime {
                 .as_deref()
                 .map(string_view)
                 .unwrap_or_else(empty_view),
+            content_type: response
+                .content_type
+                .as_deref()
+                .map(string_view)
+                .unwrap_or_else(empty_view),
+            body: bytes_view(&response.body),
         };
         // SAFETY: The runtime handle is valid and the shim copies all views
         // before this synchronous call returns.

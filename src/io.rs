@@ -371,31 +371,29 @@ fn log_complete_sip_packet(
     data: &[u8],
 ) {
     base::log::debug!(
-        "\nread : [protocol={} association={} local={} remote={} bytes={}]\n{}",
+        "rx: protocol={} association={} local={} remote={} data={}",
         protocol.as_sip_token(),
         association_id,
         local_addr,
         remote_addr,
-        data.len(),
         escape_payload(data)
     );
 }
 
 fn log_outgoing_sip_packet(transmit: &SipTransmit) {
     base::log::debug!(
-        "\nwrite : [protocol={} association={} local={} remote={} bytes={}]\n{}",
+        "tx: protocol={} association={} local={} remote={} data={}",
         transmit.protocol.as_sip_token(),
         transmit.association_id,
         transmit.local_addr,
         transmit.remote_addr,
-        transmit.data.len(),
         escape_payload(&transmit.data)
     );
 }
 
 fn escape_payload(data: &[u8]) -> String {
     String::from_utf8_lossy(data)
-        // .replace('\\', "\\\\")
+        .replace('\\', "\\\\")
         .replace('\r', "\\r")
         .replace('\n', "\\n")
 }

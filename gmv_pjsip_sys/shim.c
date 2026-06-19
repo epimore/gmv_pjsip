@@ -174,6 +174,9 @@ typedef struct gmv_invite_response_command {
     uint16_t status_code;
     char call_id[GMV_SIP_CALL_ID_CAPACITY];
     char reason[GMV_SIP_REASON_CAPACITY];
+    char content_type[GMV_SIP_CONTENT_TYPE_CAPACITY];
+    unsigned char *body;
+    size_t body_len;
     struct gmv_invite_response_command *next;
 } gmv_invite_response_command_t;
 
@@ -3241,6 +3244,10 @@ static void gmv_free_dialog_command(gmv_dialog_command_t *command) {
 
 static void gmv_free_invite_response_command(
     gmv_invite_response_command_t *command) {
+    if (!command) {
+        return;
+    }
+    free(command->body);
     free(command);
 }
 
@@ -4551,7 +4558,7 @@ static pj_status_t gmv_respond_invite_on_owner(
     gmv_sip_runtime_t *runtime,
     const gmv_invite_response_command_t *command) {
     if (!runtime || !command ||
-        command->status_code < 300 ||
+        command->status_code < 200 ||
         command->status_code > 699 ||
         !command->call_id[0] ||
         !runtime->started) {
@@ -4563,13 +4570,38 @@ static pj_status_t gmv_respond_invite_on_owner(
         return PJ_ENOTFOUND;
     }
 
+    pjmedia_sdp_session *local_sdp = NULL;
+    if (command->status_code < 300) {
+        if (!command->content_type[0] || !command->body ||
+            command->body_len == 0 ||
+            pj_ansi_stricmp(command->content_type, "application/sdp") != 0) {
+            return PJ_EINVAL;
+        }
+        char *sdp_buffer = (char *)pj_pool_alloc(
+            call->invite->dlg->pool,
+            command->body_len + 1u);
+        if (!sdp_buffer) {
+            return PJ_ENOMEM;
+        }
+        memcpy(sdp_buffer, command->body, command->body_len);
+        sdp_buffer[command->body_len] = '\0';
+        pj_status_t parse_status = pjmedia_sdp_parse(
+            call->invite->dlg->pool,
+            sdp_buffer,
+            command->body_len,
+            &local_sdp);
+        if (parse_status != PJ_SUCCESS) {
+            return parse_status;
+        }
+    }
+
     pj_str_t reason = pj_str((char *)command->reason);
     pjsip_tx_data *tdata = NULL;
     pj_status_t status = pjsip_inv_answer(
         call->invite,
         command->status_code,
         command->reason[0] ? &reason : NULL,
-        NULL,
+        local_sdp,
         &tdata);
     if (status == PJ_SUCCESS) {
         status = pjsip_inv_send_msg(call->invite, tdata);
@@ -5050,7 +5082,7 @@ int32_t gmv_sip_runtime_respond_invite(
     if (!runtime || !response ||
         response->size < sizeof(*response) ||
         response->version != GMV_SIP_ABI_VERSION ||
-        response->status_code < 300 ||
+        response->status_code < 200 ||
         response->status_code > 699 ||
         !response->call_id.ptr ||
         response->call_id.len == 0 ||
@@ -5074,9 +5106,27 @@ int32_t gmv_sip_runtime_respond_invite(
         !gmv_copy_view(
             command->reason,
             sizeof(command->reason),
-            response->reason)) {
+            response->reason) ||
+        !gmv_copy_view(
+            command->content_type,
+            sizeof(command->content_type),
+            response->content_type)) {
         gmv_free_invite_response_command(command);
         return PJ_ETOOSMALL;
+    }
+    if (response->body.len > 0) {
+        command->body = (unsigned char *)malloc(response->body.len);
+        if (!command->body) {
+            gmv_free_invite_response_command(command);
+            return PJ_ENOMEM;
+        }
+        memcpy(command->body, response->body.ptr, response->body.len);
+        command->body_len = response->body.len;
+    }
+    if (response->status_code < 300 &&
+        (!command->content_type[0] || command->body_len == 0)) {
+        gmv_free_invite_response_command(command);
+        return PJ_EINVAL;
     }
 
     pj_mutex_lock(runtime->command_mutex);

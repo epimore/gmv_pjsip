@@ -1112,6 +1112,8 @@ Content-Length: 0\r\n\r\n",
             call_id: "unsupported-invite".into(),
             status_code: 501,
             reason: Some("Inbound session is not supported".into()),
+            content_type: None,
+            body: Vec::new(),
         })
         .expect("reject unsupported incoming INVITE");
     let unsupported_response = receive_transmit(&mut runtime, &transmits);
@@ -1122,6 +1124,135 @@ Content-Length: 0\r\n\r\n",
         .expect("complete unsupported INVITE response");
 
     runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn runtime_adapter_accepts_incoming_audio_invite_and_sends_bye() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config.clone());
+    let remote = remote_addr(40007);
+    let remote_sdp = "v=0\r\n\
+o=receiver 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 30008 RTP/AVP 8\r\n\
+a=recvonly\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+y=0400000004\r\n";
+    let invite = format!(
+        "INVITE sip:platform@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bK-broadcast;rport\r\n\
+From: <sip:receiver@{}>;tag=receiver-broadcast\r\n\
+To: <sip:platform@{}>\r\n\
+Call-ID: incoming-broadcast\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:receiver@{}>\r\n\
+Subject: source:0400000004,receiver:0400000004\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: application/sdp\r\n\
+Content-Length: {}\r\n\r\n{}",
+        local_addr(),
+        remote,
+        remote,
+        local_addr(),
+        remote,
+        remote_sdp.len(),
+        remote_sdp
+    );
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            invite.as_bytes(),
+        )
+        .expect("inject broadcast INVITE");
+    let trying = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &trying).starts_with("SIP/2.0 100"));
+    let incoming = receive_event(&mut runtime, &events, SipRuntimeEventKind::IncomingInvite);
+    assert_eq!(incoming.call_id.as_deref(), Some("incoming-broadcast"));
+    let mut snapshot = incoming.dialog_snapshot.expect("UAS dialog snapshot");
+    assert_eq!(snapshot.call_id, "incoming-broadcast");
+    assert_eq!(snapshot.remote_tag, "receiver-broadcast");
+
+    let local_sdp = "v=0\r\n\
+o=platform 0 0 IN IP4 127.0.0.1\r\n\
+s=Play\r\n\
+c=IN IP4 127.0.0.1\r\n\
+t=0 0\r\n\
+m=audio 16060 RTP/AVP 8\r\n\
+a=sendonly\r\n\
+a=rtpmap:8 PCMA/8000\r\n\
+y=0400000004\r\n";
+    runtime
+        .respond_invite(&SipInviteResponse {
+            call_id: "incoming-broadcast".into(),
+            status_code: 200,
+            reason: None,
+            content_type: Some("application/sdp".into()),
+            body: local_sdp.as_bytes().to_vec(),
+        })
+        .expect("accept broadcast INVITE");
+    let ok = receive_transmit(&mut runtime, &transmits);
+    let ok = finish_transmit(&mut runtime, &ok);
+    assert!(ok.starts_with("SIP/2.0 200"));
+    assert_eq!(header_value(&ok, "Content-Type"), "application/sdp");
+    assert!(ok.contains("m=audio 16060 RTP/AVP 8"));
+    assert!(ok.contains("a=sendonly"));
+    assert!(ok.contains("a=rtpmap:8 PCMA/8000"));
+
+    let ack = format!(
+        "ACK sip:platform@{} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {};branch=z9hG4bK-broadcast-ack;rport\r\n\
+From: <sip:receiver@{}>;tag=receiver-broadcast\r\n\
+To: {}\r\n\
+Call-ID: incoming-broadcast\r\n\
+CSeq: 1 ACK\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n",
+        local_addr(),
+        remote,
+        remote,
+        header_value(&ok, "To")
+    );
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            ack.as_bytes(),
+        )
+        .expect("inject broadcast ACK");
+    runtime.poll().expect("process broadcast ACK");
+
+    runtime.shutdown().expect("shutdown original runtime");
+
+    snapshot.local_cseq = snapshot.local_cseq.saturating_add(1);
+    let (mut runtime, _events, transmits) = start_runtime(config);
+    runtime
+        .send_restored_dialog_request(&SipRestoredDialogRequest {
+            operation_id: 301,
+            method: SipDialogMethod::Bye,
+            snapshot: snapshot.clone(),
+            content_type: None,
+            body: Vec::new(),
+        })
+        .expect("send restored broadcast BYE");
+    let bye = receive_transmit(&mut runtime, &transmits);
+    let bye = finish_transmit(&mut runtime, &bye);
+    assert!(bye.starts_with("BYE "));
+    assert_eq!(header_value(&bye, "Call-ID"), snapshot.call_id);
+    assert!(header_value(&bye, "From").contains(&snapshot.local_tag));
+    assert!(header_value(&bye, "To").contains(&snapshot.remote_tag));
+
+    runtime.shutdown().expect("shutdown restored runtime");
 }
 
 #[test]
