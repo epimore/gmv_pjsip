@@ -123,6 +123,7 @@ typedef struct gmv_message_command {
     uint64_t operation_id;
     uint64_t association_id;
     int32_t transport;
+    uint32_t cseq;
     char target_uri[1024];
     char from_uri[1024];
     char content_type[GMV_SIP_CONTENT_TYPE_CAPACITY];
@@ -184,6 +185,7 @@ typedef struct gmv_subscribe_command {
     uint64_t operation_id;
     uint64_t association_id;
     int32_t transport;
+    uint32_t local_cseq;
     char target_uri[1024];
     char from_uri[1024];
     char contact_uri[1024];
@@ -4008,6 +4010,8 @@ static pj_status_t gmv_send_message_on_owner(
     const gmv_message_command_t *message) {
     if (!runtime || !message ||
         message->operation_id == 0 ||
+        message->cseq == 0 ||
+        message->cseq > INT32_MAX ||
         !message->target_uri[0] ||
         !message->from_uri[0] ||
         !message->content_type[0] ||
@@ -4029,7 +4033,7 @@ static pj_status_t gmv_send_message_on_owner(
         &target,
         NULL,
         NULL,
-        -1,
+        (int)message->cseq,
         NULL,
         &tdata);
     if (status != PJ_SUCCESS) {
@@ -4686,6 +4690,8 @@ static pj_status_t gmv_send_subscribe_on_owner(
     if (!command->target_uri[0] ||
         !command->from_uri[0] ||
         !command->contact_uri[0] ||
+        command->local_cseq == 0 ||
+        command->local_cseq > INT32_MAX ||
         command->expires == 0) {
         return PJ_EINVAL;
     }
@@ -4711,6 +4717,8 @@ static pj_status_t gmv_send_subscribe_on_owner(
     if (status != PJ_SUCCESS) {
         return status;
     }
+    dialog->local.first_cseq = (pj_int32_t)command->local_cseq;
+    dialog->local.cseq = dialog->local.first_cseq - 1;
 
     pj_str_t event = pj_str((char *)command->event);
     pjsip_evsub *subscription = NULL;
@@ -4793,6 +4801,8 @@ int32_t gmv_sip_runtime_send_message(
         message->size < sizeof(*message) ||
         message->version != GMV_SIP_ABI_VERSION ||
         message->operation_id == 0 ||
+        message->cseq == 0 ||
+        message->cseq > INT32_MAX ||
         (message->transport != GMV_SIP_TRANSPORT_UDP &&
          message->transport != GMV_SIP_TRANSPORT_TCP) ||
         (message->transport == GMV_SIP_TRANSPORT_TCP &&
@@ -4813,6 +4823,7 @@ int32_t gmv_sip_runtime_send_message(
     command->operation_id = message->operation_id;
     command->association_id = message->association_id;
     command->transport = message->transport;
+    command->cseq = message->cseq;
     if (!gmv_copy_view(
             command->target_uri,
             sizeof(command->target_uri),
@@ -5147,6 +5158,8 @@ int32_t gmv_sip_runtime_send_subscribe(
         subscribe->size < sizeof(*subscribe) ||
         subscribe->version != GMV_SIP_ABI_VERSION ||
         subscribe->operation_id == 0 ||
+        (subscribe->call_id.len == 0 &&
+         (subscribe->local_cseq == 0 || subscribe->local_cseq > INT32_MAX)) ||
         (subscribe->transport != GMV_SIP_TRANSPORT_UDP &&
          subscribe->transport != GMV_SIP_TRANSPORT_TCP) ||
         (subscribe->transport == GMV_SIP_TRANSPORT_TCP &&
@@ -5177,6 +5190,7 @@ int32_t gmv_sip_runtime_send_subscribe(
     command->operation_id = subscribe->operation_id;
     command->association_id = subscribe->association_id;
     command->transport = subscribe->transport;
+    command->local_cseq = subscribe->local_cseq;
     command->expires = subscribe->expires;
     if (!gmv_copy_view(
             command->target_uri,

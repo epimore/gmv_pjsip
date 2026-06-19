@@ -502,6 +502,12 @@ fn runtime_adapter_sends_message_and_correlates_response() {
     let request = finish_transmit(&mut runtime, &transmit);
     assert!(request.starts_with("MESSAGE "));
     assert!(request.contains("<CmdType>DeviceInfo</CmdType>"));
+    let message_cseq = header_value(&request, "CSeq")
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("MESSAGE CSeq");
+    assert!((1..=i32::MAX as u32).contains(&message_cseq));
 
     let response = format!(
         "SIP/2.0 200 OK\r\n\

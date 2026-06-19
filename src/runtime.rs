@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::slice;
+use std::sync::atomic::{AtomicU32, Ordering};
 #[cfg(feature = "test-helpers")]
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -54,7 +55,24 @@ use crate::io::{RuntimeIoCommand, SocketIoRuntime};
 use crate::transport::SipTransportProtocol;
 
 static RUNTIME_LOCK: Mutex<()> = Mutex::new(());
+static SIP_CSEQ: AtomicU32 = AtomicU32::new(0);
 const DEFAULT_IO_QUEUE_CAPACITY: usize = 32_768;
+const MAX_SIP_CSEQ: u32 = i32::MAX as u32;
+
+fn next_atomic_value(sequence: &AtomicU32, max: u32) -> u32 {
+    let mut current = sequence.load(Ordering::Relaxed);
+    loop {
+        let next = if current >= max { 1 } else { current + 1 };
+        match sequence.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn next_sip_cseq() -> u32 {
+    next_atomic_value(&SIP_CSEQ, MAX_SIP_CSEQ)
+}
 
 #[derive(Clone, Debug)]
 pub struct SipRuntimeConfig {
@@ -243,11 +261,10 @@ pub struct SipInviteIdentity {
 impl SipInviteIdentity {
     #[must_use]
     pub fn generate() -> Self {
-        let cseq_seed = Uuid::new_v4().as_u128() as u32;
         Self {
             call_id: Uuid::new_v4().simple().to_string(),
             local_tag: Uuid::new_v4().simple().to_string(),
-            local_cseq: (cseq_seed & i32::MAX as u32).max(1),
+            local_cseq: next_sip_cseq(),
         }
     }
 }
@@ -881,6 +898,7 @@ impl SipRuntime {
             operation_id: message.operation_id,
             association_id: message.association_id,
             transport: transport_id(message.protocol),
+            cseq: next_sip_cseq(),
             target_uri: string_view(&message.target_uri),
             from_uri: string_view(&message.from_uri),
             content_type: string_view(&message.content_type),
@@ -1257,6 +1275,7 @@ impl SipRuntime {
             operation_id: subscribe.operation_id,
             association_id: subscribe.association_id,
             transport: transport_id(subscribe.protocol),
+            local_cseq: if initial { next_sip_cseq() } else { 0 },
             target_uri: string_view(&subscribe.target_uri),
             from_uri: string_view(&subscribe.from_uri),
             contact_uri: string_view(&subscribe.contact_uri),
@@ -1591,4 +1610,20 @@ fn pjsip_error(operation: &'static str, status: i32) -> base::exception::GlobalE
     system_error(format!(
         "PJSIP operation `{operation}` failed: status={status}, message={message}"
     ))
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use std::sync::atomic::AtomicU32;
+
+    use super::next_atomic_value;
+
+    #[test]
+    fn atomic_sequence_increments_and_wraps_without_zero() {
+        let sequence = AtomicU32::new(0);
+        assert_eq!(next_atomic_value(&sequence, 3), 1);
+        assert_eq!(next_atomic_value(&sequence, 3), 2);
+        assert_eq!(next_atomic_value(&sequence, 3), 3);
+        assert_eq!(next_atomic_value(&sequence, 3), 1);
+    }
 }
