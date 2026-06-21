@@ -592,13 +592,16 @@ impl SipRuntime {
         if self.stopped {
             return Ok(());
         }
+        base::log::warn!("SIP runtime stop requested");
         // SAFETY: The runtime handle is valid and exclusively controlled by
         // this non-Send wrapper.
         let status = unsafe { gmv_sip_runtime_stop(self.raw.as_ptr()) };
         if status != 0 {
+            base::log::warn!("SIP runtime stop failed: status={status}");
             return Err(pjsip_error("runtime_stop", status));
         }
         self.stopped = true;
+        base::log::warn!("SIP runtime stopped");
         Ok(())
     }
 
@@ -611,6 +614,7 @@ impl SipRuntime {
         // all PJSIP calls on the thread that created the runtime.
         let status = unsafe { gmv_sip_runtime_poll(self.raw.as_ptr()) };
         if status != 0 {
+            base::log::warn!("SIP runtime poll failed: status={status}");
             return Err(pjsip_error("runtime_poll", status));
         }
         Ok(())
@@ -1306,12 +1310,17 @@ impl SipRuntime {
 impl Drop for SipRuntime {
     fn drop(&mut self) {
         if !self.stopped {
+            base::log::warn!("SIP runtime dropped while active; stopping implicitly");
             // SAFETY: Drop has exclusive access to the valid runtime handle.
-            let _ = unsafe { gmv_sip_runtime_stop(self.raw.as_ptr()) };
+            let status = unsafe { gmv_sip_runtime_stop(self.raw.as_ptr()) };
+            if status != 0 {
+                base::log::warn!("implicit SIP runtime stop failed: status={status}");
+            }
             self.stopped = true;
         }
         // SAFETY: This is the unique destroy paired with runtime create.
         unsafe { gmv_sip_runtime_destroy(self.raw.as_ptr()) };
+        base::log::warn!("SIP runtime handle is being destroyed");
     }
 }
 
@@ -1329,7 +1338,9 @@ unsafe extern "C" fn runtime_event_callback(event: *const gmv_sip_event_t, user_
     }
     // SAFETY: `user_data` points to EventState owned by SipRuntime.
     let state = unsafe { &*(user_data.cast::<EventState>()) };
-    let _ = state.sender.send(copy_event(event));
+    if state.sender.send(copy_event(event)).is_err() {
+        base::log::warn!("SIP runtime event receiver was dropped");
+    }
 }
 
 unsafe extern "C" fn runtime_send_callback(
