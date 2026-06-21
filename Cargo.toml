@@ -7,8 +7,8 @@ edition = "2021"
 test-helpers = []
 
 [dependencies]
-#base = { git = "https://github.com/epimore/pigs.git",rev = "a0b9ed27",features = ["net"] }
-base = { package = "base", path = "../pigs/base", features = ["net"] }
+base = { git = "https://github.com/epimore/pigs.git",rev = "f2fc8914",features = ["net"] }
+#base = { package = "base", path = "../pigs/base", features = ["net"] }
 
 gmv_pjsip_sys = { path = "gmv_pjsip_sys" }
 uuid = { version = "1.7", features = ["v4"] }
