@@ -1262,6 +1262,165 @@ Content-Length: 0\r\n\r\n",
 }
 
 #[test]
+fn receive_is_processed_before_close_in_same_poll() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    let association_id = 78;
+    let remote = remote_addr(40007);
+    let options = |branch: &str, cseq: u32| {
+        format!(
+            "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/TCP {remote};branch={branch};rport\r\n\
+From: <sip:device@127.0.0.1>;tag=receive-close\r\n\
+To: <sip:platform@127.0.0.1>\r\n\
+Call-ID: receive-close-options\r\n\
+CSeq: {cseq} OPTIONS\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n"
+        )
+    };
+
+    runtime
+        .inject_test_packet(
+            association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            remote,
+            options("z9hG4bK-receive-close-first", 1).as_bytes(),
+        )
+        .expect("create TCP transport");
+    let first_response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &first_response).starts_with("SIP/2.0 200"));
+
+    runtime
+        .inject_test_packet(
+            association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            remote,
+            options("z9hG4bK-receive-close-last", 2).as_bytes(),
+        )
+        .expect("queue final TCP packet");
+    runtime
+        .close_transport(association_id, SipTransportProtocol::Tcp, 0)
+        .expect("queue TCP transport close");
+    runtime.poll().expect("process final packet and close");
+    while transmits.try_recv().is_ok() {}
+
+    runtime
+        .send_message(&SipOutboundMessage {
+            operation_id: 81,
+            association_id,
+            protocol: SipTransportProtocol::Tcp,
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            content_type: "Application/MANSCDP+xml".into(),
+            body: b"<Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),
+        })
+        .expect("queue MESSAGE after close");
+    let fault = receive_event(&mut runtime, &events, SipRuntimeEventKind::RuntimeFault);
+    assert_eq!(fault.operation_id, Some(81));
+    assert!(
+        transmits.try_recv().is_err(),
+        "closed TCP association was recreated by its final packet"
+    );
+
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn closing_tcp_transport_cleans_subscription_before_refresh_timer() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    let association_id = 77;
+    let remote = remote_addr(40006);
+    let options = format!(
+        "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/TCP {remote};branch=z9hG4bK-subscribe-close;rport\r\n\
+From: <sip:device@127.0.0.1>;tag=subscribe-close\r\n\
+To: <sip:platform@127.0.0.1>\r\n\
+Call-ID: subscribe-close-options\r\n\
+CSeq: 1 OPTIONS\r\n\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n"
+    );
+    runtime
+        .inject_test_packet(
+            association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            remote,
+            options.as_bytes(),
+        )
+        .expect("create TCP transport");
+    let options_response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &options_response).starts_with("SIP/2.0 200"));
+
+    runtime
+        .send_subscribe(&SipOutboundSubscribe {
+            operation_id: 80,
+            association_id,
+            protocol: SipTransportProtocol::Tcp,
+            target_uri: format!("sip:device@{remote}"),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            contact_uri: format!("<sip:platform@{}>", local_addr()),
+            call_id: None,
+            event: "Catalog".into(),
+            expires: 1,
+            content_type: "Application/MANSCDP+xml".into(),
+            body: b"<Query><CmdType>Catalog</CmdType></Query>".to_vec(),
+        })
+        .expect("send TCP SUBSCRIBE");
+    let subscribe_transmit = receive_transmit(&mut runtime, &transmits);
+    let subscribe = finish_transmit(&mut runtime, &subscribe_transmit);
+    let response = format!(
+        "SIP/2.0 200 OK\r\n\
+Via: {}\r\n\
+From: {}\r\n\
+To: {};tag=device-sub-close\r\n\
+Call-ID: {}\r\n\
+CSeq: {}\r\n\
+Contact: <sip:device@{}>\r\n\
+Expires: 1\r\n\
+Content-Length: 0\r\n\r\n",
+        header_value(&subscribe, "Via"),
+        header_value(&subscribe, "From"),
+        header_value(&subscribe, "To"),
+        header_value(&subscribe, "Call-ID"),
+        header_value(&subscribe, "CSeq"),
+        remote,
+    );
+    runtime
+        .inject_test_packet(
+            association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            remote,
+            response.as_bytes(),
+        )
+        .expect("inject TCP SUBSCRIBE response");
+    let accepted = receive_event(&mut runtime, &events, SipRuntimeEventKind::OutboundResponse);
+    assert_eq!(accepted.operation_id, Some(80));
+
+    runtime
+        .close_transport(association_id, SipTransportProtocol::Tcp, 0)
+        .expect("close subscribed TCP transport");
+    runtime.poll().expect("process TCP transport close");
+    while transmits.try_recv().is_ok() {}
+
+    std::thread::sleep(Duration::from_millis(1200));
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < deadline {
+        runtime.poll().expect("poll after subscription expiry");
+    }
+    assert!(
+        transmits.try_recv().is_err(),
+        "closed subscription unexpectedly refreshed"
+    );
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
 fn runtime_adapter_owns_subscribe_refresh_notify_and_unsubscribe() {
     let _guard = lock_tests();
     let config = SipRuntimeConfig {

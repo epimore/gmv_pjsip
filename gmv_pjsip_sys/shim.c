@@ -92,6 +92,8 @@ typedef struct gmv_dialog_operation {
     pjsip_dialog *restored_dialog;
     int restored_session_held;
     struct gmv_invite_call *restored_call;
+    unsigned active_calls;
+    int cleanup_pending;
 } gmv_dialog_operation_t;
 
 typedef struct gmv_receive_command {
@@ -234,6 +236,8 @@ struct gmv_invite_call {
     int invite_final_emitted;
     int has_dialog_route;
     pj_sockaddr dialog_route_addr;
+    unsigned active_calls;
+    int cleanup_pending;
     struct gmv_invite_call *next;
 };
 
@@ -249,6 +253,8 @@ struct gmv_subscription_call {
     unsigned char *body;
     size_t body_len;
     pjsip_evsub *subscription;
+    unsigned active_calls;
+    int cleanup_pending;
     struct gmv_subscription_call *next;
 };
 
@@ -1774,17 +1780,36 @@ static gmv_invite_call_t *gmv_invite_call_from_session(
         invite->mod_data[runtime->module.id];
 }
 
+static void gmv_hold_invite_call(gmv_invite_call_t *call) {
+    if (call) {
+        ++call->active_calls;
+    }
+}
+
+static void gmv_release_invite_call(gmv_invite_call_t *call) {
+    if (!call || call->active_calls == 0) {
+        return;
+    }
+    --call->active_calls;
+    if (call->active_calls == 0 && call->cleanup_pending) {
+        free(call);
+    }
+}
+
 static void gmv_remove_invite_call(
     gmv_sip_runtime_t *runtime,
     gmv_invite_call_t *call) {
-    if (!runtime || !call) {
+    if (!runtime || !call || call->cleanup_pending) {
         return;
     }
     gmv_invite_call_t **cursor = &runtime->invite_calls;
     while (*cursor) {
         if (*cursor == call) {
             *cursor = call->next;
-            free(call);
+            call->cleanup_pending = 1;
+            if (call->active_calls == 0) {
+                free(call);
+            }
             return;
         }
         cursor = &(*cursor)->next;
@@ -1898,18 +1923,38 @@ static gmv_subscription_call_t *gmv_subscription_from_evsub(
         (unsigned)runtime->module.id);
 }
 
+static void gmv_hold_subscription(gmv_subscription_call_t *call) {
+    if (call) {
+        ++call->active_calls;
+    }
+}
+
+static void gmv_release_subscription(gmv_subscription_call_t *call) {
+    if (!call || call->active_calls == 0) {
+        return;
+    }
+    --call->active_calls;
+    if (call->active_calls == 0 && call->cleanup_pending) {
+        free(call->body);
+        free(call);
+    }
+}
+
 static void gmv_remove_subscription(
     gmv_sip_runtime_t *runtime,
     gmv_subscription_call_t *call) {
-    if (!runtime || !call) {
+    if (!runtime || !call || call->cleanup_pending) {
         return;
     }
     gmv_subscription_call_t **cursor = &runtime->subscriptions;
     while (*cursor) {
         if (*cursor == call) {
             *cursor = call->next;
-            free(call->body);
-            free(call);
+            call->cleanup_pending = 1;
+            if (call->active_calls == 0) {
+                free(call->body);
+                free(call);
+            }
             return;
         }
         cursor = &(*cursor)->next;
@@ -2077,14 +2122,19 @@ static void gmv_subscription_on_client_refresh(
     if (!call || call->operation_id != 0) {
         return;
     }
+    gmv_sip_runtime_t *runtime = call->runtime;
+    int32_t transport = call->transport;
+    uint32_t expires = call->expires;
+    gmv_hold_subscription(call);
     pj_status_t status =
-        gmv_start_subscription_request(call, call->expires);
+        gmv_start_subscription_request(call, expires);
+    gmv_release_subscription(call);
     if (status != PJ_SUCCESS) {
-        call->runtime->last_status = status;
+        runtime->last_status = status;
         gmv_emit_event(
-            call->runtime,
+            runtime,
             GMV_SIP_EVENT_RUNTIME_FAULT,
-            call->transport,
+            transport,
             0,
             status,
             NULL,
@@ -2100,6 +2150,95 @@ static pjsip_evsub_user gmv_subscription_callbacks = {
     &gmv_subscription_on_client_refresh,
     NULL
 };
+
+static void gmv_close_association_calls(
+    gmv_sip_runtime_t *runtime,
+    int32_t transport,
+    uint64_t association_id) {
+    gmv_invite_call_t *invite_call = runtime->invite_calls;
+    while (invite_call) {
+        gmv_invite_call_t *next = invite_call->next;
+        if (invite_call->transport == transport &&
+            invite_call->association_id == association_id) {
+            pjsip_inv_session *invite = invite_call->invite;
+            if (invite) {
+                invite->mod_data[runtime->module.id] = NULL;
+                invite_call->invite = NULL;
+                pjsip_inv_terminate(
+                    invite,
+                    PJSIP_SC_SERVICE_UNAVAILABLE,
+                    PJ_FALSE);
+            }
+            gmv_remove_invite_call(runtime, invite_call);
+        }
+        invite_call = next;
+    }
+
+    gmv_subscription_call_t *subscription_call =
+        runtime->subscriptions;
+    while (subscription_call) {
+        gmv_subscription_call_t *next = subscription_call->next;
+        if (subscription_call->transport == transport &&
+            subscription_call->association_id == association_id) {
+            pjsip_evsub *subscription =
+                subscription_call->subscription;
+            if (subscription) {
+                pjsip_evsub_set_mod_data(
+                    subscription,
+                    (unsigned)runtime->module.id,
+                    NULL);
+                subscription_call->subscription = NULL;
+                pjsip_evsub_terminate(subscription, PJ_FALSE);
+            }
+            gmv_remove_subscription(runtime, subscription_call);
+        }
+        subscription_call = next;
+    }
+}
+
+static void gmv_hold_dialog_operation(
+    gmv_dialog_operation_t *operation) {
+    if (operation) {
+        ++operation->active_calls;
+    }
+}
+
+static void gmv_complete_dialog_operation(
+    gmv_dialog_operation_t *operation) {
+    if (!operation || operation->cleanup_pending) {
+        return;
+    }
+    operation->cleanup_pending = 1;
+    if (operation->restored_dialog &&
+        operation->restored_session_held) {
+        operation->restored_session_held = 0;
+        pjsip_dlg_dec_session(
+            operation->restored_dialog,
+            &operation->runtime->module);
+        operation->restored_dialog = NULL;
+    }
+    if (operation->restored_call) {
+        gmv_remove_invite_call(
+            operation->runtime,
+            operation->restored_call);
+        operation->restored_call = NULL;
+    }
+    if (operation->active_calls == 0) {
+        free(operation);
+    }
+}
+
+static void gmv_release_dialog_operation(
+    gmv_dialog_operation_t *operation) {
+    if (!operation || operation->active_calls == 0) {
+        return;
+    }
+    --operation->active_calls;
+    if (operation->active_calls == 0 &&
+        operation->cleanup_pending) {
+        free(operation);
+    }
+}
 
 static void gmv_on_tsx_state(
     pjsip_transaction *transaction,
@@ -2123,19 +2262,7 @@ static void gmv_on_tsx_state(
         transaction->state == PJSIP_TSX_STATE_TERMINATED ||
         transaction->state == PJSIP_TSX_STATE_DESTROYED) {
         transaction->mod_data[runtime->module.id] = NULL;
-        if (operation->restored_dialog &&
-            operation->restored_session_held) {
-            operation->restored_session_held = 0;
-            pjsip_dlg_dec_session(
-                operation->restored_dialog,
-                &runtime->module);
-            operation->restored_dialog = NULL;
-        }
-        if (operation->restored_call) {
-            gmv_remove_invite_call(runtime, operation->restored_call);
-            operation->restored_call = NULL;
-        }
-        free(operation);
+        gmv_complete_dialog_operation(operation);
     }
 }
 
@@ -3215,6 +3342,10 @@ static void gmv_process_close_commands(
                 runtime,
                 transport,
                 command->status);
+            gmv_close_association_calls(
+                runtime,
+                command->transport,
+                command->association_id);
         }
         free(command);
     }
@@ -3407,6 +3538,7 @@ static void gmv_process_io_commands(gmv_sip_runtime_t *runtime) {
     pj_mutex_unlock(runtime->command_mutex);
 
     gmv_process_send_completions(runtime, completion_commands);
+    gmv_process_receive_commands(runtime, receive_commands);
     gmv_process_close_commands(runtime, close_commands);
     gmv_process_message_commands(runtime, message_commands);
     gmv_process_invite_commands(runtime, invite_commands);
@@ -3415,7 +3547,6 @@ static void gmv_process_io_commands(gmv_sip_runtime_t *runtime) {
         runtime,
         invite_response_commands);
     gmv_process_subscribe_commands(runtime, subscribe_commands);
-    gmv_process_receive_commands(runtime, receive_commands);
 }
 
 static void gmv_runtime_release(gmv_sip_runtime_t *runtime) {
@@ -4260,10 +4391,11 @@ static pj_status_t gmv_send_invite_on_owner(
             "Subject",
             command->subject);
     }
+    gmv_hold_invite_call(call);
     if (status == PJ_SUCCESS) {
         status = pjsip_inv_send_msg(invite, tdata);
     }
-    if (status != PJ_SUCCESS) {
+    if (status != PJ_SUCCESS && !call->cleanup_pending) {
         invite->mod_data[runtime->module.id] = NULL;
         call->invite = NULL;
         gmv_remove_invite_call(runtime, call);
@@ -4272,6 +4404,7 @@ static pj_status_t gmv_send_invite_on_owner(
             PJSIP_SC_INTERNAL_SERVER_ERROR,
             PJ_FALSE);
     }
+    gmv_release_invite_call(call);
     return status;
 }
 
@@ -4450,17 +4583,16 @@ static pj_status_t gmv_send_dialog_on_owner(
         restored_call->next = runtime->invite_calls;
         runtime->invite_calls = restored_call;
         operation->restored_call = restored_call;
+        gmv_hold_dialog_operation(operation);
         status = pjsip_dlg_send_request(
             dialog,
             tdata,
             runtime->module.id,
             operation);
         if (status != PJ_SUCCESS) {
-            operation->restored_session_held = 0;
-            pjsip_dlg_dec_session(dialog, &runtime->module);
-            gmv_remove_invite_call(runtime, restored_call);
-            free(operation);
+            gmv_complete_dialog_operation(operation);
         }
+        gmv_release_dialog_operation(operation);
         return status;
     }
 
@@ -4475,6 +4607,7 @@ static pj_status_t gmv_send_dialog_on_owner(
             return PJ_EBUSY;
         }
         call->dialog_operation_id = command->operation_id;
+        gmv_hold_invite_call(call);
         pjsip_tx_data *tdata = NULL;
         pj_status_t status = pjsip_inv_end_session(
             call->invite,
@@ -4487,6 +4620,7 @@ static pj_status_t gmv_send_dialog_on_owner(
         if (status != PJ_SUCCESS) {
             call->dialog_operation_id = 0;
         }
+        gmv_release_invite_call(call);
         return status;
     }
 
@@ -4547,14 +4681,16 @@ static pj_status_t gmv_send_dialog_on_owner(
     }
     operation->runtime = runtime;
     operation->operation_id = command->operation_id;
+    gmv_hold_dialog_operation(operation);
     status = pjsip_dlg_send_request(
         call->invite->dlg,
         tdata,
         runtime->module.id,
         operation);
     if (status != PJ_SUCCESS) {
-        free(operation);
+        gmv_complete_dialog_operation(operation);
     }
+    gmv_release_dialog_operation(operation);
     return status;
 }
 
@@ -4601,6 +4737,7 @@ static pj_status_t gmv_respond_invite_on_owner(
 
     pj_str_t reason = pj_str((char *)command->reason);
     pjsip_tx_data *tdata = NULL;
+    gmv_hold_invite_call(call);
     pj_status_t status = pjsip_inv_answer(
         call->invite,
         command->status_code,
@@ -4610,6 +4747,7 @@ static pj_status_t gmv_respond_invite_on_owner(
     if (status == PJ_SUCCESS) {
         status = pjsip_inv_send_msg(call->invite, tdata);
     }
+    gmv_release_invite_call(call);
     return status;
 }
 
@@ -4678,12 +4816,14 @@ static pj_status_t gmv_send_subscribe_on_owner(
             return status;
         }
         call->operation_id = command->operation_id;
+        gmv_hold_subscription(call);
         status = gmv_start_subscription_request(
             call,
             command->expires);
         if (status != PJ_SUCCESS) {
             call->operation_id = 0;
         }
+        gmv_release_subscription(call);
         return status;
     }
 
@@ -4779,10 +4919,11 @@ static pj_status_t gmv_send_subscribe_on_owner(
         call);
     call->next = runtime->subscriptions;
     runtime->subscriptions = call;
+    gmv_hold_subscription(call);
     status = gmv_start_subscription_request(
         call,
         command->expires);
-    if (status != PJ_SUCCESS) {
+    if (status != PJ_SUCCESS && !call->cleanup_pending) {
         pjsip_evsub_set_mod_data(
             subscription,
             (unsigned)runtime->module.id,
@@ -4791,6 +4932,7 @@ static pj_status_t gmv_send_subscribe_on_owner(
         gmv_remove_subscription(runtime, call);
         pjsip_evsub_terminate(subscription, PJ_FALSE);
     }
+    gmv_release_subscription(call);
     return status;
 }
 
