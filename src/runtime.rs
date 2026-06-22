@@ -76,7 +76,8 @@ fn next_sip_cseq() -> u32 {
 
 #[derive(Clone, Debug)]
 pub struct SipRuntimeConfig {
-    pub bind_address: Ipv4Addr,
+    /// Address advertised in SIP Via and transport metadata.
+    pub advertised_address: Ipv4Addr,
     pub port: u16,
     pub enable_udp: bool,
     pub enable_tcp: bool,
@@ -109,7 +110,7 @@ pub struct SipRuntimeSockets {
 impl Default for SipRuntimeConfig {
     fn default() -> Self {
         Self {
-            bind_address: Ipv4Addr::LOCALHOST,
+            advertised_address: Ipv4Addr::LOCALHOST,
             port: 0,
             enable_udp: true,
             enable_tcp: true,
@@ -388,7 +389,7 @@ impl SipRuntime {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
 
-        let bind_address = config.bind_address.to_string();
+        let advertised_address = config.advertised_address.to_string();
         let auth_realm = config.auth_realm.as_bytes();
         let user_agent = config.user_agent.as_bytes();
         let (sender, events) = mpsc::channel();
@@ -404,8 +405,8 @@ impl SipRuntime {
         // SAFETY: The initializer completed for a valid non-null pointer.
         let mut ffi_config = unsafe { ffi_config.assume_init() };
         ffi_config.bind_address = gmv_sip_string_view_t {
-            ptr: bind_address.as_ptr().cast(),
-            len: bind_address.len(),
+            ptr: advertised_address.as_ptr().cast(),
+            len: advertised_address.len(),
         };
         ffi_config.port = config.port;
         ffi_config.enable_udp = u8::from(sockets.udp.is_some());
@@ -487,7 +488,7 @@ impl SipRuntime {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
 
-        let bind_address = config.bind_address.to_string();
+        let advertised_address = config.advertised_address.to_string();
         let auth_realm = config.auth_realm.as_bytes();
         let user_agent = config.user_agent.as_bytes();
         let (sender, events) = mpsc::channel();
@@ -503,8 +504,8 @@ impl SipRuntime {
         // SAFETY: The initializer completed for a valid non-null pointer.
         let mut ffi_config = unsafe { ffi_config.assume_init() };
         ffi_config.bind_address = gmv_sip_string_view_t {
-            ptr: bind_address.as_ptr().cast(),
-            len: bind_address.len(),
+            ptr: advertised_address.as_ptr().cast(),
+            len: advertised_address.len(),
         };
         ffi_config.port = config.port;
         ffi_config.enable_udp = u8::from(config.enable_udp);

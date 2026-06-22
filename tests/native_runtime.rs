@@ -199,7 +199,7 @@ fn runtime_owns_inherited_udp_socket() {
     peer.set_nonblocking(true).expect("set peer nonblocking");
     let peer_addr = peer.local_addr().expect("peer UDP address");
     let config = SipRuntimeConfig {
-        bind_address: Ipv4Addr::LOCALHOST,
+        advertised_address: Ipv4Addr::LOCALHOST,
         port: runtime_addr.port(),
         enable_tcp: false,
         ..SipRuntimeConfig::default()
@@ -568,7 +568,7 @@ fn tcp_via_uses_configured_advertised_address() {
     let _guard = lock_tests();
     let advertised_address = Ipv4Addr::new(203, 0, 113, 10);
     let config = SipRuntimeConfig {
-        bind_address: advertised_address,
+        advertised_address,
         enable_udp: false,
         ..SipRuntimeConfig::default()
     };

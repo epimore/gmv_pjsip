@@ -25,6 +25,14 @@ impl EnvVars {
         println!("cargo:rerun-if-changed=wrapper.h");
         println!("cargo:rerun-if-changed=shim.h");
         println!("cargo:rerun-if-changed=shim.c");
+        println!("cargo:rerun-if-changed=shim_commands.inc");
+        println!("cargo:rerun-if-changed=shim_command_dispatch.inc");
+        println!("cargo:rerun-if-changed=shim_transport.inc");
+        println!("cargo:rerun-if-changed=shim_auth.inc");
+        println!("cargo:rerun-if-changed=shim_message.inc");
+        println!("cargo:rerun-if-changed=shim_invite.inc");
+        println!("cargo:rerun-if-changed=shim_dialog.inc");
+        println!("cargo:rerun-if-changed=shim_subscription.inc");
         println!("cargo:rerun-if-changed=src/bindings.rs");
 
         for name in [

@@ -36,7 +36,7 @@ pub fn device_contact_addr() -> SocketAddr {
 
 pub fn start_runtime() -> (SipRuntime, SipRuntimeEvents, SipRuntimeTransmits) {
     let config = SipRuntimeConfig {
-        bind_address: Ipv4Addr::new(192, 0, 2, 10),
+        advertised_address: Ipv4Addr::new(192, 0, 2, 10),
         port: PLATFORM_PORT,
         enable_tcp: false,
         ..SipRuntimeConfig::default()
