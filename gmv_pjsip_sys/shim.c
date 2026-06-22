@@ -84,6 +84,7 @@ typedef struct gmv_auth_nonce {
 typedef struct gmv_outbound_operation {
     gmv_sip_runtime_t *runtime;
     uint64_t operation_id;
+    int final_response_emitted;
 } gmv_outbound_operation_t;
 
 typedef struct gmv_dialog_operation {
@@ -848,6 +849,7 @@ static pj_status_t gmv_create_custom_transport(
     int32_t protocol,
     uint64_t association_id,
     const char *local_address,
+    const char *advertised_address,
     uint16_t local_port,
     const char *remote_address,
     uint16_t remote_port,
@@ -919,7 +921,7 @@ static pj_status_t gmv_create_custom_transport(
         goto on_error;
     }
     base->has_addr_name = PJ_TRUE;
-    pj_strdup2(pool, &base->local_name.host, local_address);
+    pj_strdup2(pool, &base->local_name.host, advertised_address);
     base->local_name.port = local_port;
 
     if (protocol == GMV_SIP_TRANSPORT_TCP) {
@@ -1690,9 +1692,11 @@ static void gmv_outbound_callback(void *token, pjsip_event *event) {
         return;
     }
     pjsip_transaction *transaction = event->body.tsx_state.tsx;
-    if (!transaction || transaction->status_code < 200) {
+    if (!transaction || transaction->status_code < 200 ||
+        operation->final_response_emitted) {
         return;
     }
+    operation->final_response_emitted = 1;
 
     pjsip_rx_data *rdata = NULL;
     if (event->body.tsx_state.type == PJSIP_EVENT_RX_MSG) {
@@ -3263,6 +3267,7 @@ static void gmv_process_receive_commands(
                 command->transport,
                 command->association_id,
                 command->local_address,
+                runtime->bind_address,
                 command->local_port,
                 command->remote_address,
                 command->remote_port,
@@ -4012,6 +4017,7 @@ int32_t gmv_sip_runtime_start(gmv_sip_runtime_t *runtime) {
             runtime,
             GMV_SIP_TRANSPORT_UDP,
             0,
+            runtime->bind_address,
             runtime->bind_address,
             runtime->requested_port,
             "0.0.0.0",

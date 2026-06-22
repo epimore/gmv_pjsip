@@ -10,5 +10,6 @@ test-helpers = []
 base = { git = "https://github.com/epimore/pigs.git",rev = "f2fc8914",features = ["net"] }
 #base = { package = "base", path = "../pigs/base", features = ["net"] }
 
+encoding_rs = "0.8"
 gmv_pjsip_sys = { path = "gmv_pjsip_sys" }
 uuid = { version = "1.7", features = ["v4"] }

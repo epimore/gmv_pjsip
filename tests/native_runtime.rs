@@ -537,6 +537,77 @@ Content-Length: 0\r\n\r\n",
     assert_eq!(event.operation_id, Some(operation_id));
     assert_eq!(event.status_code, Some(200));
     assert_eq!(event.method.as_deref(), Some("MESSAGE"));
+
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            response.as_bytes(),
+        )
+        .expect("inject duplicate outbound response");
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut duplicate_response = false;
+    while Instant::now() < deadline {
+        runtime.poll().expect("poll duplicate response");
+        while let Ok(event) = events.try_recv() {
+            duplicate_response |= event.kind == SipRuntimeEventKind::OutboundResponse
+                && event.operation_id == Some(operation_id);
+        }
+    }
+    assert!(
+        !duplicate_response,
+        "final MESSAGE response was emitted more than once"
+    );
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn tcp_via_uses_configured_advertised_address() {
+    let _guard = lock_tests();
+    let advertised_address = Ipv4Addr::new(203, 0, 113, 10);
+    let config = SipRuntimeConfig {
+        bind_address: advertised_address,
+        enable_udp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, _events, transmits) = start_runtime(config);
+    let remote = remote_addr(40013);
+    let association_id = 13;
+    let bootstrap = format!(
+        "OPTIONS sip:platform@{} SIP/2.0\r\nVia: SIP/2.0/TCP {remote};branch=z9hG4bK-bootstrap;rport\r\nFrom: <sip:device@{remote}>;tag=bootstrap\r\nTo: <sip:platform@{}>\r\nCall-ID: bootstrap-advertised-via\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
+        local_addr(),
+        local_addr(),
+    );
+    runtime
+        .inject_test_packet(
+            association_id,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            remote,
+            bootstrap.as_bytes(),
+        )
+        .expect("create TCP transport");
+    let response = receive_transmit(&mut runtime, &transmits);
+    finish_transmit(&mut runtime, &response);
+
+    runtime
+        .send_message(&SipOutboundMessage {
+            operation_id: 43,
+            association_id,
+            protocol: SipTransportProtocol::Tcp,
+            target_uri: format!("sip:device@{remote};transport=tcp"),
+            from_uri: format!("<sip:platform@{advertised_address}>"),
+            content_type: "Application/MANSCDP+xml".into(),
+            body: b"<Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),
+        })
+        .expect("send TCP MESSAGE");
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    let request = finish_transmit(&mut runtime, &transmit);
+    assert!(header_value(&request, "Via")
+        .starts_with(&format!("SIP/2.0/TCP {advertised_address}:{LOCAL_PORT};")));
+
     runtime.shutdown().expect("shutdown runtime");
 }
 

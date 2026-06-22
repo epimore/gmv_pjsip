@@ -8,6 +8,7 @@ use base::dashmap::DashMap;
 use base::tokio::io::{AsyncReadExt, AsyncWriteExt};
 use base::tokio::net::{TcpListener as TokioTcpListener, TcpStream, UdpSocket as TokioUdpSocket};
 use base::tokio::sync::{mpsc, watch};
+use encoding_rs::{GB18030, GBK};
 
 use crate::error::{internal_error, Result};
 use crate::runtime::{SipRuntimeSockets, SipTransmit};
@@ -425,8 +426,56 @@ fn log_outgoing_sip_packet(transmit: &SipTransmit) {
 }
 
 fn escape_payload(data: &[u8]) -> String {
-    String::from_utf8_lossy(data)
+    decode_sip_payload(data)
         .replace('\\', "\\\\")
         .replace('\r', "\\r")
         .replace('\n', "\\n")
+}
+
+fn decode_sip_payload(data: &[u8]) -> String {
+    let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return String::from_utf8_lossy(data).into_owned();
+    };
+    let body_offset = header_end + 4;
+    let mut decoded = String::from_utf8_lossy(&data[..body_offset]).into_owned();
+    let body = &data[body_offset..];
+    let declaration = String::from_utf8_lossy(&body[..body.len().min(256)]).to_ascii_uppercase();
+    let body = if declaration.contains("GB18030") {
+        GB18030.decode(body).0
+    } else if declaration.contains("GB2312") || declaration.contains("GBK") {
+        GBK.decode(body).0
+    } else {
+        String::from_utf8_lossy(body)
+    };
+    decoded.push_str(&body);
+    decoded
+}
+
+#[cfg(test)]
+mod tests {
+    use encoding_rs::{GB18030, GBK};
+
+    use super::escape_payload;
+
+    #[test]
+    fn logs_gb2312_xml_as_readable_text() {
+        let xml = "<?xml version=\"1.0\" encoding=\"GB2312\"?><Notify><AlarmDescription>移动侦测</AlarmDescription></Notify>";
+        let (body, _, had_errors) = GBK.encode(xml);
+        assert!(!had_errors);
+        let mut packet = b"MESSAGE sip:test SIP/2.0\r\nContent-Length: 0\r\n\r\n".to_vec();
+        packet.extend_from_slice(&body);
+
+        assert!(escape_payload(&packet).contains("<AlarmDescription>移动侦测</AlarmDescription>"));
+    }
+
+    #[test]
+    fn logs_gb18030_xml_as_readable_text() {
+        let xml = "<?xml version=\"1.0\" encoding=\"GB18030\"?><Notify><AlarmDescription>移动侦测</AlarmDescription></Notify>";
+        let (body, _, had_errors) = GB18030.encode(xml);
+        assert!(!had_errors);
+        let mut packet = b"MESSAGE sip:test SIP/2.0\r\nContent-Length: 0\r\n\r\n".to_vec();
+        packet.extend_from_slice(&body);
+
+        assert!(escape_payload(&packet).contains("<AlarmDescription>移动侦测</AlarmDescription>"));
+    }
 }
