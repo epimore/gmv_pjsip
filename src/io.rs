@@ -16,6 +16,11 @@ use crate::transport::SipTransportProtocol;
 
 const UDP_BUFFER_SIZE: usize = 65_535;
 
+#[derive(Debug)]
+struct TcpWriteRequest {
+    transmit: SipTransmit,
+}
+
 pub(crate) enum RuntimeIoCommand {
     Receive {
         association_id: u64,
@@ -229,7 +234,7 @@ async fn read_udp(
 async fn accept_tcp(
     listener: TokioTcpListener,
     commands: std::sync::mpsc::SyncSender<RuntimeIoCommand>,
-    writers: Arc<DashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    writers: Arc<DashMap<u64, mpsc::Sender<TcpWriteRequest>>>,
     next_association_id: Arc<AtomicU64>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -273,7 +278,7 @@ async fn handle_tcp_stream(
     stream: TcpStream,
     remote_addr: SocketAddr,
     commands: std::sync::mpsc::SyncSender<RuntimeIoCommand>,
-    writers: Arc<DashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    writers: Arc<DashMap<u64, mpsc::Sender<TcpWriteRequest>>>,
 ) {
     let local_addr = match stream.local_addr() {
         Ok(addr) => addr,
@@ -283,18 +288,28 @@ async fn handle_tcp_stream(
         }
     };
     let (mut reader, mut writer) = stream.into_split();
-    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
+    let (writer_tx, mut writer_rx) = mpsc::channel::<TcpWriteRequest>(128);
     writers.insert(association_id, writer_tx);
 
     let writer_commands = commands.clone();
     base::tokio::spawn(async move {
-        while let Some(data) = writer_rx.recv().await {
-            if let Err(err) = writer.write_all(&data).await {
+        while let Some(request) = writer_rx.recv().await {
+            let len = request.transmit.data.len();
+            if let Err(err) = writer.write_all(&request.transmit.data).await {
+                let _ = writer_commands.try_send(RuntimeIoCommand::CompleteSend {
+                    send_id: request.transmit.send_id,
+                    result: Err(1),
+                });
                 base::log::warn!(
                     "SIP TCP writer exiting after write failure: association_id={association_id}, err={err}"
                 );
                 break;
             }
+            log_outgoing_sip_packet(&request.transmit);
+            let _ = writer_commands.try_send(RuntimeIoCommand::CompleteSend {
+                send_id: request.transmit.send_id,
+                result: Ok(len),
+            });
         }
         base::log::warn!("SIP TCP writer task exited: association_id={association_id}");
     });
@@ -335,7 +350,7 @@ async fn handle_tcp_stream(
         }
     }
     writers.remove(&association_id);
-    let _ = writer_commands.try_send(RuntimeIoCommand::TransportClosed {
+    let _ = commands.try_send(RuntimeIoCommand::TransportClosed {
         association_id,
         protocol: SipTransportProtocol::Tcp,
         local_addr,
@@ -350,32 +365,40 @@ async fn handle_tcp_stream(
 async fn write_transmit(
     transmit: SipTransmit,
     udp: Option<&Arc<TokioUdpSocket>>,
-    writers: &DashMap<u64, mpsc::Sender<Vec<u8>>>,
+    writers: &DashMap<u64, mpsc::Sender<TcpWriteRequest>>,
     commands: &std::sync::mpsc::SyncSender<RuntimeIoCommand>,
 ) {
-    log_outgoing_sip_packet(&transmit);
-    let result = match transmit.protocol {
-        SipTransportProtocol::Udp => match udp {
-            Some(socket) => socket
-                .send_to(&transmit.data, transmit.remote_addr)
-                .await
-                .map_err(|_| 1),
-            None => Err(1),
-        },
-        SipTransportProtocol::Tcp | SipTransportProtocol::Tls => {
-            match writers.get(&transmit.association_id) {
-                Some(writer) => writer
-                    .try_send(transmit.data.clone())
-                    .map(|()| transmit.data.len())
+    match transmit.protocol {
+        SipTransportProtocol::Udp => {
+            let result = match udp {
+                Some(socket) => socket
+                    .send_to(&transmit.data, transmit.remote_addr)
+                    .await
                     .map_err(|_| 1),
                 None => Err(1),
+            };
+            if result.is_ok() {
+                log_outgoing_sip_packet(&transmit);
+            }
+            let _ = commands.try_send(RuntimeIoCommand::CompleteSend {
+                send_id: transmit.send_id,
+                result,
+            });
+        }
+        SipTransportProtocol::Tcp | SipTransportProtocol::Tls => {
+            let send_id = transmit.send_id;
+            let result = match writers.get(&transmit.association_id) {
+                Some(writer) => writer.try_send(TcpWriteRequest { transmit }).map_err(|_| 1),
+                None => Err(1),
+            };
+            if let Err(status) = result {
+                let _ = commands.try_send(RuntimeIoCommand::CompleteSend {
+                    send_id,
+                    result: Err(status),
+                });
             }
         }
-    };
-    let _ = commands.try_send(RuntimeIoCommand::CompleteSend {
-        send_id: transmit.send_id,
-        result,
-    });
+    }
 }
 
 fn next_sip_message(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {

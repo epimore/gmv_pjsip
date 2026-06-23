@@ -276,6 +276,56 @@ static void gmv_add_options_response_headers(
     }
 }
 
+static void gmv_preserve_response_to_uri(
+    pjsip_rx_data *rdata,
+    pjsip_tx_data *tdata) {
+    if (!rdata || !tdata || !rdata->msg_info.to || !tdata->msg) {
+        return;
+    }
+    pjsip_to_hdr *response_to =
+        (pjsip_to_hdr *)pjsip_msg_find_hdr(
+            tdata->msg,
+            PJSIP_H_TO,
+            NULL);
+    if (!response_to) {
+        return;
+    }
+    pjsip_to_hdr *request_to =
+        (pjsip_to_hdr *)pjsip_hdr_clone(
+            tdata->pool,
+            (const pjsip_hdr *)rdata->msg_info.to);
+    if (!request_to || !request_to->uri) {
+        return;
+    }
+    response_to->uri = request_to->uri;
+}
+
+static void gmv_fix_response_top_via(
+    pjsip_rx_data *rdata,
+    pjsip_tx_data *tdata) {
+    if (!rdata || !tdata || !tdata->msg) {
+        return;
+    }
+    pjsip_via_hdr *via =
+        (pjsip_via_hdr *)pjsip_msg_find_hdr(
+            tdata->msg,
+            PJSIP_H_VIA,
+            NULL);
+    if (!via) {
+        return;
+    }
+    if (via->rport_param >= 0 && rdata->pkt_info.src_port > 0) {
+        via->rport_param = rdata->pkt_info.src_port;
+    }
+    if (rdata->pkt_info.src_name[0] != '\0' &&
+        via->recvd_param.slen == 0) {
+        pj_strdup2(
+            tdata->pool,
+            &via->recvd_param,
+            rdata->pkt_info.src_name);
+    }
+}
+
 static pj_status_t gmv_send_response(
     gmv_sip_runtime_t *runtime,
     pjsip_rx_data *rdata,
@@ -293,6 +343,8 @@ static pj_status_t gmv_send_response(
     if (status != PJ_SUCCESS) {
         return status;
     }
+    gmv_preserve_response_to_uri(rdata, tdata);
+    gmv_fix_response_top_via(rdata, tdata);
     gmv_add_register_response_headers(rdata, tdata, status_code);
     gmv_add_options_response_headers(rdata, tdata, status_code);
 
@@ -780,6 +832,102 @@ static pj_bool_t gmv_handle_register(
     return PJ_TRUE;
 }
 
+static void gmv_cleanup_recent_requests(
+    gmv_sip_runtime_t *runtime,
+    uint64_t now) {
+    gmv_recent_request_t **cursor = &runtime->recent_requests;
+    while (*cursor) {
+        gmv_recent_request_t *request = *cursor;
+        if (request->expires_at_ms > now) {
+            cursor = &request->next;
+            continue;
+        }
+        *cursor = request->next;
+        free(request);
+        --runtime->recent_request_count;
+    }
+}
+
+static void gmv_trim_recent_requests(gmv_sip_runtime_t *runtime) {
+    while (runtime->recent_request_count > GMV_SIP_DUPLICATE_REQUEST_MAX &&
+           runtime->recent_requests) {
+        gmv_recent_request_t **cursor = &runtime->recent_requests;
+        while ((*cursor)->next) {
+            cursor = &(*cursor)->next;
+        }
+        gmv_recent_request_t *request = *cursor;
+        *cursor = NULL;
+        free(request);
+        --runtime->recent_request_count;
+    }
+}
+
+static int gmv_build_request_dedupe_key(
+    pjsip_rx_data *rdata,
+    char *out,
+    size_t out_len) {
+    if (!rdata || !out || out_len == 0 || !rdata->msg_info.msg ||
+        !rdata->msg_info.cid || !rdata->msg_info.cseq ||
+        !rdata->msg_info.via ||
+        rdata->msg_info.cid->id.slen <= 0 ||
+        rdata->msg_info.cseq->method.name.slen <= 0 ||
+        rdata->msg_info.via->branch_param.slen <= 0) {
+        return 0;
+    }
+    uint64_t association_id = 0;
+    if (rdata->tp_info.transport) {
+        gmv_custom_transport_t *transport =
+            (gmv_custom_transport_t *)rdata->tp_info.transport;
+        association_id = transport->association_id;
+    }
+    int written = pj_ansi_snprintf(
+        out,
+        out_len,
+        "%d|%llu|%.*s|%d|%.*s|%.*s",
+        gmv_transport_type(rdata->tp_info.transport),
+        (unsigned long long)association_id,
+        (int)rdata->msg_info.cid->id.slen,
+        rdata->msg_info.cid->id.ptr,
+        (int)rdata->msg_info.cseq->cseq,
+        (int)rdata->msg_info.cseq->method.name.slen,
+        rdata->msg_info.cseq->method.name.ptr,
+        (int)rdata->msg_info.via->branch_param.slen,
+        rdata->msg_info.via->branch_param.ptr);
+    return written > 0 && (size_t)written < out_len;
+}
+
+static pj_bool_t gmv_recent_request_seen(
+    gmv_sip_runtime_t *runtime,
+    pjsip_rx_data *rdata) {
+    char key[GMV_SIP_DUPLICATE_KEY_CAPACITY];
+    if (!runtime ||
+        !gmv_build_request_dedupe_key(rdata, key, sizeof(key))) {
+        return PJ_FALSE;
+    }
+    uint64_t now = gmv_now_ms();
+    gmv_cleanup_recent_requests(runtime, now);
+    gmv_recent_request_t *request = runtime->recent_requests;
+    while (request) {
+        if (strcmp(request->key, key) == 0) {
+            request->expires_at_ms =
+                now + GMV_SIP_DUPLICATE_REQUEST_TTL_MS;
+            return PJ_TRUE;
+        }
+        request = request->next;
+    }
+    request = (gmv_recent_request_t *)calloc(1, sizeof(*request));
+    if (!request) {
+        return PJ_FALSE;
+    }
+    pj_ansi_strxcpy(request->key, key, sizeof(request->key));
+    request->expires_at_ms = now + GMV_SIP_DUPLICATE_REQUEST_TTL_MS;
+    request->next = runtime->recent_requests;
+    runtime->recent_requests = request;
+    ++runtime->recent_request_count;
+    gmv_trim_recent_requests(runtime);
+    return PJ_FALSE;
+}
+
 static pj_bool_t gmv_on_rx_request(pjsip_rx_data *rdata) {
     gmv_sip_runtime_t *runtime = g_active_runtime;
     if (!runtime || !rdata || !rdata->msg_info.msg) {
@@ -803,6 +951,20 @@ static pj_bool_t gmv_on_rx_request(pjsip_rx_data *rdata) {
     int32_t transport = gmv_transport_type(rdata->tp_info.transport);
     if (is_invite) {
         return gmv_handle_incoming_invite(runtime, rdata);
+    }
+    if (!is_register && gmv_recent_request_seen(runtime, rdata)) {
+        if (is_ack || is_bye || is_cancel) {
+            return PJ_FALSE;
+        }
+        pj_status_t duplicate_status = gmv_send_response(
+            runtime,
+            rdata,
+            NULL,
+            PJSIP_SC_OK,
+            0,
+            PJ_FALSE);
+        runtime->last_status = duplicate_status;
+        return PJ_TRUE;
     }
     gmv_emit_event(
         runtime,

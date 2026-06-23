@@ -37,6 +37,9 @@
 #define GMV_SIP_CONFIG_HAS(config, field) \
     ((config)->size >= \
      offsetof(gmv_sip_runtime_config_t, field) + sizeof((config)->field))
+#define GMV_SIP_DUPLICATE_REQUEST_TTL_MS 5000u
+#define GMV_SIP_DUPLICATE_REQUEST_MAX 512u
+#define GMV_SIP_DUPLICATE_KEY_CAPACITY 768u
 
 typedef struct gmv_pending_auth {
     uint64_t lookup_id;
@@ -64,6 +67,12 @@ typedef struct gmv_auth_command {
     char secret[GMV_SIP_AUTH_SECRET_CAPACITY];
     struct gmv_auth_command *next;
 } gmv_auth_command_t;
+
+typedef struct gmv_recent_request {
+    char key[GMV_SIP_DUPLICATE_KEY_CAPACITY];
+    uint64_t expires_at_ms;
+    struct gmv_recent_request *next;
+} gmv_recent_request_t;
 
 typedef struct gmv_nonce_usage {
     char username[GMV_SIP_DEVICE_ID_CAPACITY];
@@ -197,6 +206,8 @@ struct gmv_sip_runtime {
     gmv_pending_auth_t *pending_auth;
     gmv_auth_command_t *command_head;
     gmv_auth_command_t *command_tail;
+    gmv_recent_request_t *recent_requests;
+    uint32_t recent_request_count;
     gmv_receive_command_t *receive_head;
     gmv_receive_command_t *receive_tail;
     gmv_send_completion_command_t *completion_head;
@@ -1700,6 +1711,12 @@ static void gmv_runtime_release(gmv_sip_runtime_t *runtime) {
         gmv_free_pending_auth(pending);
     }
     runtime->pending_auth_count = 0;
+    while (runtime->recent_requests) {
+        gmv_recent_request_t *request = runtime->recent_requests;
+        runtime->recent_requests = request->next;
+        free(request);
+    }
+    runtime->recent_request_count = 0;
     while (runtime->command_head) {
         gmv_auth_command_t *command = runtime->command_head;
         runtime->command_head = command->next;
