@@ -1,0 +1,6 @@
+[env]
+PJSIP_INCLUDE_DIR = { value = "../gmv/third_party/pjproject-2.17/dist/include", relative = true }
+PJSIP_LIBS_DIR    = { value = "../gmv/third_party/pjproject-2.17/dist/lib", relative = true }
+[net]
+git-fetch-with-cli = true
+retry = 5

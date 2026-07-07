@@ -23,10 +23,11 @@ pub use auth::{
 pub use gb28181::sdp::{TalkAudioCodec, TalkSdpMode};
 pub use message::SipMethod;
 pub use runtime::{
-    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipDialogSnapshot, SipInviteIdentity,
-    SipInviteResponse, SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe,
-    SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind,
-    SipRuntimeEvents, SipRuntimeSockets, SipTlsConfig,
+    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipDialogSnapshot,
+    SipIncomingInviteAllow, SipInviteIdentity, SipInviteResponse, SipOutboundInvite,
+    SipOutboundMessage, SipOutboundSubscribe, SipRegisteredSource, SipRestoredDialogRequest,
+    SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeEvents,
+    SipRuntimeSockets, SipTlsConfig,
 };
 #[cfg(feature = "test-helpers")]
 pub use runtime::{SipRuntimeTransmits, SipTransmit};

@@ -949,7 +949,21 @@ static pj_bool_t gmv_on_rx_request(pjsip_rx_data *rdata) {
     }
 
     int32_t transport = gmv_transport_type(rdata->tp_info.transport);
+    pj_str_t request_device_id = gmv_from_user(rdata);
+    if ((is_options || is_message) &&
+        !gmv_registered_source_allowed(
+            runtime,
+            transport,
+            rdata->pkt_info.src_name,
+            &request_device_id)) {
+        runtime->last_status = PJ_SUCCESS;
+        return PJ_TRUE;
+    }
     if (is_invite) {
+        if (!gmv_consume_incoming_invite_allow(runtime, rdata)) {
+            runtime->last_status = PJ_SUCCESS;
+            return PJ_TRUE;
+        }
         return gmv_handle_incoming_invite(runtime, rdata);
     }
     if (!is_register && gmv_recent_request_seen(runtime, rdata)) {
@@ -1011,4 +1025,3 @@ static pj_bool_t gmv_on_rx_request(pjsip_rx_data *rdata) {
     }
     return PJ_TRUE;
 }
-

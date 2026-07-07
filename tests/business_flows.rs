@@ -11,7 +11,7 @@ use gmv_pjsip::gb28181::xml::{
 };
 use gmv_pjsip::{
     SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipOutboundInvite, SipOutboundMessage,
-    SipOutboundSubscribe, SipRuntimeEventKind, SipTransportProtocol,
+    SipOutboundSubscribe, SipRegisteredSource, SipRuntimeEventKind, SipTransportProtocol,
 };
 use support::device_simulator::{device_addr, platform_addr, CHANNEL_ID, DEVICE_ID, PLATFORM_ID};
 use support::{
@@ -171,6 +171,13 @@ fn normal_gb28181_business_dialogues_use_runtime_adapter() {
         event.kind == SipRuntimeEventKind::Registered
     });
     assert_eq!(registered.device_id.as_deref(), Some(DEVICE_ID));
+    runtime
+        .allow_registered_source(&SipRegisteredSource {
+            device_id: DEVICE_ID.into(),
+            remote_address: device_addr().ip().to_string(),
+            protocol: SipTransportProtocol::Udp,
+        })
+        .expect("allow registered device source");
 
     device.inject_request(&mut runtime, "OPTIONS", "normal-options", None, "", &[]);
     let options_response = receive_transmit_for(&mut runtime, &transmits, "OPTIONS response");

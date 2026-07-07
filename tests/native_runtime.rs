@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use base::log::{LevelFilter, Log, Metadata, Record};
 use gmv_pjsip::{
-    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipInviteResponse, SipOutboundInvite,
-    SipOutboundMessage, SipOutboundSubscribe, SipRestoredDialogRequest, SipRuntime,
-    SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits,
-    SipTransmit, SipTransportProtocol,
+    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipIncomingInviteAllow,
+    SipInviteResponse, SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe,
+    SipRegisteredSource, SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
+    SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -67,6 +67,21 @@ fn start_runtime(
     config.port = LOCAL_PORT;
     config.user_agent = TEST_USER_AGENT.into();
     SipRuntime::start_for_test(config).expect("start runtime")
+}
+
+fn allow_registered_source(
+    runtime: &mut SipRuntime,
+    device_id: &str,
+    remote: SocketAddr,
+    protocol: SipTransportProtocol,
+) {
+    runtime
+        .allow_registered_source(&SipRegisteredSource {
+            device_id: device_id.into(),
+            remote_address: remote.ip().to_string(),
+            protocol,
+        })
+        .expect("allow registered source");
 }
 
 fn receive_event(
@@ -213,6 +228,7 @@ fn runtime_owns_inherited_udp_socket() {
         },
     )
     .expect("start socket-owned runtime");
+    allow_registered_source(&mut runtime, "test", peer_addr, SipTransportProtocol::Udp);
     let request = format!(
         "OPTIONS sip:{runtime_addr} SIP/2.0\r\n\
 Via: SIP/2.0/UDP {peer_addr};branch=z9hG4bK-owned-udp;rport\r\n\
@@ -258,6 +274,7 @@ fn runtime_adapter_handles_udp_and_fragmented_tcp() {
     let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
 
     let udp_remote = remote_addr(40000);
+    allow_registered_source(&mut runtime, "test", udp_remote, SipTransportProtocol::Udp);
     let options = format!(
         "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
 Via: SIP/2.0/UDP {udp_remote};branch=z9hG4bK-options;rport\r\n\
@@ -287,6 +304,7 @@ Content-Length: 0\r\n\r\n"
     assert!(response.contains("\r\nAllow: REGISTER, MESSAGE, OPTIONS\r\n"));
 
     let tcp_remote = remote_addr(40001);
+    allow_registered_source(&mut runtime, "test", tcp_remote, SipTransportProtocol::Tcp);
     let body = "<?xml version=\"1.0\"?><Notify><CmdType>Keepalive</CmdType></Notify>";
     let message = format!(
         "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
@@ -575,6 +593,7 @@ fn tcp_via_uses_configured_advertised_address() {
     let (mut runtime, _events, transmits) = start_runtime(config);
     let remote = remote_addr(40013);
     let association_id = 13;
+    allow_registered_source(&mut runtime, "device", remote, SipTransportProtocol::Tcp);
     let bootstrap = format!(
         "OPTIONS sip:platform@{} SIP/2.0\r\nVia: SIP/2.0/TCP {remote};branch=z9hG4bK-bootstrap;rport\r\nFrom: <sip:device@{remote}>;tag=bootstrap\r\nTo: <sip:platform@{}>\r\nCall-ID: bootstrap-advertised-via\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
         local_addr(),
@@ -1011,6 +1030,12 @@ fn fresh_runtime_sends_restored_info_info_and_bye() {
 
     let tcp_remote = remote_addr(15072);
     let tcp_association_id = 77;
+    allow_registered_source(
+        &mut runtime,
+        "device",
+        tcp_remote,
+        SipTransportProtocol::Tcp,
+    );
     let bootstrap = format!(
         "OPTIONS sip:platform@{} SIP/2.0\r\nVia: SIP/2.0/TCP {tcp_remote};branch=z9hG4bK-bootstrap\r\nFrom: <sip:device@{tcp_remote}>;tag=bootstrap\r\nTo: <sip:platform@{}>\r\nCall-ID: bootstrap-tcp\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\nContent-Length: 0\r\n\r\n",
         local_addr(),
@@ -1081,6 +1106,15 @@ fn runtime_adapter_owns_incoming_invite_and_cancel() {
     };
     let (mut runtime, events, transmits) = start_runtime(config);
     let remote = remote_addr(40006);
+    runtime
+        .allow_incoming_invite(&SipIncomingInviteAllow {
+            target_id: "device".into(),
+            source_id: "platform".into(),
+            remote_address: remote.ip().to_string(),
+            protocol: SipTransportProtocol::Udp,
+            ttl: Duration::from_secs(5),
+        })
+        .expect("allow incoming INVITE");
     let sdp = "v=0\r\n\
 o=device 0 0 IN IP4 127.0.0.1\r\n\
 s=Play\r\n\
@@ -1180,25 +1214,11 @@ Content-Length: 0\r\n\r\n",
             unsupported_invite.as_bytes(),
         )
         .expect("inject unsupported incoming INVITE");
-    let unsupported_trying = receive_transmit(&mut runtime, &transmits);
-    assert!(finish_transmit(&mut runtime, &unsupported_trying).starts_with("SIP/2.0 100"));
-    let unsupported = receive_event(&mut runtime, &events, SipRuntimeEventKind::IncomingInvite);
-    assert_eq!(unsupported.call_id.as_deref(), Some("unsupported-invite"));
-    runtime
-        .respond_invite(&SipInviteResponse {
-            call_id: "unsupported-invite".into(),
-            status_code: 501,
-            reason: Some("Inbound session is not supported".into()),
-            content_type: None,
-            body: Vec::new(),
-        })
-        .expect("reject unsupported incoming INVITE");
-    let unsupported_response = receive_transmit(&mut runtime, &transmits);
-    assert!(finish_transmit(&mut runtime, &unsupported_response)
-        .starts_with("SIP/2.0 501 Inbound session is not supported"));
-    runtime
-        .poll()
-        .expect("complete unsupported INVITE response");
+    runtime.poll().expect("process unsupported INVITE drop");
+    assert!(matches!(
+        transmits.recv_timeout(Duration::from_millis(50)),
+        Err(RecvTimeoutError::Timeout)
+    ));
 
     runtime.shutdown().expect("shutdown runtime");
 }
@@ -1212,6 +1232,15 @@ fn runtime_adapter_accepts_incoming_audio_invite_and_sends_bye() {
     };
     let (mut runtime, events, transmits) = start_runtime(config.clone());
     let remote = remote_addr(40007);
+    runtime
+        .allow_incoming_invite(&SipIncomingInviteAllow {
+            target_id: "receiver".into(),
+            source_id: "platform".into(),
+            remote_address: remote.ip().to_string(),
+            protocol: SipTransportProtocol::Udp,
+            ttl: Duration::from_secs(5),
+        })
+        .expect("allow broadcast INVITE");
     let remote_sdp = "v=0\r\n\
 o=receiver 0 0 IN IP4 127.0.0.1\r\n\
 s=Play\r\n\
@@ -1338,6 +1367,7 @@ fn receive_is_processed_before_close_in_same_poll() {
     let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
     let association_id = 78;
     let remote = remote_addr(40007);
+    allow_registered_source(&mut runtime, "device", remote, SipTransportProtocol::Tcp);
     let options = |branch: &str, cseq: u32| {
         format!(
             "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
@@ -1405,6 +1435,7 @@ fn closing_tcp_transport_cleans_subscription_before_refresh_timer() {
     let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
     let association_id = 77;
     let remote = remote_addr(40006);
+    allow_registered_source(&mut runtime, "device", remote, SipTransportProtocol::Tcp);
     let options = format!(
         "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
 Via: SIP/2.0/TCP {remote};branch=z9hG4bK-subscribe-close;rport\r\n\

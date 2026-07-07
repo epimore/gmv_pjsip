@@ -90,6 +90,22 @@ typedef struct gmv_auth_nonce {
     struct gmv_auth_nonce *next;
 } gmv_auth_nonce_t;
 
+typedef struct gmv_registered_source {
+    int32_t transport;
+    char device_id[GMV_SIP_DEVICE_ID_CAPACITY];
+    char remote_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
+    struct gmv_registered_source *next;
+} gmv_registered_source_t;
+
+typedef struct gmv_incoming_invite_allow {
+    int32_t transport;
+    char target_id[GMV_SIP_DEVICE_ID_CAPACITY];
+    char source_id[GMV_SIP_DEVICE_ID_CAPACITY];
+    char remote_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
+    uint64_t expires_at_ms;
+    struct gmv_incoming_invite_allow *next;
+} gmv_incoming_invite_allow_t;
+
 typedef struct gmv_outbound_operation {
     gmv_sip_runtime_t *runtime;
     uint64_t operation_id;
@@ -230,6 +246,8 @@ struct gmv_sip_runtime {
     gmv_pending_send_t *pending_sends;
     gmv_invite_call_t *invite_calls;
     gmv_subscription_call_t *subscriptions;
+    gmv_registered_source_t *registered_sources;
+    gmv_incoming_invite_allow_t *incoming_invite_allows;
     uint64_t transport_sequence;
     uint64_t send_sequence;
     int pj_initialized;
@@ -270,6 +288,7 @@ static pj_status_t gmv_send_subscribe_on_owner(
 static pj_bool_t gmv_handle_incoming_invite(
     gmv_sip_runtime_t *runtime,
     pjsip_rx_data *rdata);
+static int32_t gmv_transport_type(const pjsip_transport *transport);
 static gmv_invite_call_t *gmv_find_invite_call(
     gmv_sip_runtime_t *runtime,
     const char *call_id);
@@ -429,6 +448,157 @@ static uint64_t gmv_now_ms(void) {
     pj_time_val now;
     pj_gettimeofday(&now);
     return ((uint64_t)now.sec * 1000u) + (uint64_t)now.msec;
+}
+
+static pj_str_t gmv_empty_pj_str(void) {
+    return pj_str("");
+}
+
+static pj_str_t gmv_sip_uri_user(pjsip_uri *uri) {
+    if (!uri) {
+        return gmv_empty_pj_str();
+    }
+    uri = pjsip_uri_get_uri(uri);
+    if (!uri || !PJSIP_URI_SCHEME_IS_SIP(uri)) {
+        return gmv_empty_pj_str();
+    }
+    return ((pjsip_sip_uri *)uri)->user;
+}
+
+static pj_str_t gmv_from_user(const pjsip_rx_data *rdata) {
+    if (!rdata || !rdata->msg_info.from || !rdata->msg_info.from->uri) {
+        return gmv_empty_pj_str();
+    }
+    return gmv_sip_uri_user(rdata->msg_info.from->uri);
+}
+
+static pj_str_t gmv_to_user(const pjsip_rx_data *rdata) {
+    if (!rdata || !rdata->msg_info.to || !rdata->msg_info.to->uri) {
+        return gmv_empty_pj_str();
+    }
+    return gmv_sip_uri_user(rdata->msg_info.to->uri);
+}
+
+static int gmv_pj_str_equals_c(const pj_str_t *value, const char *expected) {
+    size_t expected_len = expected ? strlen(expected) : 0;
+    return value && value->ptr && value->slen >= 0 &&
+        (size_t)value->slen == expected_len &&
+        memcmp(value->ptr, expected, expected_len) == 0;
+}
+
+static int gmv_subject_contains_target(
+    const pjsip_rx_data *rdata,
+    const char *target_id) {
+    if (!rdata || !rdata->msg_info.msg || !target_id || !*target_id) {
+        return 0;
+    }
+    pj_str_t subject_name = pj_str("Subject");
+    pjsip_generic_string_hdr *subject =
+        (pjsip_generic_string_hdr *)pjsip_msg_find_hdr_by_name(
+            rdata->msg_info.msg,
+            &subject_name,
+            NULL);
+    if (!subject || !subject->hvalue.ptr || subject->hvalue.slen <= 0) {
+        return 0;
+    }
+    size_t target_len = strlen(target_id);
+    if ((size_t)subject->hvalue.slen < target_len) {
+        return 0;
+    }
+    for (pj_ssize_t offset = 0;
+         offset <= subject->hvalue.slen - (pj_ssize_t)target_len;
+         ++offset) {
+        if (memcmp(subject->hvalue.ptr + offset, target_id, target_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int gmv_transport_and_source_match(
+    int32_t expected_transport,
+    const char *expected_address,
+    int32_t actual_transport,
+    const char *actual_address) {
+    return expected_transport == actual_transport &&
+        expected_address && actual_address &&
+        strcmp(expected_address, actual_address) == 0;
+}
+
+static int gmv_registered_source_allowed(
+    gmv_sip_runtime_t *runtime,
+    int32_t transport,
+    const char *remote_address,
+    const pj_str_t *device_id) {
+    if (!device_id || !device_id->ptr || device_id->slen <= 0) {
+        return 0;
+    }
+    gmv_registered_source_t *source =
+        runtime ? runtime->registered_sources : NULL;
+    while (source) {
+        if (gmv_pj_str_equals_c(device_id, source->device_id) &&
+            gmv_transport_and_source_match(
+                source->transport,
+                source->remote_address,
+                transport,
+                remote_address)) {
+            return 1;
+        }
+        source = source->next;
+    }
+    return 0;
+}
+
+static void gmv_cleanup_incoming_invite_allows(
+    gmv_sip_runtime_t *runtime,
+    uint64_t now) {
+    if (!runtime) {
+        return;
+    }
+    gmv_incoming_invite_allow_t **cursor = &runtime->incoming_invite_allows;
+    while (*cursor) {
+        gmv_incoming_invite_allow_t *allow = *cursor;
+        if (allow->expires_at_ms <= now) {
+            *cursor = allow->next;
+            free(allow);
+            continue;
+        }
+        cursor = &allow->next;
+    }
+}
+
+static int gmv_consume_incoming_invite_allow(
+    gmv_sip_runtime_t *runtime,
+    pjsip_rx_data *rdata) {
+    if (!runtime || !rdata) {
+        return 0;
+    }
+    uint64_t now = gmv_now_ms();
+    gmv_cleanup_incoming_invite_allows(runtime, now);
+    int32_t transport = gmv_transport_type(rdata->tp_info.transport);
+    pj_str_t from_user = gmv_from_user(rdata);
+    pj_str_t to_user = gmv_to_user(rdata);
+
+    gmv_incoming_invite_allow_t **cursor = &runtime->incoming_invite_allows;
+    while (*cursor) {
+        gmv_incoming_invite_allow_t *allow = *cursor;
+        int source_matches = gmv_pj_str_equals_c(&to_user, allow->source_id);
+        int target_matches =
+            gmv_pj_str_equals_c(&from_user, allow->target_id) ||
+            gmv_subject_contains_target(rdata, allow->target_id);
+        if (source_matches && target_matches &&
+            gmv_transport_and_source_match(
+                allow->transport,
+                allow->remote_address,
+                transport,
+                rdata->pkt_info.src_name)) {
+            *cursor = allow->next;
+            free(allow);
+            return 1;
+        }
+        cursor = &allow->next;
+    }
+    return 0;
 }
 
 static pj_status_t gmv_auth_lookup(
@@ -1807,6 +1977,17 @@ static void gmv_runtime_release(gmv_sip_runtime_t *runtime) {
         runtime->auth_nonces = nonce->next;
         gmv_free_nonce(nonce);
     }
+    while (runtime->registered_sources) {
+        gmv_registered_source_t *source = runtime->registered_sources;
+        runtime->registered_sources = source->next;
+        free(source);
+    }
+    while (runtime->incoming_invite_allows) {
+        gmv_incoming_invite_allow_t *allow =
+            runtime->incoming_invite_allows;
+        runtime->incoming_invite_allows = allow->next;
+        free(allow);
+    }
     while (runtime->transports) {
         gmv_close_custom_transport(
             runtime,
@@ -2285,6 +2466,141 @@ int32_t gmv_sip_runtime_complete_auth_lookup(
         runtime->command_head = command;
     }
     runtime->command_tail = command;
+    pj_mutex_unlock(runtime->command_mutex);
+    return PJ_SUCCESS;
+}
+
+int32_t gmv_sip_runtime_allow_registered_source(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_registered_source_t *source) {
+    if (!runtime || !source ||
+        source->size < sizeof(*source) ||
+        source->version != GMV_SIP_ABI_VERSION ||
+        (source->transport != GMV_SIP_TRANSPORT_UDP &&
+         source->transport != GMV_SIP_TRANSPORT_TCP) ||
+        !source->device_id.ptr || source->device_id.len == 0 ||
+        !source->remote_address.ptr || source->remote_address.len == 0 ||
+        !runtime->started || !runtime->command_mutex) {
+        return PJ_EINVAL;
+    }
+
+    char device_id[GMV_SIP_DEVICE_ID_CAPACITY];
+    char remote_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
+    if (!gmv_copy_view(device_id, sizeof(device_id), source->device_id) ||
+        !gmv_copy_view(
+            remote_address,
+            sizeof(remote_address),
+            source->remote_address)) {
+        return PJ_ETOOSMALL;
+    }
+
+    pj_mutex_lock(runtime->command_mutex);
+    gmv_registered_source_t *item = runtime->registered_sources;
+    while (item) {
+        if (strcmp(item->device_id, device_id) == 0) {
+            item->transport = source->transport;
+            pj_ansi_strxcpy(
+                item->remote_address,
+                remote_address,
+                sizeof(item->remote_address));
+            pj_mutex_unlock(runtime->command_mutex);
+            return PJ_SUCCESS;
+        }
+        item = item->next;
+    }
+
+    item = (gmv_registered_source_t *)calloc(1, sizeof(*item));
+    if (!item) {
+        pj_mutex_unlock(runtime->command_mutex);
+        return PJ_ENOMEM;
+    }
+    item->transport = source->transport;
+    pj_ansi_strxcpy(item->device_id, device_id, sizeof(item->device_id));
+    pj_ansi_strxcpy(
+        item->remote_address,
+        remote_address,
+        sizeof(item->remote_address));
+    item->next = runtime->registered_sources;
+    runtime->registered_sources = item;
+    pj_mutex_unlock(runtime->command_mutex);
+    return PJ_SUCCESS;
+}
+
+int32_t gmv_sip_runtime_remove_registered_source(
+    gmv_sip_runtime_t *runtime,
+    gmv_sip_string_view_t device_id) {
+    if (!runtime ||
+        !device_id.ptr ||
+        device_id.len == 0 ||
+        !runtime->command_mutex) {
+        return PJ_EINVAL;
+    }
+    char device_id_buffer[GMV_SIP_DEVICE_ID_CAPACITY];
+    if (!gmv_copy_view(
+            device_id_buffer,
+            sizeof(device_id_buffer),
+            device_id)) {
+        return PJ_ETOOSMALL;
+    }
+
+    pj_mutex_lock(runtime->command_mutex);
+    gmv_registered_source_t **cursor = &runtime->registered_sources;
+    while (*cursor) {
+        gmv_registered_source_t *item = *cursor;
+        if (strcmp(item->device_id, device_id_buffer) == 0) {
+            *cursor = item->next;
+            free(item);
+            continue;
+        }
+        cursor = &item->next;
+    }
+    pj_mutex_unlock(runtime->command_mutex);
+    return PJ_SUCCESS;
+}
+
+int32_t gmv_sip_runtime_allow_incoming_invite(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_incoming_invite_allow_t *allow) {
+    if (!runtime || !allow ||
+        allow->size < sizeof(*allow) ||
+        allow->version != GMV_SIP_ABI_VERSION ||
+        (allow->transport != GMV_SIP_TRANSPORT_UDP &&
+         allow->transport != GMV_SIP_TRANSPORT_TCP) ||
+        !allow->target_id.ptr || allow->target_id.len == 0 ||
+        !allow->source_id.ptr || allow->source_id.len == 0 ||
+        !allow->remote_address.ptr || allow->remote_address.len == 0 ||
+        allow->ttl_ms == 0 ||
+        !runtime->started || !runtime->command_mutex) {
+        return PJ_EINVAL;
+    }
+
+    gmv_incoming_invite_allow_t *item =
+        (gmv_incoming_invite_allow_t *)calloc(1, sizeof(*item));
+    if (!item) {
+        return PJ_ENOMEM;
+    }
+    item->transport = allow->transport;
+    item->expires_at_ms = gmv_now_ms() + allow->ttl_ms;
+    if (!gmv_copy_view(
+            item->target_id,
+            sizeof(item->target_id),
+            allow->target_id) ||
+        !gmv_copy_view(
+            item->source_id,
+            sizeof(item->source_id),
+            allow->source_id) ||
+        !gmv_copy_view(
+            item->remote_address,
+            sizeof(item->remote_address),
+            allow->remote_address)) {
+        free(item);
+        return PJ_ETOOSMALL;
+    }
+
+    pj_mutex_lock(runtime->command_mutex);
+    gmv_cleanup_incoming_invite_allows(runtime, gmv_now_ms());
+    item->next = runtime->incoming_invite_allows;
+    runtime->incoming_invite_allows = item;
     pj_mutex_unlock(runtime->command_mutex);
     return PJ_SUCCESS;
 }
