@@ -4,7 +4,7 @@ pub(crate) type Result<T> = GlobalResult<T>;
 
 pub(crate) fn system_error(message: impl Into<String>) -> GlobalError {
     let message = message.into();
-    GlobalError::new_sys_error(&message, |_| {})
+    GlobalError::new_sys_error(&message, |msg| base::log::error!("{msg}"))
 }
 
 pub(crate) fn invalid_config(message: String) -> GlobalError {
