@@ -4,11 +4,13 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use base::log::{LevelFilter, Log, Metadata, Record};
+use gmv_pjsip::auth::{create_digest_response, parse_digest_authorization};
 use gmv_pjsip::{
-    SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipIncomingInviteAllow,
-    SipInviteResponse, SipOutboundInvite, SipOutboundMessage, SipOutboundSubscribe,
-    SipRegisteredSource, SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent,
-    SipRuntimeEventKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
+    AuthAlgorithm, AuthCredential, CredentialKind, SipAuthLookupResult, SipDialogMethod,
+    SipDialogRequest, SipIncomingInviteAllow, SipInviteResponse, SipOutboundInvite,
+    SipOutboundMessage, SipOutboundSubscribe, SipRegisteredSource, SipRestoredDialogRequest,
+    SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeSockets,
+    SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -138,6 +140,177 @@ fn header_value<'a>(message: &'a str, name: &str) -> &'a str {
             header.eq_ignore_ascii_case(name).then_some(value.trim())
         })
         .unwrap_or_else(|| panic!("missing {name} header"))
+}
+
+fn register_request(
+    request_uri: &str,
+    username: &str,
+    remote: SocketAddr,
+    cseq: u32,
+    authorization: Option<&str>,
+) -> String {
+    let authorization = authorization
+        .map(|value| format!("Authorization: {value}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "REGISTER {request_uri} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {remote};branch=z9hG4bK-register-{cseq};rport\r\n\
+From: <sip:{username}@3402000000>;tag=register\r\n\
+To: <sip:{username}@3402000000>\r\n\
+Call-ID: digest-register\r\n\
+CSeq: {cseq} REGISTER\r\n\
+Contact: <sip:{username}@{remote}>\r\n\
+Expires: 3600\r\n\
+{authorization}\
+Max-Forwards: 70\r\n\
+Content-Length: 0\r\n\r\n"
+    )
+}
+
+fn test_credential(username: &str, realm: &str) -> AuthCredential {
+    AuthCredential {
+        username: username.into(),
+        realm: realm.into(),
+        secret: "native-runtime-test-secret".into(),
+        kind: CredentialKind::PlainPassword,
+        algorithm: AuthAlgorithm::Md5,
+    }
+}
+
+fn issue_register_challenge(
+    runtime: &mut SipRuntime,
+    events: &Receiver<SipRuntimeEvent>,
+    transmits: &SipRuntimeTransmits,
+    request_uri: &str,
+    username: &str,
+    remote: SocketAddr,
+    credential: &AuthCredential,
+) -> String {
+    let request = register_request(request_uri, username, remote, 1, None);
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            request.as_bytes(),
+        )
+        .expect("inject initial REGISTER");
+    let lookup = receive_event(runtime, events, SipRuntimeEventKind::AuthLookupRequired);
+    runtime
+        .complete_auth_lookup(
+            lookup.lookup_id.expect("auth lookup id"),
+            SipAuthLookupResult::Credential(credential.clone()),
+        )
+        .expect("complete initial auth lookup");
+    let challenge_transmit = receive_transmit(runtime, transmits);
+    let challenge = finish_transmit(runtime, &challenge_transmit);
+    assert!(challenge.starts_with("SIP/2.0 401"));
+    header_value(&challenge, "WWW-Authenticate").to_owned()
+}
+
+fn digest_authorization(
+    challenge: &str,
+    credential: &AuthCredential,
+    authorization_uri: &str,
+) -> String {
+    let parts = parse_digest_authorization(challenge);
+    let nonce = parts.get("nonce").expect("challenge nonce");
+    let nc = "00000001";
+    let cnonce = "native-test-cnonce";
+    let qop = "auth";
+    let response = create_digest_response(
+        credential,
+        "REGISTER",
+        authorization_uri,
+        nonce,
+        Some(nc),
+        Some(cnonce),
+        Some(qop),
+        AuthAlgorithm::Md5,
+    )
+    .expect("create REGISTER digest");
+    format!(
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", \
+         response=\"{}\", algorithm=MD5, cnonce=\"{}\", qop={}, nc={}",
+        credential.username, credential.realm, nonce, authorization_uri, response, cnonce, qop, nc
+    )
+}
+
+struct DigestRegisterCase<'a> {
+    request_uri: &'a str,
+    authorization_uri: &'a str,
+    username: &'a str,
+    remote: SocketAddr,
+    credential: &'a AuthCredential,
+    tamper_digest: bool,
+}
+
+fn complete_digest_register(
+    runtime: &mut SipRuntime,
+    events: &Receiver<SipRuntimeEvent>,
+    transmits: &SipRuntimeTransmits,
+    case: DigestRegisterCase<'_>,
+) -> (String, Option<SipRuntimeEvent>) {
+    let challenge = issue_register_challenge(
+        runtime,
+        events,
+        transmits,
+        case.request_uri,
+        case.username,
+        case.remote,
+        case.credential,
+    );
+    let mut authorization =
+        digest_authorization(&challenge, case.credential, case.authorization_uri);
+    if case.tamper_digest {
+        let response_start =
+            authorization.find("response=\"").expect("digest response") + "response=\"".len();
+        let replacement = if &authorization[response_start..response_start + 1] == "0" {
+            "1"
+        } else {
+            "0"
+        };
+        authorization.replace_range(response_start..response_start + 1, replacement);
+    }
+    let request = register_request(
+        case.request_uri,
+        case.username,
+        case.remote,
+        2,
+        Some(&authorization),
+    );
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            case.remote,
+            request.as_bytes(),
+        )
+        .expect("inject authenticated REGISTER");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut registered = None;
+    while Instant::now() < deadline {
+        runtime.poll().expect("poll runtime");
+        while let Ok(event) = events.try_recv() {
+            if event.kind == SipRuntimeEventKind::AuthLookupRequired {
+                runtime
+                    .complete_auth_lookup(
+                        event.lookup_id.expect("auth lookup id"),
+                        SipAuthLookupResult::Credential(case.credential.clone()),
+                    )
+                    .expect("complete authenticated lookup");
+            } else if event.kind == SipRuntimeEventKind::Registered {
+                registered = Some(event);
+            }
+        }
+        if let Ok(transmit) = transmits.try_recv() {
+            return (finish_transmit(runtime, &transmit), registered);
+        }
+    }
+    panic!("timed out waiting for authenticated REGISTER response");
 }
 
 #[test]
@@ -489,6 +662,152 @@ Content-Length: 0\r\n\r\n"
         registered.user_agent.as_deref(),
         Some("GMV-Test-Device/1.0")
     );
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn runtime_adapter_register_digest_nat_uri_compat() {
+    let _guard = lock_tests();
+    let advertised_address = Ipv4Addr::new(192, 0, 2, 10);
+    let config = SipRuntimeConfig {
+        advertised_address,
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40012);
+    let username = "34020000001320000001";
+    let request_uri = format!("sip:34020000002000000001@{}", local_addr());
+    let authorization_uri = format!("sip:34020000002000000001@{advertised_address}:{LOCAL_PORT}");
+    let credential = test_credential(username, "3402000000");
+
+    let (response, registered) = complete_digest_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        DigestRegisterCase {
+            request_uri: &request_uri,
+            authorization_uri: &authorization_uri,
+            username,
+            remote,
+            credential: &credential,
+            tamper_digest: false,
+        },
+    );
+
+    assert!(response.starts_with("SIP/2.0 200"));
+    let registered = registered
+        .unwrap_or_else(|| receive_event(&mut runtime, &events, SipRuntimeEventKind::Registered));
+    assert_eq!(registered.device_id.as_deref(), Some(username));
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn runtime_adapter_register_digest_exact_uri_still_succeeds() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let username = "34020000001320000001";
+    let request_uri = format!("sip:34020000002000000001@{}", local_addr());
+    let credential = test_credential(username, "3402000000");
+
+    let (response, registered) = complete_digest_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        DigestRegisterCase {
+            request_uri: &request_uri,
+            authorization_uri: &request_uri,
+            username,
+            remote: remote_addr(40013),
+            credential: &credential,
+            tamper_digest: false,
+        },
+    );
+
+    assert!(response.starts_with("SIP/2.0 200"));
+    let registered = registered
+        .unwrap_or_else(|| receive_event(&mut runtime, &events, SipRuntimeEventKind::Registered));
+    assert_eq!(registered.device_id.as_deref(), Some(username));
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn runtime_adapter_rejects_unrelated_digest_uri() {
+    let _guard = lock_tests();
+    let advertised_address = Ipv4Addr::new(192, 0, 2, 10);
+    let request_uri = format!("sip:34020000002000000001@{}", local_addr());
+    let username = "34020000001320000001";
+    let credential = test_credential(username, "3402000000");
+    let rejected_uris = [
+        format!("sip:34020000002000000001@192.0.2.99:{LOCAL_PORT}"),
+        format!("sip:44010000002000000001@{advertised_address}:{LOCAL_PORT}"),
+        format!(
+            "sip:34020000002000000001@{advertised_address}:{}",
+            LOCAL_PORT + 1
+        ),
+    ];
+
+    for (index, authorization_uri) in rejected_uris.iter().enumerate() {
+        let config = SipRuntimeConfig {
+            advertised_address,
+            enable_tcp: false,
+            ..SipRuntimeConfig::default()
+        };
+        let (mut runtime, events, transmits) = start_runtime(config);
+        let (response, registered) = complete_digest_register(
+            &mut runtime,
+            &events,
+            &transmits,
+            DigestRegisterCase {
+                request_uri: &request_uri,
+                authorization_uri,
+                username,
+                remote: remote_addr(40020 + index as u16),
+                credential: &credential,
+                tamper_digest: false,
+            },
+        );
+        assert!(response.starts_with("SIP/2.0 403"));
+        assert!(registered.is_none());
+        runtime.shutdown().expect("shutdown runtime");
+    }
+}
+
+#[test]
+fn runtime_adapter_rejects_invalid_register_digest() {
+    let _guard = lock_tests();
+    let advertised_address = Ipv4Addr::new(192, 0, 2, 10);
+    let config = SipRuntimeConfig {
+        advertised_address,
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let username = "34020000001320000001";
+    let request_uri = format!("sip:34020000002000000001@{}", local_addr());
+    let authorization_uri = format!("sip:34020000002000000001@{advertised_address}:{LOCAL_PORT}");
+    let credential = test_credential(username, "3402000000");
+
+    let (response, registered) = complete_digest_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        DigestRegisterCase {
+            request_uri: &request_uri,
+            authorization_uri: &authorization_uri,
+            username,
+            remote: remote_addr(40030),
+            credential: &credential,
+            tamper_digest: true,
+        },
+    );
+
+    assert!(response.starts_with("SIP/2.0 403"));
+    assert!(registered.is_none());
     runtime.shutdown().expect("shutdown runtime");
 }
 

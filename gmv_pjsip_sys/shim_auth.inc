@@ -82,9 +82,10 @@ static int gmv_parse_nonce_count(const pj_str_t *value, uint32_t *out) {
 }
 
 static int gmv_authorization_uri_matches(
+    gmv_sip_runtime_t *runtime,
     pjsip_rx_data *rdata,
     const pjsip_authorization_hdr *auth) {
-    if (!rdata || !rdata->msg_info.msg || !auth ||
+    if (!runtime || !rdata || !rdata->msg_info.msg || !auth ||
         auth->credential.digest.uri.slen <= 0) {
         return 0;
     }
@@ -101,17 +102,56 @@ static int gmv_authorization_uri_matches(
         buffer,
         (pj_size_t)value->slen,
         0);
-    return authorization_uri &&
-        pjsip_uri_cmp(
+    pjsip_uri *request_uri = rdata->msg_info.msg->line.req.uri;
+    if (!authorization_uri || !request_uri) {
+        return 0;
+    }
+    if (pjsip_uri_cmp(
             PJSIP_URI_IN_REQ_URI,
             authorization_uri,
-            rdata->msg_info.msg->line.req.uri) == PJ_SUCCESS;
+            request_uri) == PJ_SUCCESS) {
+        return 1;
+    }
+
+    authorization_uri = pjsip_uri_get_uri(authorization_uri);
+    request_uri = pjsip_uri_get_uri(request_uri);
+    if (!PJSIP_URI_SCHEME_IS_SIP(authorization_uri) ||
+        !PJSIP_URI_SCHEME_IS_SIP(request_uri)) {
+        return 0;
+    }
+    pjsip_sip_uri *authorization_sip =
+        (pjsip_sip_uri *)authorization_uri;
+    pjsip_sip_uri *request_sip = (pjsip_sip_uri *)request_uri;
+    int authorization_port = authorization_sip->port
+        ? authorization_sip->port
+        : 5060;
+    int request_port = request_sip->port ? request_sip->port : 5060;
+    if (pj_stricmp2(
+            &authorization_sip->host,
+            runtime->advertised_address) != 0 ||
+        authorization_port != request_port ||
+        authorization_port != runtime->requested_port) {
+        return 0;
+    }
+
+    pjsip_sip_uri *normalized = (pjsip_sip_uri *)pjsip_uri_clone(
+        rdata->tp_info.pool,
+        authorization_sip);
+    if (!normalized) {
+        return 0;
+    }
+    normalized->host = request_sip->host;
+    return pjsip_uri_cmp(
+        PJSIP_URI_IN_REQ_URI,
+        normalized,
+        request_uri) == PJ_SUCCESS;
 }
 
 static int gmv_authorization_shape_valid(
+    gmv_sip_runtime_t *runtime,
     pjsip_rx_data *rdata,
     const pjsip_authorization_hdr *auth) {
-    if (!gmv_authorization_uri_matches(rdata, auth)) {
+    if (!gmv_authorization_uri_matches(runtime, rdata, auth)) {
         return 0;
     }
     const pjsip_digest_credential *digest = &auth->credential.digest;
@@ -785,7 +825,7 @@ static pj_bool_t gmv_handle_register(
             runtime->last_status = status;
             return PJ_TRUE;
         }
-        if (!gmv_authorization_shape_valid(rdata, auth)) {
+        if (!gmv_authorization_shape_valid(runtime, rdata, auth)) {
             pj_status_t status = gmv_send_response(
                 runtime,
                 rdata,
