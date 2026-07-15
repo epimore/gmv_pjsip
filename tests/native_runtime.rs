@@ -1295,9 +1295,11 @@ fn fresh_runtime_sends_restored_info_info_and_bye() {
                 snapshot,
                 content_type: (method == SipDialogMethod::Info)
                     .then(|| "Application/MANSRTSP".into()),
-                body: (method == SipDialogMethod::Info)
-                    .then(|| b"PLAY RTSP/1.0\r\nCSeq: 1\r\nScale: 2.0\r\n".to_vec())
-                    .unwrap_or_default(),
+                body: if method == SipDialogMethod::Info {
+                    b"PLAY RTSP/1.0\r\nCSeq: 1\r\nScale: 2.0\r\n".to_vec()
+                } else {
+                    Vec::new()
+                },
             })
             .expect("queue restored dialog request");
 
