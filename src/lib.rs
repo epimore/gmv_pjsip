@@ -25,9 +25,9 @@ pub use message::SipMethod;
 pub use runtime::{
     SipAuthLookupResult, SipDialogMethod, SipDialogRequest, SipDialogSnapshot,
     SipIncomingInviteAllow, SipInviteIdentity, SipInviteResponse, SipOutboundInvite,
-    SipOutboundMessage, SipOutboundSubscribe, SipRegisteredSource, SipRestoredDialogRequest,
-    SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeEvents,
-    SipRuntimeSockets, SipTlsConfig,
+    SipOutboundMessage, SipOutboundSubscribe, SipRecoverySource, SipRegisteredSource,
+    SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind,
+    SipRuntimeEvents, SipRuntimeSockets, SipTlsConfig,
 };
 #[cfg(feature = "test-helpers")]
 pub use runtime::{SipRuntimeTransmits, SipTransmit};

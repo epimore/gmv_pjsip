@@ -8,9 +8,9 @@ use gmv_pjsip::auth::{create_digest_response, parse_digest_authorization};
 use gmv_pjsip::{
     AuthAlgorithm, AuthCredential, CredentialKind, SipAuthLookupResult, SipDialogMethod,
     SipDialogRequest, SipIncomingInviteAllow, SipInviteResponse, SipOutboundInvite,
-    SipOutboundMessage, SipOutboundSubscribe, SipRegisteredSource, SipRestoredDialogRequest,
-    SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind, SipRuntimeSockets,
-    SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
+    SipOutboundMessage, SipOutboundSubscribe, SipRecoverySource, SipRegisteredSource,
+    SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind,
+    SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -84,6 +84,23 @@ fn allow_registered_source(
             protocol,
         })
         .expect("allow registered source");
+}
+
+fn allow_recovery_source(
+    runtime: &mut SipRuntime,
+    device_id: &str,
+    remote: SocketAddr,
+    protocol: SipTransportProtocol,
+    ttl: Duration,
+) {
+    runtime
+        .allow_recovery_source(&SipRecoverySource {
+            device_id: device_id.into(),
+            remote_address: remote.ip().to_string(),
+            protocol,
+            ttl,
+        })
+        .expect("allow recovery source");
 }
 
 fn receive_event(
@@ -601,6 +618,271 @@ Content-Length: 0\r\n\r\n"
         .close_transport(7, SipTransportProtocol::Tcp, 0)
         .expect("close TCP runtime adapter");
     runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn recovery_source_only_allows_message_and_promotes_to_live() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    let remote = remote_addr(40100);
+    allow_recovery_source(
+        &mut runtime,
+        "recovering-device",
+        remote,
+        SipTransportProtocol::Udp,
+        Duration::from_millis(200),
+    );
+
+    let options = format!(
+        "OPTIONS sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {remote};branch=z9hG4bK-recovery-options;rport\r\n\
+From: <sip:recovering-device@127.0.0.1>;tag=recovery-options\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: recovery-options\r\n\
+CSeq: 1 OPTIONS\r\n\
+Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n"
+    );
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            options.as_bytes(),
+        )
+        .expect("inject recovery OPTIONS");
+    runtime.poll().expect("poll recovery OPTIONS");
+    assert!(matches!(
+        transmits.recv_timeout(Duration::from_millis(20)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(events.try_recv().is_err());
+
+    let body = "<?xml version=\"1.0\"?><Notify><CmdType>Keepalive</CmdType><DeviceID>recovering-device</DeviceID></Notify>";
+    let message = format!(
+        "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {remote};branch=z9hG4bK-recovery-message;rport\r\n\
+From: <sip:recovering-device@127.0.0.1>;tag=recovery-message\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: recovery-message\r\n\
+CSeq: 2 MESSAGE\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: Application/MANSCDP+xml\r\n\
+Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let wrong_identity = message
+        .replace("recovering-device@", "unknown-device@")
+        .replace("recovery-message", "wrong-recovery-message");
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            wrong_identity.as_bytes(),
+        )
+        .expect("inject wrong recovery identity");
+    runtime.poll().expect("poll wrong recovery identity");
+    assert!(matches!(
+        transmits.recv_timeout(Duration::from_millis(20)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(events.try_recv().is_err());
+
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            message.as_bytes(),
+        )
+        .expect("inject recovery MESSAGE");
+    let response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &response).starts_with("SIP/2.0 200"));
+    let request = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(request.method.as_deref(), Some("MESSAGE"));
+
+    allow_registered_source(
+        &mut runtime,
+        "recovering-device",
+        remote,
+        SipTransportProtocol::Udp,
+    );
+    std::thread::sleep(Duration::from_millis(220));
+    runtime.poll().expect("poll promoted source");
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            options.as_bytes(),
+        )
+        .expect("inject promoted OPTIONS");
+    let response = receive_transmit(&mut runtime, &transmits);
+    assert!(finish_transmit(&mut runtime, &response).starts_with("SIP/2.0 200"));
+}
+
+#[test]
+fn expired_recovery_source_is_removed_without_reconnect() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    let remote = remote_addr(40101);
+    allow_recovery_source(
+        &mut runtime,
+        "expired-device",
+        remote,
+        SipTransportProtocol::Udp,
+        Duration::from_millis(20),
+    );
+    std::thread::sleep(Duration::from_millis(30));
+    runtime.poll().expect("poll expired recovery source");
+
+    let body = "<Notify><CmdType>Keepalive</CmdType><DeviceID>expired-device</DeviceID></Notify>";
+    let message = format!(
+        "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {remote};branch=z9hG4bK-expired-message;rport\r\n\
+From: <sip:expired-device@127.0.0.1>;tag=expired-message\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: expired-message\r\n\
+CSeq: 1 MESSAGE\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: Application/MANSCDP+xml\r\n\
+Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            remote,
+            message.as_bytes(),
+        )
+        .expect("inject expired recovery MESSAGE");
+    runtime.poll().expect("poll expired recovery MESSAGE");
+    assert!(matches!(
+        transmits.recv_timeout(Duration::from_millis(20)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    assert!(events.try_recv().is_err());
+}
+
+#[test]
+fn tcp_recovery_source_allows_current_connection_message() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    let remote = remote_addr(40102);
+    allow_recovery_source(
+        &mut runtime,
+        "tcp-recovering-device",
+        remote,
+        SipTransportProtocol::Tcp,
+        Duration::from_secs(1),
+    );
+    let body =
+        "<Notify><CmdType>Keepalive</CmdType><DeviceID>tcp-recovering-device</DeviceID></Notify>";
+    let message = format!(
+        "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/TCP {remote};branch=z9hG4bK-tcp-recovery;rport\r\n\
+From: <sip:tcp-recovering-device@127.0.0.1>;tag=tcp-recovery\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: tcp-recovery\r\n\
+CSeq: 1 MESSAGE\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: Application/MANSCDP+xml\r\n\
+Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    runtime
+        .inject_test_packet(
+            44,
+            SipTransportProtocol::Tcp,
+            local_addr(),
+            remote,
+            message.as_bytes(),
+        )
+        .expect("inject TCP recovery MESSAGE");
+    let response = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(response.association_id, 44);
+    assert!(finish_transmit(&mut runtime, &response).starts_with("SIP/2.0 200"));
+    let request = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+    assert_eq!(request.method.as_deref(), Some("MESSAGE"));
+}
+
+#[test]
+#[ignore = "capacity baseline; run explicitly for restart recovery changes"]
+fn recovery_source_capacity_baseline_10000() {
+    let _guard = lock_tests();
+    let (mut runtime, events, transmits) = start_runtime(SipRuntimeConfig::default());
+    let remote = remote_addr(40103);
+    let started = Instant::now();
+    for index in 0..10_000 {
+        allow_recovery_source(
+            &mut runtime,
+            &format!("capacity-device-{index:05}"),
+            remote,
+            SipTransportProtocol::Udp,
+            Duration::from_secs(60),
+        );
+    }
+    let install_elapsed = started.elapsed();
+    assert!(
+        install_elapsed < Duration::from_secs(30),
+        "10k recovery source install exceeded baseline: {install_elapsed:?}"
+    );
+
+    let lookup_started = Instant::now();
+    for (cseq, index) in [0, 5_000, 9_999].into_iter().enumerate() {
+        let device_id = format!("capacity-device-{index:05}");
+        let body = format!(
+            "<Notify><CmdType>Keepalive</CmdType><DeviceID>{device_id}</DeviceID></Notify>"
+        );
+        let message = format!(
+            "MESSAGE sip:127.0.0.1:{LOCAL_PORT} SIP/2.0\r\n\
+Via: SIP/2.0/UDP {remote};branch=z9hG4bK-capacity-{index};rport\r\n\
+From: <sip:{device_id}@127.0.0.1>;tag=capacity-{index}\r\n\
+To: <sip:gmv@127.0.0.1>\r\n\
+Call-ID: capacity-{index}\r\n\
+CSeq: {} MESSAGE\r\n\
+Max-Forwards: 70\r\n\
+Content-Type: Application/MANSCDP+xml\r\n\
+Content-Length: {}\r\n\r\n{}",
+            cseq + 1,
+            body.len(),
+            body
+        );
+        runtime
+            .inject_test_packet(
+                0,
+                SipTransportProtocol::Udp,
+                local_addr(),
+                remote,
+                message.as_bytes(),
+            )
+            .expect("inject capacity lookup");
+        let response = receive_transmit(&mut runtime, &transmits);
+        assert!(finish_transmit(&mut runtime, &response).starts_with("SIP/2.0 200"));
+        let request = receive_event(&mut runtime, &events, SipRuntimeEventKind::RequestReceived);
+        assert_eq!(request.method.as_deref(), Some("MESSAGE"));
+        assert!(request
+            .from_header
+            .as_deref()
+            .is_some_and(|from| from.contains(&device_id)));
+    }
+    let lookup_elapsed = lookup_started.elapsed();
+    assert!(
+        lookup_elapsed < Duration::from_secs(2),
+        "first/middle/last recovery source lookup exceeded baseline: {lookup_elapsed:?}"
+    );
+    println!(
+        "10k recovery source baseline: install={install_elapsed:?}, lookups={lookup_elapsed:?}"
+    );
 }
 
 #[test]

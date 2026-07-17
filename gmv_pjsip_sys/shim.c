@@ -94,6 +94,8 @@ typedef struct gmv_registered_source {
     int32_t transport;
     char device_id[GMV_SIP_DEVICE_ID_CAPACITY];
     char remote_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
+    uint64_t generation;
+    uint64_t recovery_expires_at_ms;
     struct gmv_registered_source *next;
 } gmv_registered_source_t;
 
@@ -450,6 +452,14 @@ static uint64_t gmv_now_ms(void) {
     return ((uint64_t)now.sec * 1000u) + (uint64_t)now.msec;
 }
 
+static uint64_t gmv_monotonic_ms(void) {
+    pj_time_val now;
+    if (pj_gettickcount(&now) != PJ_SUCCESS) {
+        return gmv_now_ms();
+    }
+    return ((uint64_t)now.sec * 1000u) + (uint64_t)now.msec;
+}
+
 static pj_str_t gmv_empty_pj_str(void) {
     return pj_str("");
 }
@@ -525,18 +535,40 @@ static int gmv_transport_and_source_match(
         strcmp(expected_address, actual_address) == 0;
 }
 
+static void gmv_cleanup_recovery_sources(
+    gmv_sip_runtime_t *runtime,
+    uint64_t now) {
+    if (!runtime) {
+        return;
+    }
+    gmv_registered_source_t **cursor = &runtime->registered_sources;
+    while (*cursor) {
+        gmv_registered_source_t *source = *cursor;
+        if (source->recovery_expires_at_ms > 0 &&
+            source->recovery_expires_at_ms <= now) {
+            *cursor = source->next;
+            free(source);
+            continue;
+        }
+        cursor = &source->next;
+    }
+}
+
 static int gmv_registered_source_allowed(
     gmv_sip_runtime_t *runtime,
     int32_t transport,
     const char *remote_address,
-    const pj_str_t *device_id) {
+    const pj_str_t *device_id,
+    int allow_recovery) {
     if (!device_id || !device_id->ptr || device_id->slen <= 0) {
         return 0;
     }
+    gmv_cleanup_recovery_sources(runtime, gmv_monotonic_ms());
     gmv_registered_source_t *source =
         runtime ? runtime->registered_sources : NULL;
     while (source) {
         if (gmv_pj_str_equals_c(device_id, source->device_id) &&
+            (source->recovery_expires_at_ms == 0 || allow_recovery) &&
             gmv_transport_and_source_match(
                 source->transport,
                 source->remote_address,
@@ -2375,6 +2407,7 @@ int32_t gmv_sip_runtime_poll(gmv_sip_runtime_t *runtime) {
     gmv_process_io_commands(runtime);
     gmv_process_auth_commands(runtime);
     gmv_process_auth_timeouts(runtime);
+    gmv_cleanup_recovery_sources(runtime, gmv_monotonic_ms());
 
     pj_time_val timeout;
     timeout.sec = (long)(runtime->poll_timeout_ms / 1000u);
@@ -2499,6 +2532,8 @@ int32_t gmv_sip_runtime_allow_registered_source(
     while (item) {
         if (strcmp(item->device_id, device_id) == 0) {
             item->transport = source->transport;
+            item->generation += 1;
+            item->recovery_expires_at_ms = 0;
             pj_ansi_strxcpy(
                 item->remote_address,
                 remote_address,
@@ -2515,6 +2550,74 @@ int32_t gmv_sip_runtime_allow_registered_source(
         return PJ_ENOMEM;
     }
     item->transport = source->transport;
+    item->generation = 1;
+    pj_ansi_strxcpy(item->device_id, device_id, sizeof(item->device_id));
+    pj_ansi_strxcpy(
+        item->remote_address,
+        remote_address,
+        sizeof(item->remote_address));
+    item->next = runtime->registered_sources;
+    runtime->registered_sources = item;
+    pj_mutex_unlock(runtime->command_mutex);
+    return PJ_SUCCESS;
+}
+
+int32_t gmv_sip_runtime_allow_recovery_source(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_recovery_source_t *source) {
+    if (!runtime || !source ||
+        source->size < sizeof(*source) ||
+        source->version != GMV_SIP_ABI_VERSION ||
+        (source->transport != GMV_SIP_TRANSPORT_UDP &&
+         source->transport != GMV_SIP_TRANSPORT_TCP) ||
+        !source->device_id.ptr || source->device_id.len == 0 ||
+        !source->remote_address.ptr || source->remote_address.len == 0 ||
+        source->ttl_ms == 0 ||
+        !runtime->started || !runtime->command_mutex) {
+        return PJ_EINVAL;
+    }
+
+    char device_id[GMV_SIP_DEVICE_ID_CAPACITY];
+    char remote_address[GMV_SIP_BIND_ADDRESS_CAPACITY];
+    if (!gmv_copy_view(device_id, sizeof(device_id), source->device_id) ||
+        !gmv_copy_view(
+            remote_address,
+            sizeof(remote_address),
+            source->remote_address)) {
+        return PJ_ETOOSMALL;
+    }
+
+    pj_mutex_lock(runtime->command_mutex);
+    gmv_cleanup_recovery_sources(runtime, gmv_monotonic_ms());
+    gmv_registered_source_t *item = runtime->registered_sources;
+    while (item) {
+        if (strcmp(item->device_id, device_id) == 0) {
+            if (item->recovery_expires_at_ms == 0) {
+                pj_mutex_unlock(runtime->command_mutex);
+                return PJ_SUCCESS;
+            }
+            item->transport = source->transport;
+            item->generation += 1;
+            item->recovery_expires_at_ms =
+                gmv_monotonic_ms() + source->ttl_ms;
+            pj_ansi_strxcpy(
+                item->remote_address,
+                remote_address,
+                sizeof(item->remote_address));
+            pj_mutex_unlock(runtime->command_mutex);
+            return PJ_SUCCESS;
+        }
+        item = item->next;
+    }
+
+    item = (gmv_registered_source_t *)calloc(1, sizeof(*item));
+    if (!item) {
+        pj_mutex_unlock(runtime->command_mutex);
+        return PJ_ENOMEM;
+    }
+    item->transport = source->transport;
+    item->generation = 1;
+    item->recovery_expires_at_ms = gmv_monotonic_ms() + source->ttl_ms;
     pj_ansi_strxcpy(item->device_id, device_id, sizeof(item->device_id));
     pj_ansi_strxcpy(
         item->remote_address,

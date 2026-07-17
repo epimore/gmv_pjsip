@@ -36,14 +36,14 @@ use gmv_pjsip_sys::{
     gmv_sip_event_type_GMV_SIP_EVENT_UNREGISTERED as EVENT_UNREGISTERED,
     gmv_sip_incoming_invite_allow_t, gmv_sip_invite_response_t, gmv_sip_outbound_invite_t,
     gmv_sip_outbound_message_t, gmv_sip_outbound_subscribe_t, gmv_sip_received_packet_t,
-    gmv_sip_registered_source_t, gmv_sip_restored_dialog_request_t,
-    gmv_sip_runtime_allow_incoming_invite, gmv_sip_runtime_allow_registered_source,
-    gmv_sip_runtime_close_transport, gmv_sip_runtime_complete_auth_lookup,
-    gmv_sip_runtime_complete_send, gmv_sip_runtime_config_init, gmv_sip_runtime_config_t,
-    gmv_sip_runtime_create, gmv_sip_runtime_destroy, gmv_sip_runtime_poll,
-    gmv_sip_runtime_receive_packet, gmv_sip_runtime_remove_registered_source,
-    gmv_sip_runtime_respond_invite, gmv_sip_runtime_send_dialog_request,
-    gmv_sip_runtime_send_invite, gmv_sip_runtime_send_message,
+    gmv_sip_recovery_source_t, gmv_sip_registered_source_t, gmv_sip_restored_dialog_request_t,
+    gmv_sip_runtime_allow_incoming_invite, gmv_sip_runtime_allow_recovery_source,
+    gmv_sip_runtime_allow_registered_source, gmv_sip_runtime_close_transport,
+    gmv_sip_runtime_complete_auth_lookup, gmv_sip_runtime_complete_send,
+    gmv_sip_runtime_config_init, gmv_sip_runtime_config_t, gmv_sip_runtime_create,
+    gmv_sip_runtime_destroy, gmv_sip_runtime_poll, gmv_sip_runtime_receive_packet,
+    gmv_sip_runtime_remove_registered_source, gmv_sip_runtime_respond_invite,
+    gmv_sip_runtime_send_dialog_request, gmv_sip_runtime_send_invite, gmv_sip_runtime_send_message,
     gmv_sip_runtime_send_restored_dialog_request, gmv_sip_runtime_send_subscribe,
     gmv_sip_runtime_start, gmv_sip_runtime_stop, gmv_sip_runtime_t, gmv_sip_send_completion_t,
     gmv_sip_send_packet_t, gmv_sip_string_view_t,
@@ -108,6 +108,14 @@ pub struct SipRegisteredSource {
     pub device_id: String,
     pub remote_address: String,
     pub protocol: SipTransportProtocol,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SipRecoverySource {
+    pub device_id: String,
+    pub remote_address: String,
+    pub protocol: SipTransportProtocol,
+    pub ttl: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -917,6 +925,44 @@ impl SipRuntime {
             unsafe { gmv_sip_runtime_allow_registered_source(self.raw.as_ptr(), &ffi_source) };
         if status != 0 {
             return Err(pjsip_error("allow_registered_source", status));
+        }
+        Ok(())
+    }
+
+    pub fn allow_recovery_source(&mut self, source: &SipRecoverySource) -> Result<()> {
+        if self.stopped {
+            return Err(invalid_config(
+                "cannot update recovery SIP source after runtime stop".into(),
+            ));
+        }
+        let ttl_ms = source.ttl.as_millis();
+        if source.protocol == SipTransportProtocol::Tls
+            || source.device_id.is_empty()
+            || source.remote_address.is_empty()
+            || source.device_id.as_bytes().contains(&0)
+            || source.remote_address.as_bytes().contains(&0)
+            || ttl_ms == 0
+            || ttl_ms > u128::from(u32::MAX)
+        {
+            return Err(invalid_config(
+                "recovery SIP source requires UDP/TCP, device_id, remote_address, and bounded ttl"
+                    .into(),
+            ));
+        }
+
+        let ffi_source = gmv_sip_recovery_source_t {
+            size: mem::size_of::<gmv_sip_recovery_source_t>() as u32,
+            version: GMV_SIP_ABI_VERSION,
+            transport: transport_id(source.protocol),
+            device_id: string_view(&source.device_id),
+            remote_address: string_view(&source.remote_address),
+            ttl_ms: ttl_ms as u32,
+        };
+        // SAFETY: The runtime handle is valid and the shim copies all views.
+        let status =
+            unsafe { gmv_sip_runtime_allow_recovery_source(self.raw.as_ptr(), &ffi_source) };
+        if status != 0 {
+            return Err(pjsip_error("allow_recovery_source", status));
         }
         Ok(())
     }

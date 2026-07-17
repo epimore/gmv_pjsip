@@ -995,7 +995,8 @@ static pj_bool_t gmv_on_rx_request(pjsip_rx_data *rdata) {
             runtime,
             transport,
             rdata->pkt_info.src_name,
-            &request_device_id)) {
+            &request_device_id,
+            is_message)) {
         runtime->last_status = PJ_SUCCESS;
         return PJ_TRUE;
     }

@@ -173,6 +173,15 @@ typedef struct gmv_sip_registered_source {
     gmv_sip_string_view_t remote_address;
 } gmv_sip_registered_source_t;
 
+typedef struct gmv_sip_recovery_source {
+    uint32_t size;
+    uint32_t version;
+    int32_t transport;
+    gmv_sip_string_view_t device_id;
+    gmv_sip_string_view_t remote_address;
+    uint32_t ttl_ms;
+} gmv_sip_recovery_source_t;
+
 typedef struct gmv_sip_incoming_invite_allow {
     uint32_t size;
     uint32_t version;
@@ -285,6 +294,9 @@ int32_t gmv_sip_runtime_complete_auth_lookup(
 int32_t gmv_sip_runtime_allow_registered_source(
     gmv_sip_runtime_t *runtime,
     const gmv_sip_registered_source_t *source);
+int32_t gmv_sip_runtime_allow_recovery_source(
+    gmv_sip_runtime_t *runtime,
+    const gmv_sip_recovery_source_t *source);
 int32_t gmv_sip_runtime_remove_registered_source(
     gmv_sip_runtime_t *runtime,
     gmv_sip_string_view_t device_id);
