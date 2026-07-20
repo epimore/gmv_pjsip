@@ -282,7 +282,72 @@ static void gmv_add_register_response_headers(
                 tdata->msg,
                 (pjsip_hdr *)response_contact);
         }
+    } else if (status_code == PJSIP_SC_INTERNAL_SERVER_ERROR) {
+        gmv_add_string_header(tdata, "Retry-After", "1");
     }
+}
+
+static int gmv_register_order_is_stale(
+    gmv_sip_runtime_t *runtime,
+    const gmv_pending_auth_t *pending,
+    pjsip_rx_data *rdata) {
+    if (!runtime || !pending || !rdata || !rdata->msg_info.cid ||
+        !rdata->msg_info.cseq || rdata->msg_info.cseq->cseq < 0) {
+        return 0;
+    }
+    gmv_register_order_t *order = runtime->register_orders;
+    while (order) {
+        if (strcmp(order->device_id, pending->device_id) == 0) {
+            return pj_strcmp2(&rdata->msg_info.cid->id, order->call_id) == 0 &&
+                (uint32_t)rdata->msg_info.cseq->cseq < order->cseq;
+        }
+        order = order->next;
+    }
+    return 0;
+}
+
+static void gmv_commit_register_order(
+    gmv_sip_runtime_t *runtime,
+    const gmv_pending_auth_t *pending,
+    pjsip_rx_data *rdata) {
+    if (!runtime || !pending || !rdata || !rdata->msg_info.cid ||
+        !rdata->msg_info.cseq || rdata->msg_info.cseq->cseq < 0) {
+        return;
+    }
+    gmv_register_order_t **cursor = &runtime->register_orders;
+    while (*cursor && strcmp((*cursor)->device_id, pending->device_id) != 0) {
+        cursor = &(*cursor)->next;
+    }
+    if (gmv_register_expires(rdata) == 0) {
+        if (*cursor) {
+            gmv_register_order_t *removed = *cursor;
+            *cursor = removed->next;
+            free(removed);
+        }
+        return;
+    }
+    gmv_register_order_t *order = *cursor;
+    if (!order) {
+        order = (gmv_register_order_t *)calloc(1, sizeof(*order));
+        if (!order || !gmv_copy_view(
+                order->device_id,
+                sizeof(order->device_id),
+                gmv_bytes_view(
+                    pending->device_id,
+                    strlen(pending->device_id)))) {
+            free(order);
+            return;
+        }
+        order->next = runtime->register_orders;
+        runtime->register_orders = order;
+    }
+    if (!gmv_copy_view(
+            order->call_id,
+            sizeof(order->call_id),
+            gmv_string_view(&rdata->msg_info.cid->id))) {
+        return;
+    }
+    order->cseq = (uint32_t)rdata->msg_info.cseq->cseq;
 }
 
 static void gmv_add_options_response_headers(
@@ -657,6 +722,11 @@ static void gmv_complete_pending_auth(
         }
     }
 
+    if (response_code == PJSIP_SC_OK &&
+        gmv_register_order_is_stale(runtime, pending, rdata)) {
+        response_code = PJSIP_SC_INTERNAL_SERVER_ERROR;
+    }
+
     pj_status_t send_status = gmv_send_response(
         runtime,
         rdata,
@@ -674,6 +744,7 @@ static void gmv_complete_pending_auth(
             pending,
             rdata);
         if (response_code == PJSIP_SC_OK) {
+            gmv_commit_register_order(runtime, pending, rdata);
             gmv_emit_auth_event(
                 runtime,
                 gmv_register_expires(rdata) == 0

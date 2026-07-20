@@ -82,6 +82,8 @@ fn allow_registered_source(
             device_id: device_id.into(),
             remote_address: remote.ip().to_string(),
             protocol,
+            registration_call_id: None,
+            registration_cseq: None,
         })
         .expect("allow registered source");
 }
@@ -98,6 +100,8 @@ fn allow_recovery_source(
             device_id: device_id.into(),
             remote_address: remote.ip().to_string(),
             protocol,
+            registration_call_id: None,
+            registration_cseq: None,
             ttl,
         })
         .expect("allow recovery source");
@@ -163,6 +167,7 @@ fn register_request(
     request_uri: &str,
     username: &str,
     remote: SocketAddr,
+    call_id: &str,
     cseq: u32,
     authorization: Option<&str>,
 ) -> String {
@@ -174,7 +179,7 @@ fn register_request(
 Via: SIP/2.0/UDP {remote};branch=z9hG4bK-register-{cseq};rport\r\n\
 From: <sip:{username}@3402000000>;tag=register\r\n\
 To: <sip:{username}@3402000000>\r\n\
-Call-ID: digest-register\r\n\
+Call-ID: {call_id}\r\n\
 CSeq: {cseq} REGISTER\r\n\
 Contact: <sip:{username}@{remote}>\r\n\
 Expires: 3600\r\n\
@@ -182,6 +187,48 @@ Expires: 3600\r\n\
 Max-Forwards: 70\r\n\
 Content-Length: 0\r\n\r\n"
     )
+}
+
+struct BypassRegisterCase<'a> {
+    request_uri: &'a str,
+    username: &'a str,
+    remote: SocketAddr,
+    call_id: &'a str,
+    cseq: u32,
+}
+
+fn complete_bypass_register(
+    runtime: &mut SipRuntime,
+    events: &Receiver<SipRuntimeEvent>,
+    transmits: &SipRuntimeTransmits,
+    case: BypassRegisterCase<'_>,
+) -> String {
+    let request = register_request(
+        case.request_uri,
+        case.username,
+        case.remote,
+        case.call_id,
+        case.cseq,
+        None,
+    );
+    runtime
+        .inject_test_packet(
+            0,
+            SipTransportProtocol::Udp,
+            local_addr(),
+            case.remote,
+            request.as_bytes(),
+        )
+        .expect("inject bypass REGISTER");
+    let lookup = receive_event(runtime, events, SipRuntimeEventKind::AuthLookupRequired);
+    runtime
+        .complete_auth_lookup(
+            lookup.lookup_id.expect("auth lookup id"),
+            SipAuthLookupResult::Bypass,
+        )
+        .expect("complete bypass auth lookup");
+    let transmit = receive_transmit(runtime, transmits);
+    finish_transmit(runtime, &transmit)
 }
 
 fn test_credential(username: &str, realm: &str) -> AuthCredential {
@@ -203,7 +250,7 @@ fn issue_register_challenge(
     remote: SocketAddr,
     credential: &AuthCredential,
 ) -> String {
-    let request = register_request(request_uri, username, remote, 1, None);
+    let request = register_request(request_uri, username, remote, "digest-register", 1, None);
     runtime
         .inject_test_packet(
             0,
@@ -294,6 +341,7 @@ fn complete_digest_register(
         case.request_uri,
         case.username,
         case.remote,
+        "digest-register",
         2,
         Some(&authorization),
     );
@@ -823,13 +871,16 @@ fn recovery_source_capacity_baseline_10000() {
     let remote = remote_addr(40103);
     let started = Instant::now();
     for index in 0..10_000 {
-        allow_recovery_source(
-            &mut runtime,
-            &format!("capacity-device-{index:05}"),
-            remote,
-            SipTransportProtocol::Udp,
-            Duration::from_secs(60),
-        );
+        runtime
+            .allow_recovery_source(&SipRecoverySource {
+                device_id: format!("capacity-device-{index:05}"),
+                remote_address: remote.ip().to_string(),
+                protocol: SipTransportProtocol::Udp,
+                registration_call_id: Some(format!("capacity-register-{index:05}")),
+                registration_cseq: Some(10),
+                ttl: Duration::from_secs(60),
+            })
+            .expect("allow capacity recovery source");
     }
     let install_elapsed = started.elapsed();
     assert!(
@@ -944,6 +995,111 @@ Content-Length: 0\r\n\r\n"
         registered.user_agent.as_deref(),
         Some("GMV-Test-Device/1.0")
     );
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn runtime_rejects_register_cseq_rollback_before_success_response() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40022);
+    let username = "34020000001320000001";
+    let request_uri = format!("sip:3402000000@127.0.0.1:{LOCAL_PORT}");
+
+    let accepted = complete_bypass_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        BypassRegisterCase {
+            request_uri: &request_uri,
+            username,
+            remote,
+            call_id: "stable-register",
+            cseq: 10,
+        },
+    );
+    assert!(accepted.starts_with("SIP/2.0 200"));
+    receive_event(&mut runtime, &events, SipRuntimeEventKind::Registered);
+
+    let stale = complete_bypass_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        BypassRegisterCase {
+            request_uri: &request_uri,
+            username,
+            remote,
+            call_id: "stable-register",
+            cseq: 9,
+        },
+    );
+    assert!(stale.starts_with("SIP/2.0 500"));
+    assert_eq!(header_value(&stale, "Retry-After"), "1");
+    for _ in 0..3 {
+        runtime.poll().expect("poll stale REGISTER result");
+    }
+    assert!(events.try_iter().all(|event| {
+        event.kind != SipRuntimeEventKind::Registered
+            && event.kind != SipRuntimeEventKind::Unregistered
+    }));
+
+    let replacement = complete_bypass_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        BypassRegisterCase {
+            request_uri: &request_uri,
+            username,
+            remote,
+            call_id: "replacement-register",
+            cseq: 1,
+        },
+    );
+    assert!(replacement.starts_with("SIP/2.0 200"));
+    receive_event(&mut runtime, &events, SipRuntimeEventKind::Registered);
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn recovery_source_restores_register_ordering_before_first_register() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, events, transmits) = start_runtime(config);
+    let remote = remote_addr(40023);
+    let username = "34020000001320000001";
+    runtime
+        .allow_recovery_source(&SipRecoverySource {
+            device_id: username.into(),
+            remote_address: remote.ip().to_string(),
+            protocol: SipTransportProtocol::Udp,
+            registration_call_id: Some("stable-register".into()),
+            registration_cseq: Some(10),
+            ttl: Duration::from_secs(30),
+        })
+        .expect("install recovery source with REGISTER ordering");
+    let request_uri = format!("sip:3402000000@127.0.0.1:{LOCAL_PORT}");
+
+    let stale = complete_bypass_register(
+        &mut runtime,
+        &events,
+        &transmits,
+        BypassRegisterCase {
+            request_uri: &request_uri,
+            username,
+            remote,
+            call_id: "stable-register",
+            cseq: 9,
+        },
+    );
+    assert!(stale.starts_with("SIP/2.0 500"));
+    assert_eq!(header_value(&stale, "Retry-After"), "1");
     runtime.shutdown().expect("shutdown runtime");
 }
 

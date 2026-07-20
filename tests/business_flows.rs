@@ -176,6 +176,8 @@ fn normal_gb28181_business_dialogues_use_runtime_adapter() {
             device_id: DEVICE_ID.into(),
             remote_address: device_addr().ip().to_string(),
             protocol: SipTransportProtocol::Udp,
+            registration_call_id: None,
+            registration_cseq: None,
         })
         .expect("allow registered device source");
 

@@ -108,6 +108,8 @@ pub struct SipRegisteredSource {
     pub device_id: String,
     pub remote_address: String,
     pub protocol: SipTransportProtocol,
+    pub registration_call_id: Option<String>,
+    pub registration_cseq: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +117,19 @@ pub struct SipRecoverySource {
     pub device_id: String,
     pub remote_address: String,
     pub protocol: SipTransportProtocol,
+    pub registration_call_id: Option<String>,
+    pub registration_cseq: Option<u32>,
     pub ttl: Duration,
+}
+
+fn valid_registration_order(call_id: Option<&str>, cseq: Option<u32>) -> bool {
+    match (call_id, cseq) {
+        (None, None) => true,
+        (Some(call_id), Some(cseq)) => {
+            !call_id.is_empty() && !call_id.as_bytes().contains(&0) && cseq > 0
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -907,6 +921,10 @@ impl SipRuntime {
             || source.remote_address.is_empty()
             || source.device_id.as_bytes().contains(&0)
             || source.remote_address.as_bytes().contains(&0)
+            || !valid_registration_order(
+                source.registration_call_id.as_deref(),
+                source.registration_cseq,
+            )
         {
             return Err(invalid_config(
                 "registered SIP source requires UDP/TCP, device_id, and remote_address".into(),
@@ -919,6 +937,10 @@ impl SipRuntime {
             transport: transport_id(source.protocol),
             device_id: string_view(&source.device_id),
             remote_address: string_view(&source.remote_address),
+            registration_call_id: string_view(
+                source.registration_call_id.as_deref().unwrap_or_default(),
+            ),
+            registration_cseq: source.registration_cseq.unwrap_or_default(),
         };
         // SAFETY: The runtime handle is valid and the shim copies all views.
         let status =
@@ -941,6 +963,10 @@ impl SipRuntime {
             || source.remote_address.is_empty()
             || source.device_id.as_bytes().contains(&0)
             || source.remote_address.as_bytes().contains(&0)
+            || !valid_registration_order(
+                source.registration_call_id.as_deref(),
+                source.registration_cseq,
+            )
             || ttl_ms == 0
             || ttl_ms > u128::from(u32::MAX)
         {
@@ -956,6 +982,10 @@ impl SipRuntime {
             transport: transport_id(source.protocol),
             device_id: string_view(&source.device_id),
             remote_address: string_view(&source.remote_address),
+            registration_call_id: string_view(
+                source.registration_call_id.as_deref().unwrap_or_default(),
+            ),
+            registration_cseq: source.registration_cseq.unwrap_or_default(),
             ttl_ms: ttl_ms as u32,
         };
         // SAFETY: The runtime handle is valid and the shim copies all views.

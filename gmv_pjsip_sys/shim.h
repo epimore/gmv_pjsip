@@ -171,6 +171,8 @@ typedef struct gmv_sip_registered_source {
     int32_t transport;
     gmv_sip_string_view_t device_id;
     gmv_sip_string_view_t remote_address;
+    gmv_sip_string_view_t registration_call_id;
+    uint32_t registration_cseq;
 } gmv_sip_registered_source_t;
 
 typedef struct gmv_sip_recovery_source {
@@ -179,6 +181,8 @@ typedef struct gmv_sip_recovery_source {
     int32_t transport;
     gmv_sip_string_view_t device_id;
     gmv_sip_string_view_t remote_address;
+    gmv_sip_string_view_t registration_call_id;
+    uint32_t registration_cseq;
     uint32_t ttl_ms;
 } gmv_sip_recovery_source_t;
 

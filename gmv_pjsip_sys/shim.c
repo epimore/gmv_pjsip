@@ -99,6 +99,13 @@ typedef struct gmv_registered_source {
     struct gmv_registered_source *next;
 } gmv_registered_source_t;
 
+typedef struct gmv_register_order {
+    char device_id[GMV_SIP_DEVICE_ID_CAPACITY];
+    char call_id[GMV_SIP_CALL_ID_CAPACITY];
+    uint32_t cseq;
+    struct gmv_register_order *next;
+} gmv_register_order_t;
+
 typedef struct gmv_incoming_invite_allow {
     int32_t transport;
     char target_id[GMV_SIP_DEVICE_ID_CAPACITY];
@@ -249,6 +256,7 @@ struct gmv_sip_runtime {
     gmv_invite_call_t *invite_calls;
     gmv_subscription_call_t *subscriptions;
     gmv_registered_source_t *registered_sources;
+    gmv_register_order_t *register_orders;
     gmv_incoming_invite_allow_t *incoming_invite_allows;
     uint64_t transport_sequence;
     uint64_t send_sequence;
@@ -535,6 +543,51 @@ static int gmv_transport_and_source_match(
         strcmp(expected_address, actual_address) == 0;
 }
 
+static void gmv_remove_register_order(
+    gmv_sip_runtime_t *runtime,
+    const char *device_id) {
+    if (!runtime || !device_id) {
+        return;
+    }
+    gmv_register_order_t **cursor = &runtime->register_orders;
+    while (*cursor) {
+        gmv_register_order_t *order = *cursor;
+        if (strcmp(order->device_id, device_id) == 0) {
+            *cursor = order->next;
+            free(order);
+            return;
+        }
+        cursor = &order->next;
+    }
+}
+
+static void gmv_sync_register_order(
+    gmv_sip_runtime_t *runtime,
+    const char *device_id,
+    gmv_sip_string_view_t call_id,
+    uint32_t cseq) {
+    if (!runtime || !device_id || !call_id.ptr || call_id.len == 0 || cseq == 0) {
+        return;
+    }
+    gmv_register_order_t *order = runtime->register_orders;
+    while (order && strcmp(order->device_id, device_id) != 0) {
+        order = order->next;
+    }
+    if (!order) {
+        order = (gmv_register_order_t *)calloc(1, sizeof(*order));
+        if (!order) {
+            return;
+        }
+        pj_ansi_strxcpy(order->device_id, device_id, sizeof(order->device_id));
+        order->next = runtime->register_orders;
+        runtime->register_orders = order;
+    }
+    if (!gmv_copy_view(order->call_id, sizeof(order->call_id), call_id)) {
+        return;
+    }
+    order->cseq = cseq;
+}
+
 static void gmv_cleanup_recovery_sources(
     gmv_sip_runtime_t *runtime,
     uint64_t now) {
@@ -547,6 +600,7 @@ static void gmv_cleanup_recovery_sources(
         if (source->recovery_expires_at_ms > 0 &&
             source->recovery_expires_at_ms <= now) {
             *cursor = source->next;
+            gmv_remove_register_order(runtime, source->device_id);
             free(source);
             continue;
         }
@@ -2014,6 +2068,11 @@ static void gmv_runtime_release(gmv_sip_runtime_t *runtime) {
         runtime->registered_sources = source->next;
         free(source);
     }
+    while (runtime->register_orders) {
+        gmv_register_order_t *order = runtime->register_orders;
+        runtime->register_orders = order->next;
+        free(order);
+    }
     while (runtime->incoming_invite_allows) {
         gmv_incoming_invite_allow_t *allow =
             runtime->incoming_invite_allows;
@@ -2531,6 +2590,11 @@ int32_t gmv_sip_runtime_allow_registered_source(
     gmv_registered_source_t *item = runtime->registered_sources;
     while (item) {
         if (strcmp(item->device_id, device_id) == 0) {
+            gmv_sync_register_order(
+                runtime,
+                device_id,
+                source->registration_call_id,
+                source->registration_cseq);
             item->transport = source->transport;
             item->generation += 1;
             item->recovery_expires_at_ms = 0;
@@ -2549,6 +2613,11 @@ int32_t gmv_sip_runtime_allow_registered_source(
         pj_mutex_unlock(runtime->command_mutex);
         return PJ_ENOMEM;
     }
+    gmv_sync_register_order(
+        runtime,
+        device_id,
+        source->registration_call_id,
+        source->registration_cseq);
     item->transport = source->transport;
     item->generation = 1;
     pj_ansi_strxcpy(item->device_id, device_id, sizeof(item->device_id));
@@ -2596,6 +2665,11 @@ int32_t gmv_sip_runtime_allow_recovery_source(
                 pj_mutex_unlock(runtime->command_mutex);
                 return PJ_SUCCESS;
             }
+            gmv_sync_register_order(
+                runtime,
+                device_id,
+                source->registration_call_id,
+                source->registration_cseq);
             item->transport = source->transport;
             item->generation += 1;
             item->recovery_expires_at_ms =
@@ -2610,6 +2684,11 @@ int32_t gmv_sip_runtime_allow_recovery_source(
         item = item->next;
     }
 
+    gmv_sync_register_order(
+        runtime,
+        device_id,
+        source->registration_call_id,
+        source->registration_cseq);
     item = (gmv_registered_source_t *)calloc(1, sizeof(*item));
     if (!item) {
         pj_mutex_unlock(runtime->command_mutex);
@@ -2647,6 +2726,7 @@ int32_t gmv_sip_runtime_remove_registered_source(
     }
 
     pj_mutex_lock(runtime->command_mutex);
+    gmv_remove_register_order(runtime, device_id_buffer);
     gmv_registered_source_t **cursor = &runtime->registered_sources;
     while (*cursor) {
         gmv_registered_source_t *item = *cursor;
