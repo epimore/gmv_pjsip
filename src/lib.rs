@@ -27,7 +27,7 @@ pub use runtime::{
     SipIncomingInviteAllow, SipInviteIdentity, SipInviteResponse, SipOutboundInvite,
     SipOutboundMessage, SipOutboundSubscribe, SipRecoverySource, SipRegisteredSource,
     SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind,
-    SipRuntimeEvents, SipRuntimeSockets, SipTlsConfig,
+    SipRuntimeEvents, SipRuntimeFaultKind, SipRuntimeSockets, SipTlsConfig,
 };
 #[cfg(feature = "test-helpers")]
 pub use runtime::{SipRuntimeTransmits, SipTransmit};

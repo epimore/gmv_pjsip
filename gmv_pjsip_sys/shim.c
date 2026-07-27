@@ -3396,3 +3396,7 @@ int32_t gmv_sip_error_message(
     buffer[message.slen] = '\0';
     return PJ_SUCCESS;
 }
+
+int gmv_pjsip_status_is_not_found(int32_t status) {
+    return status == PJ_ENOTFOUND;
+}

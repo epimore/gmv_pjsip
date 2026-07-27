@@ -16,7 +16,7 @@ use std::time::Duration;
 use base::tokio::sync::mpsc as tokio_mpsc;
 use gmv_pjsip_sys::{
     gmv_pjsip_auth_alg_md5, gmv_pjsip_auth_alg_sha256, gmv_pjsip_auth_alg_sha512_256,
-    gmv_pjsip_auth_digest_type, gmv_pjsip_auth_plain_password_type,
+    gmv_pjsip_auth_digest_type, gmv_pjsip_auth_plain_password_type, gmv_pjsip_status_is_not_found,
     gmv_sip_auth_lookup_completion_t,
     gmv_sip_auth_lookup_result_GMV_SIP_AUTH_BYPASS as AUTH_BYPASS,
     gmv_sip_auth_lookup_result_GMV_SIP_AUTH_CREDENTIAL as AUTH_CREDENTIAL,
@@ -228,6 +228,12 @@ pub enum SipRuntimeEventKind {
     Unknown(i32),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SipRuntimeFaultKind {
+    NotFound,
+    Other,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SipRuntimeEvent {
     pub event_id: u64,
@@ -257,6 +263,17 @@ pub struct SipRuntimeEvent {
     pub event: Option<String>,
     pub subscription_state: Option<String>,
     pub dialog_snapshot: Option<SipDialogSnapshot>,
+}
+
+impl SipRuntimeEvent {
+    pub fn fault_kind(&self) -> SipRuntimeFaultKind {
+        // SAFETY: This classifier has no side effects and accepts every i32 status.
+        if unsafe { gmv_pjsip_status_is_not_found(self.pj_status) } != 0 {
+            SipRuntimeFaultKind::NotFound
+        } else {
+            SipRuntimeFaultKind::Other
+        }
+    }
 }
 
 pub type SipRuntimeEvents = Receiver<SipRuntimeEvent>;

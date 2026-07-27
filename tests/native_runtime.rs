@@ -10,7 +10,7 @@ use gmv_pjsip::{
     SipDialogRequest, SipIncomingInviteAllow, SipInviteResponse, SipOutboundInvite,
     SipOutboundMessage, SipOutboundSubscribe, SipRecoverySource, SipRegisteredSource,
     SipRestoredDialogRequest, SipRuntime, SipRuntimeConfig, SipRuntimeEvent, SipRuntimeEventKind,
-    SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
+    SipRuntimeFaultKind, SipRuntimeSockets, SipRuntimeTransmits, SipTransmit, SipTransportProtocol,
 };
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2234,6 +2234,7 @@ Content-Length: 0\r\n\r\n"
         .expect("send TCP SUBSCRIBE");
     let subscribe_transmit = receive_transmit(&mut runtime, &transmits);
     let subscribe = finish_transmit(&mut runtime, &subscribe_transmit);
+    let call_id = header_value(&subscribe, "Call-ID").to_string();
     let response = format!(
         "SIP/2.0 200 OK\r\n\
 Via: {}\r\n\
@@ -2268,6 +2269,25 @@ Content-Length: 0\r\n\r\n",
         .expect("close subscribed TCP transport");
     runtime.poll().expect("process TCP transport close");
     while transmits.try_recv().is_ok() {}
+
+    runtime
+        .send_subscribe(&SipOutboundSubscribe {
+            operation_id: 81,
+            association_id,
+            protocol: SipTransportProtocol::Tcp,
+            target_uri: String::new(),
+            from_uri: String::new(),
+            contact_uri: String::new(),
+            call_id: Some(call_id),
+            event: "Catalog".into(),
+            expires: 180,
+            content_type: "Application/MANSCDP+xml".into(),
+            body: b"<Query><CmdType>Catalog</CmdType></Query>".to_vec(),
+        })
+        .expect("queue refresh for removed subscription");
+    let missing = receive_event(&mut runtime, &events, SipRuntimeEventKind::RuntimeFault);
+    assert_eq!(missing.operation_id, Some(81));
+    assert_eq!(missing.fault_kind(), SipRuntimeFaultKind::NotFound);
 
     std::thread::sleep(Duration::from_millis(1200));
     let deadline = Instant::now() + Duration::from_millis(250);

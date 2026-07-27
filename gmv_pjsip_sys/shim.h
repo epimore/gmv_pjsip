@@ -342,6 +342,7 @@ int32_t gmv_sip_error_message(
     int32_t status,
     char *buffer,
     size_t buffer_len);
+int gmv_pjsip_status_is_not_found(int32_t status);
 
 /* Stable C shim around PJPROJECT auth APIs so Rust safe layer does not depend
  * on bindgen's enum/struct layout names. */
