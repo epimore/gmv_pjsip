@@ -2810,6 +2810,7 @@ int32_t gmv_sip_runtime_send_message(
         (message->transport == GMV_SIP_TRANSPORT_TCP &&
          message->association_id == 0) ||
         !message->target_uri.ptr || message->target_uri.len == 0 ||
+        !message->to_uri.ptr || message->to_uri.len == 0 ||
         !message->from_uri.ptr || message->from_uri.len == 0 ||
         !message->content_type.ptr || message->content_type.len == 0 ||
         (message->body.len > 0 && !message->body.ptr) ||
@@ -2830,6 +2831,10 @@ int32_t gmv_sip_runtime_send_message(
             command->target_uri,
             sizeof(command->target_uri),
             message->target_uri) ||
+        !gmv_copy_view(
+            command->to_uri,
+            sizeof(command->to_uri),
+            message->to_uri) ||
         !gmv_copy_view(
             command->from_uri,
             sizeof(command->from_uri),

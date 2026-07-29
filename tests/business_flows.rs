@@ -47,6 +47,7 @@ fn send_message_round_trip(
             association_id: 0,
             protocol: SipTransportProtocol::Udp,
             target_uri: format!("sip:{DEVICE_ID}@{}", device_addr()),
+            to_uri: None,
             from_uri: format!("<sip:{PLATFORM_ID}@{}>", platform_addr()),
             content_type: "Application/MANSCDP+xml".into(),
             body: body.into_bytes(),

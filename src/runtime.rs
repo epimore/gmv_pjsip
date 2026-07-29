@@ -305,6 +305,7 @@ pub struct SipOutboundMessage {
     pub association_id: u64,
     pub protocol: SipTransportProtocol,
     pub target_uri: String,
+    pub to_uri: Option<String>,
     pub from_uri: String,
     pub content_type: String,
     pub body: Vec<u8>,
@@ -1092,14 +1093,19 @@ impl SipRuntime {
             || message.from_uri.is_empty()
             || !message.content_type.contains('/')
             || message.target_uri.as_bytes().contains(&0)
+            || message
+                .to_uri
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.as_bytes().contains(&0))
             || message.from_uri.as_bytes().contains(&0)
             || message.content_type.as_bytes().contains(&0)
         {
             return Err(invalid_config(
-                "target_uri, from_uri, and content_type are required".into(),
+                "target_uri, optional to_uri, from_uri, and content_type must be valid".into(),
             ));
         }
 
+        let to_uri = message.to_uri.as_deref().unwrap_or(&message.target_uri);
         let request = gmv_sip_outbound_message_t {
             size: mem::size_of::<gmv_sip_outbound_message_t>() as u32,
             version: GMV_SIP_ABI_VERSION,
@@ -1108,6 +1114,7 @@ impl SipRuntime {
             transport: transport_id(message.protocol),
             cseq: next_sip_cseq(),
             target_uri: string_view(&message.target_uri),
+            to_uri: string_view(to_uri),
             from_uri: string_view(&message.from_uri),
             content_type: string_view(&message.content_type),
             body: bytes_view(&message.body),

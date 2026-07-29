@@ -30,6 +30,7 @@ typedef struct gmv_message_command {
     int32_t transport;
     uint32_t cseq;
     char target_uri[GMV_SIP_URI_CAPACITY];
+    char to_uri[GMV_SIP_URI_CAPACITY];
     char from_uri[GMV_SIP_URI_CAPACITY];
     char content_type[GMV_SIP_CONTENT_TYPE_CAPACITY];
     unsigned char *body;

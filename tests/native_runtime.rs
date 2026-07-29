@@ -1265,6 +1265,7 @@ fn runtime_adapter_sends_message_and_correlates_response() {
             association_id: 0,
             protocol: SipTransportProtocol::Udp,
             target_uri: format!("sip:device@{remote}"),
+            to_uri: None,
             from_uri: format!("<sip:platform@{}>", local_addr()),
             content_type: "Application/MANSCDP+xml".into(),
             body: b"<?xml version=\"1.0\"?><Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),
@@ -1276,6 +1277,10 @@ fn runtime_adapter_sends_message_and_correlates_response() {
     assert_eq!(transmit.remote_addr, remote);
     let request = finish_transmit(&mut runtime, &transmit);
     assert!(request.starts_with("MESSAGE "));
+    assert_eq!(
+        header_value(&request, "To"),
+        format!("<sip:device@{}>", remote.ip())
+    );
     assert!(request.contains("<CmdType>DeviceInfo</CmdType>"));
     let message_cseq = header_value(&request, "CSeq")
         .split_whitespace()
@@ -1339,6 +1344,68 @@ Content-Length: 0\r\n\r\n",
 }
 
 #[test]
+fn runtime_adapter_sends_message_with_distinct_to() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, _events, transmits) = start_runtime(config);
+    let remote = remote_addr(40023);
+    runtime
+        .send_message(&SipOutboundMessage {
+            operation_id: 44,
+            association_id: 0,
+            protocol: SipTransportProtocol::Udp,
+            target_uri: format!("sip:proxy@{remote}"),
+            to_uri: Some(format!("<sip:channel@{remote}>")),
+            from_uri: format!("<sip:platform@{}>", local_addr()),
+            content_type: "Application/MANSCDP+xml".into(),
+            body: b"<Control><CmdType>DeviceConfig</CmdType></Control>".to_vec(),
+        })
+        .expect("send outbound MESSAGE with distinct To");
+
+    let transmit = receive_transmit(&mut runtime, &transmits);
+    assert_eq!(transmit.remote_addr, remote);
+    let request = finish_transmit(&mut runtime, &transmit);
+    assert!(request.starts_with(&format!("MESSAGE sip:proxy@{remote} SIP/2.0")));
+    assert_eq!(
+        header_value(&request, "To"),
+        format!("<sip:channel@{}>", remote.ip())
+    );
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
+fn runtime_adapter_rejects_invalid_explicit_message_to() {
+    let _guard = lock_tests();
+    let config = SipRuntimeConfig {
+        enable_tcp: false,
+        ..SipRuntimeConfig::default()
+    };
+    let (mut runtime, _events, _transmits) = start_runtime(config);
+    let remote = remote_addr(40024);
+    let message = SipOutboundMessage {
+        operation_id: 45,
+        association_id: 0,
+        protocol: SipTransportProtocol::Udp,
+        target_uri: format!("sip:proxy@{remote}"),
+        to_uri: Some(String::new()),
+        from_uri: format!("<sip:platform@{}>", local_addr()),
+        content_type: "Application/MANSCDP+xml".into(),
+        body: b"<Control><CmdType>DeviceConfig</CmdType></Control>".to_vec(),
+    };
+
+    assert!(runtime.send_message(&message).is_err());
+    let mut nul_message = message;
+    nul_message.to_uri = Some("<sip:channel\0@example.com>".into());
+    assert!(runtime.send_message(&nul_message).is_err());
+    nul_message.to_uri = Some(format!("<sip:{}@example.com>", "x".repeat(1024)));
+    assert!(runtime.send_message(&nul_message).is_err());
+    runtime.shutdown().expect("shutdown runtime");
+}
+
+#[test]
 fn tcp_via_uses_configured_advertised_address() {
     let _guard = lock_tests();
     let advertised_address = Ipv4Addr::new(203, 0, 113, 10);
@@ -1374,6 +1441,7 @@ fn tcp_via_uses_configured_advertised_address() {
             association_id,
             protocol: SipTransportProtocol::Tcp,
             target_uri: format!("sip:device@{remote};transport=tcp"),
+            to_uri: Some(format!("<sip:channel@{remote};transport=tcp>")),
             from_uri: format!("<sip:platform@{advertised_address}>"),
             content_type: "Application/MANSCDP+xml".into(),
             body: b"<Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),
@@ -1383,6 +1451,10 @@ fn tcp_via_uses_configured_advertised_address() {
     let request = finish_transmit(&mut runtime, &transmit);
     assert!(header_value(&request, "Via")
         .starts_with(&format!("SIP/2.0/TCP {advertised_address}:{LOCAL_PORT};")));
+    assert_eq!(
+        header_value(&request, "To"),
+        format!("<sip:channel@{}>", remote.ip())
+    );
 
     runtime.shutdown().expect("shutdown runtime");
 }
@@ -2173,6 +2245,7 @@ Content-Length: 0\r\n\r\n"
             association_id,
             protocol: SipTransportProtocol::Tcp,
             target_uri: format!("sip:device@{remote}"),
+            to_uri: None,
             from_uri: format!("<sip:platform@{}>", local_addr()),
             content_type: "Application/MANSCDP+xml".into(),
             body: b"<Query><CmdType>DeviceInfo</CmdType></Query>".to_vec(),

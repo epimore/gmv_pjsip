@@ -14,6 +14,7 @@ static pj_status_t gmv_send_message_on_owner(
     }
 
     pj_str_t target = pj_str((char *)message->target_uri);
+    pj_str_t to = pj_str((char *)message->to_uri);
     pj_str_t from = pj_str((char *)message->from_uri);
     pjsip_tx_data *tdata = NULL;
     pjsip_method method;
@@ -24,7 +25,7 @@ static pj_status_t gmv_send_message_on_owner(
         &method,
         &target,
         &from,
-        &target,
+        &to,
         NULL,
         NULL,
         (int)message->cseq,
@@ -75,4 +76,3 @@ static pj_status_t gmv_send_message_on_owner(
     runtime->last_status = status;
     return status;
 }
-
