@@ -69,7 +69,7 @@ impl SocketIoRuntime {
                     }
                 };
                 runtime.block_on(run_io(sockets, transmits, commands, shutdown_rx));
-                base::log::warn!("SIP socket IO runtime thread exited");
+                base::log::debug!("SIP socket IO runtime thread exited");
             })
             .map_err(|err| internal_error(format!("spawn SIP socket IO task failed: {err}")))?;
         Ok(Self {
@@ -81,12 +81,12 @@ impl SocketIoRuntime {
 
 impl Drop for SocketIoRuntime {
     fn drop(&mut self) {
-        base::log::warn!("SIP socket IO runtime shutdown requested");
+        base::log::debug!("SIP socket IO runtime shutdown requested");
         let _ = self.shutdown.send(true);
         if let Some(thread) = self.thread.take() {
             match thread.join() {
-                Ok(()) => base::log::warn!("SIP socket IO runtime thread joined"),
-                Err(_) => base::log::warn!("SIP socket IO runtime thread panicked"),
+                Ok(()) => base::log::debug!("SIP socket IO runtime thread joined"),
+                Err(_) => base::log::error!("SIP socket IO runtime thread panicked"),
             }
         }
     }
@@ -145,17 +145,17 @@ async fn run_io(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() {
-                    base::log::warn!("SIP socket IO runtime exiting because shutdown channel closed");
+                    base::log::debug!("SIP socket IO runtime exiting because shutdown channel closed");
                     break;
                 }
                 if *shutdown.borrow() {
-                    base::log::warn!("SIP socket IO runtime exiting after shutdown request");
+                    base::log::debug!("SIP socket IO runtime exiting after shutdown request");
                     break;
                 }
             }
         }
     }
-    base::log::warn!("SIP socket IO runtime task exited");
+    base::log::debug!("SIP socket IO runtime task exited");
 }
 
 fn prepare_udp_socket(socket: UdpSocket) -> Result<Arc<TokioUdpSocket>> {
@@ -218,17 +218,17 @@ async fn read_udp(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() {
-                    base::log::warn!("SIP UDP reader exiting because shutdown channel closed");
+                    base::log::debug!("SIP UDP reader exiting because shutdown channel closed");
                     break;
                 }
                 if *shutdown.borrow() {
-                    base::log::warn!("SIP UDP reader exiting after shutdown request");
+                    base::log::debug!("SIP UDP reader exiting after shutdown request");
                     break;
                 }
             }
         }
     }
-    base::log::warn!("SIP UDP reader exited: local_addr={local_addr}");
+    base::log::debug!("SIP UDP reader exited: local_addr={local_addr}");
 }
 
 async fn accept_tcp(
@@ -260,17 +260,17 @@ async fn accept_tcp(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() {
-                    base::log::warn!("SIP TCP accept task exiting because shutdown channel closed");
+                    base::log::debug!("SIP TCP accept task exiting because shutdown channel closed");
                     break;
                 }
                 if *shutdown.borrow() {
-                    base::log::warn!("SIP TCP accept task exiting after shutdown request");
+                    base::log::debug!("SIP TCP accept task exiting after shutdown request");
                     break;
                 }
             }
         }
     }
-    base::log::warn!("SIP TCP accept task exited");
+    base::log::debug!("SIP TCP accept task exited");
 }
 
 async fn handle_tcp_stream(
@@ -311,7 +311,7 @@ async fn handle_tcp_stream(
                 result: Ok(len),
             });
         }
-        base::log::warn!("SIP TCP writer task exited: association_id={association_id}");
+        base::log::debug!("SIP TCP writer task exited: association_id={association_id}");
     });
 
     let mut buffer = Vec::with_capacity(8192);
@@ -319,7 +319,9 @@ async fn handle_tcp_stream(
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => {
-                base::log::warn!("SIP TCP peer closed connection: association_id={association_id}");
+                base::log::debug!(
+                    "SIP TCP peer closed connection: association_id={association_id}"
+                );
                 break;
             }
             Ok(len) => {
@@ -357,7 +359,7 @@ async fn handle_tcp_stream(
         remote_addr,
         status: 1,
     });
-    base::log::warn!(
+    base::log::debug!(
         "SIP TCP connection task exited: association_id={association_id}, remote_addr={remote_addr}"
     );
 }
