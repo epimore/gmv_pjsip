@@ -145,6 +145,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "base"
 version = "0.2.0"
+source = "git+https://github.com/epimore/pigs.git?rev=6ef154f#6ef154fd2e9d59aa2288922ff475c30988e0a1dc"
 dependencies = [
  "aes 0.7.5",
  "aes-gcm",
@@ -292,6 +293,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "cfg_lib"
 version = "0.1.0"
+source = "git+https://github.com/epimore/pigs.git?rev=6ef154f#6ef154fd2e9d59aa2288922ff475c30988e0a1dc"
 dependencies = [
  "cfg_macro",
  "clap",
@@ -301,6 +303,7 @@ dependencies = [
 [[package]]
 name = "cfg_macro"
 version = "0.1.0"
+source = "git+https://github.com/epimore/pigs.git?rev=6ef154f#6ef154fd2e9d59aa2288922ff475c30988e0a1dc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -398,6 +401,7 @@ dependencies = [
 [[package]]
 name = "constructor"
 version = "0.2.0"
+source = "git+https://github.com/epimore/pigs.git?rev=6ef154f#6ef154fd2e9d59aa2288922ff475c30988e0a1dc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -516,6 +520,7 @@ dependencies = [
 [[package]]
 name = "exception"
 version = "0.1.0"
+source = "git+https://github.com/epimore/pigs.git?rev=6ef154f#6ef154fd2e9d59aa2288922ff475c30988e0a1dc"
 dependencies = [
  "anyhow",
  "log",
